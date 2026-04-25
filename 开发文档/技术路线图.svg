@@ -1,0 +1,328 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 700" font-family="PingFang SC, Microsoft YaHei, sans-serif">
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#1E3A5F" flood-opacity="0.12"/>
+    </filter>
+    <filter id="shadow-sm" x="-5%" y="-5%" width="115%" height="115%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#1E3A5F" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="700" fill="#FAFBFC"/>
+
+  <!-- Header -->
+  <rect x="0" y="0" width="1200" height="64" fill="#1E3A5F"/>
+  <text x="600" y="40" text-anchor="middle" fill="white" font-size="22" font-weight="600" letter-spacing="2">清关优化系统 · 技术路线图</text>
+
+  <!-- ============ TOP: 3 Phase Cards ============ -->
+  <!-- Phase 1 -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="90" width="340" height="160" rx="10" fill="white"/>
+    <rect x="40" y="90" width="340" height="40" rx="10" fill="#1E3A5F"/>
+    <rect x="40" y="115" width="340" height="15" fill="#1E3A5F"/>
+    <text x="210" y="116" text-anchor="middle" fill="white" font-size="14" font-weight="600">第一阶段 · MVP 最小可行产品</text>
+  </g>
+  <!-- Phase 1 content -->
+  <g font-size="12" fill="#374151">
+    <text x="60" y="152"><tspan fill="#0D9488" font-weight="600">●</tspan> 文档解析模块 (DocumentParser)</text>
+    <text x="60" y="170"><tspan fill="#0D9488" font-weight="600">●</tspan> 字段映射模块 (FieldMapper)</text>
+    <text x="60" y="188"><tspan fill="#0D9488" font-weight="600">●</tspan> 税率查询模块 (TaxRateCrawler)</text>
+    <text x="60" y="206"><tspan fill="#0D9488" font-weight="600">●</tspan> HS编码优化模块 (HSOptimizer)</text>
+    <text x="60" y="224"><tspan fill="#0D9488" font-weight="600">●</tspan> 文件生成模块 (FileGenerator)</text>
+    <text x="60" y="242"><tspan fill="#0D9488" font-weight="600">●</tspan> 日志记录模块 (Logger)</text>
+  </g>
+
+  <!-- Arrow 1→2 -->
+  <g transform="translate(380, 170)">
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#CBD5E1" stroke-width="2"/>
+    <polygon points="40,-5 50,0 40,5" fill="#94A3B8"/>
+    <text x="25" y="-10" text-anchor="middle" font-size="10" fill="#64748B">1-2周</text>
+  </g>
+
+  <!-- Phase 2 -->
+  <g filter="url(#shadow)">
+    <rect x="420" y="90" width="340" height="160" rx="10" fill="white"/>
+    <rect x="420" y="90" width="340" height="40" rx="10" fill="#2563EB"/>
+    <rect x="420" y="115" width="340" height="15" fill="#2563EB"/>
+    <text x="590" y="116" text-anchor="middle" fill="white" font-size="14" font-weight="600">第二阶段 · 性能优化</text>
+  </g>
+  <g font-size="12" fill="#374151">
+    <text x="440" y="152"><tspan fill="#2563EB" font-weight="600">●</tspan> 字段映射准确率 &gt; 90%</text>
+    <text x="440" y="170"><tspan fill="#2563EB" font-weight="600">●</tspan> HS优化成功率 &gt; 70%</text>
+    <text x="440" y="188"><tspan fill="#2563EB" font-weight="600">●</tspan> 平均处理时间 &lt; 2分钟/票</text>
+    <text x="440" y="206"><tspan fill="#2563EB" font-weight="600">●</tspan> Redis 缓存命中率优化</text>
+    <text x="440" y="224"><tspan fill="#2563EB" font-weight="600">●</tspan> Celery 异步任务队列</text>
+    <text x="440" y="242"><tspan fill="#2563EB" font-weight="600">●</tspan> 批量处理支持</text>
+  </g>
+
+  <!-- Arrow 2→3 -->
+  <g transform="translate(760, 170)">
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#CBD5E1" stroke-width="2"/>
+    <polygon points="40,-5 50,0 40,5" fill="#94A3B8"/>
+    <text x="25" y="-10" text-anchor="middle" font-size="10" fill="#64748B">1-2周</text>
+  </g>
+
+  <!-- Phase 3 -->
+  <g filter="url(#shadow)">
+    <rect x="800" y="90" width="360" height="160" rx="10" fill="white"/>
+    <rect x="800" y="90" width="360" height="40" rx="10" fill="#0D9488"/>
+    <rect x="800" y="115" width="360" height="15" fill="#0D9488"/>
+    <text x="980" y="116" text-anchor="middle" fill="white" font-size="14" font-weight="600">第三阶段 · 完善扩展</text>
+  </g>
+  <g font-size="12" fill="#374151">
+    <text x="820" y="152"><tspan fill="#0D9488" font-weight="600">●</tspan> 用户满意度 &gt; 85%</text>
+    <text x="820" y="170"><tspan fill="#0D9488" font-weight="600">●</tspan> 系统稳定性 &gt; 99%</text>
+    <text x="820" y="188"><tspan fill="#0D9488" font-weight="600">●</tspan> 支持 PDF / 图片格式</text>
+    <text x="820" y="206"><tspan fill="#0D9488" font-weight="600">●</tspan> 统计报表与可视化</text>
+    <text x="820" y="224"><tspan fill="#0D9488" font-weight="600">●</tspan> 优化建议引擎</text>
+    <text x="820" y="242"><tspan fill="#0D9488" font-weight="600">●</tspan> 更多文档格式支持</text>
+  </g>
+
+  <!-- ============ MIDDLE: Core Module Flow ============ -->
+  <g transform="translate(0, 280)">
+    <!-- Section Label -->
+    <text x="40" y="0" font-size="13" fill="#1E3A5F" font-weight="600" letter-spacing="1">核心模块数据流</text>
+    <line x1="40" y1="10" x2="200" y2="10" stroke="#1E3A5F" stroke-width="1.5"/>
+
+    <!-- Module Flow -->
+    <!-- Module 1: 文档解析 -->
+    <g filter="url(#shadow-sm)">
+      <rect x="40" y="28" width="150" height="88" rx="8" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+    </g>
+    <rect x="40" y="28" width="150" height="28" rx="8" fill="#1E3A5F"/>
+    <rect x="40" y="44" width="150" height="12" fill="#1E3A5F"/>
+    <text x="115" y="47" text-anchor="middle" fill="white" font-size="12" font-weight="600">📄 文档解析</text>
+    <text x="115" y="66" text-anchor="middle" font-size="10" fill="#64748B">openpyxl / pandas</text>
+    <text x="115" y="80" text-anchor="middle" font-size="9" fill="#94A3B8">解析Excel提取原始数据</text>
+    <text x="115" y="92" text-anchor="middle" font-size="9" fill="#94A3B8">多Sheet · 动态表头</text>
+    <text x="115" y="104" text-anchor="middle" font-size="9" fill="#94A3B8">容错性读取</text>
+
+    <!-- Arrow -->
+    <line x1="190" y1="72" x2="212" y2="72" stroke="#94A3B8" stroke-width="1.5"/>
+    <polygon points="212,68 220,72 212,76" fill="#94A3B8"/>
+
+    <!-- Module 2: 字段映射 -->
+    <g filter="url(#shadow-sm)">
+      <rect x="220" y="28" width="150" height="88" rx="8" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+    </g>
+    <rect x="220" y="28" width="150" height="28" rx="8" fill="#2563EB"/>
+    <rect x="220" y="44" width="150" height="12" fill="#2563EB"/>
+    <text x="295" y="47" text-anchor="middle" fill="white" font-size="12" font-weight="600">🗺️ 字段映射</text>
+    <text x="295" y="66" text-anchor="middle" font-size="10" fill="#64748B">精确 · 模糊 · AI</text>
+    <text x="295" y="80" text-anchor="middle" font-size="9" fill="#94A3B8">字段名→标准字段</text>
+    <text x="295" y="92" text-anchor="middle" font-size="9" fill="#94A3B8">冲突检测与解决</text>
+    <text x="295" y="104" text-anchor="middle" font-size="9" fill="#94A3B8">置信度评分</text>
+
+    <!-- Arrow -->
+    <line x1="370" y1="72" x2="392" y2="72" stroke="#94A3B8" stroke-width="1.5"/>
+    <polygon points="392,68 400,72 392,76" fill="#94A3B8"/>
+
+    <!-- Module 3: 税率查询 -->
+    <g filter="url(#shadow-sm)">
+      <rect x="400" y="28" width="150" height="88" rx="8" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+    </g>
+    <rect x="400" y="28" width="150" height="28" rx="8" fill="#7C3AED"/>
+    <rect x="400" y="44" width="150" height="12" fill="#7C3AED"/>
+    <text x="475" y="47" text-anchor="middle" fill="white" font-size="12" font-weight="600">🔍 税率查询</text>
+    <text x="475" y="66" text-anchor="middle" font-size="10" fill="#64748B">Playwright + Redis</text>
+    <text x="475" y="80" text-anchor="middle" font-size="9" fill="#94A3B8">codeflagai.com</text>
+    <text x="475" y="92" text-anchor="middle" font-size="9" fill="#94A3B8">JS渲染 · 反爬策略</text>
+    <text x="475" y="104" text-anchor="middle" font-size="9" fill="#94A3B8">7天缓存 · 自动续期</text>
+
+    <!-- Arrow -->
+    <line x1="550" y1="72" x2="572" y2="72" stroke="#94A3B8" stroke-width="1.5"/>
+    <polygon points="572,68 580,72 572,76" fill="#94A3B8"/>
+
+    <!-- Module 4: HS优化 -->
+    <g filter="url(#shadow-sm)">
+      <rect x="580" y="28" width="150" height="88" rx="8" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+    </g>
+    <rect x="580" y="28" width="150" height="28" rx="8" fill="#DC2626"/>
+    <rect x="580" y="44" width="150" height="12" fill="#DC2626"/>
+    <text x="655" y="47" text-anchor="middle" fill="white" font-size="12" font-weight="600">⚡ HS优化</text>
+    <text x="655" y="66" text-anchor="middle" font-size="10" fill="#64748B">豆包大模型 + 规则</text>
+    <text x="655" y="80" text-anchor="middle" font-size="9" fill="#94A3B8">税率得分 60%</text>
+    <text x="655" y="92" text-anchor="middle" font-size="9" fill="#94A3B8">相似度得分 40%</text>
+    <text x="655" y="104" text-anchor="middle" font-size="9" fill="#94A3B8">风险标注 · 约束过滤</text>
+
+    <!-- Arrow -->
+    <line x1="730" y1="72" x2="752" y2="72" stroke="#94A3B8" stroke-width="1.5"/>
+    <polygon points="752,68 760,72 752,76" fill="#94A3B8"/>
+
+    <!-- Module 5: 文件生成 -->
+    <g filter="url(#shadow-sm)">
+      <rect x="760" y="28" width="150" height="88" rx="8" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+    </g>
+    <rect x="760" y="28" width="150" height="28" rx="8" fill="#B45309"/>
+    <rect x="760" y="44" width="150" height="12" fill="#B45309"/>
+    <text x="835" y="47" text-anchor="middle" fill="white" font-size="12" font-weight="600">📋 文件生成</text>
+    <text x="835" y="66" text-anchor="middle" font-size="10" fill="#64748B">openpyxl 模板填充</text>
+    <text x="835" y="80" text-anchor="middle" font-size="9" fill="#94A3B8">清关.xlsx 模板</text>
+    <text x="835" y="92" text-anchor="middle" font-size="9" fill="#94A3B8">缺失字段标记</text>
+    <text x="835" y="104" text-anchor="middle" font-size="9" fill="#94A3B8">时间戳命名输出</text>
+
+    <!-- Arrow -->
+    <line x1="910" y1="72" x2="932" y2="72" stroke="#94A3B8" stroke-width="1.5"/>
+    <polygon points="932,68 940,72 932,76" fill="#94A3B8"/>
+
+    <!-- Module 6: 日志记录 -->
+    <g filter="url(#shadow-sm)">
+      <rect x="940" y="28" width="150" height="88" rx="8" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+    </g>
+    <rect x="940" y="28" width="150" height="28" rx="8" fill="#0D9488"/>
+    <rect x="940" y="44" width="150" height="12" fill="#0D9488"/>
+    <text x="1015" y="47" text-anchor="middle" fill="white" font-size="12" font-weight="600">📊 日志记录</text>
+    <text x="1015" y="66" text-anchor="middle" font-size="10" fill="#64748B">structlog · Excel多Sheet</text>
+    <text x="1015" y="80" text-anchor="middle" font-size="9" fill="#94A3B8">替换日志 · 冲突日志</text>
+    <text x="1015" y="92" text-anchor="middle" font-size="9" fill="#94A3B8">字段映射日志</text>
+    <text x="1015" y="104" text-anchor="middle" font-size="9" fill="#94A3B8">全流程可追溯</text>
+
+    <!-- Data Flow Label -->
+    <text x="560" y="145" text-anchor="middle" font-size="10" fill="#94A3B8">数据流: Excel文件 → 标准化字段 → 税率查询 → 最优编码 → 清关文件 + 操作日志</text>
+  </g>
+
+  <!-- ============ BOTTOM LEFT: Tech Stack ============ -->
+  <g transform="translate(0, 420)">
+    <text x="40" y="0" font-size="13" fill="#1E3A5F" font-weight="600" letter-spacing="1">技术栈</text>
+    <line x1="40" y1="10" x2="120" y2="10" stroke="#1E3A5F" stroke-width="1.5"/>
+
+    <!-- Tech cards row -->
+    <g filter="url(#shadow-sm)">
+      <rect x="40" y="24" width="100" height="60" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <rect x="40" y="24" width="100" height="4" rx="2" fill="#1E3A5F"/>
+      <text x="90" y="52" text-anchor="middle" font-size="11" fill="#1E3A5F" font-weight="600">后端</text>
+      <text x="90" y="66" text-anchor="middle" font-size="9" fill="#64748B">Python 3.10+</text>
+      <text x="90" y="78" text-anchor="middle" font-size="9" fill="#64748B">FastAPI</text>
+    </g>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="148" y="24" width="100" height="60" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <rect x="148" y="24" width="100" height="4" rx="2" fill="#2563EB"/>
+      <text x="198" y="52" text-anchor="middle" font-size="11" fill="#2563EB" font-weight="600">前端</text>
+      <text x="198" y="66" text-anchor="middle" font-size="9" fill="#64748B">React + TS</text>
+      <text x="198" y="78" text-anchor="middle" font-size="9" fill="#64748B">Ant Design</text>
+    </g>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="256" y="24" width="100" height="60" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <rect x="256" y="24" width="100" height="4" rx="2" fill="#7C3AED"/>
+      <text x="306" y="52" text-anchor="middle" font-size="11" fill="#7C3AED" font-weight="600">数据库</text>
+      <text x="306" y="66" text-anchor="middle" font-size="9" fill="#64748B">PostgreSQL</text>
+      <text x="306" y="78" text-anchor="middle" font-size="9" fill="#64748B">Redis 缓存</text>
+    </g>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="364" y="24" width="100" height="60" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <rect x="364" y="24" width="100" height="4" rx="2" fill="#DC2626"/>
+      <text x="414" y="52" text-anchor="middle" font-size="11" fill="#DC2626" font-weight="600">任务队列</text>
+      <text x="414" y="66" text-anchor="middle" font-size="9" fill="#64748B">Celery</text>
+      <text x="414" y="78" text-anchor="middle" font-size="9" fill="#64748B">异步处理</text>
+    </g>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="472" y="24" width="100" height="60" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <rect x="472" y="24" width="100" height="4" rx="2" fill="#B45309"/>
+      <text x="522" y="52" text-anchor="middle" font-size="11" fill="#B45309" font-weight="600">爬虫</text>
+      <text x="522" y="66" text-anchor="middle" font-size="9" fill="#64748B">Playwright</text>
+      <text x="522" y="78" text-anchor="middle" font-size="9" fill="#64748B">JS渲染</text>
+    </g>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="580" y="24" width="100" height="60" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <rect x="580" y="24" width="100" height="4" rx="2" fill="#0D9488"/>
+      <text x="630" y="52" text-anchor="middle" font-size="11" fill="#0D9488" font-weight="600">AI模型</text>
+      <text x="630" y="66" text-anchor="middle" font-size="9" fill="#64748B">豆包大模型</text>
+      <text x="630" y="78" text-anchor="middle" font-size="9" fill="#64748B">字节跳动</text>
+    </g>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="688" y="24" width="100" height="60" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <rect x="688" y="24" width="100" height="4" rx="2" fill="#1E3A5F"/>
+      <text x="738" y="52" text-anchor="middle" font-size="11" fill="#1E3A5F" font-weight="600">部署</text>
+      <text x="738" y="66" text-anchor="middle" font-size="9" fill="#64748B">Docker</text>
+      <text x="738" y="78" text-anchor="middle" font-size="9" fill="#64748B">Nginx</text>
+    </g>
+  </g>
+
+  <!-- ============ BOTTOM RIGHT: Business Flow ============ -->
+  <g transform="translate(0, 510)">
+    <text x="40" y="0" font-anchor="start" font-size="13" fill="#1E3A5F" font-weight="600" letter-spacing="1">业务流程</text>
+    <line x1="40" y1="10" x2="120" y2="10" stroke="#1E3A5F" stroke-width="1.5"/>
+
+    <!-- Business flow boxes -->
+    <g filter="url(#shadow-sm)">
+      <rect x="40" y="24" width="130" height="44" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <text x="105" y="40" text-anchor="middle" font-size="10" fill="#1E3A5F" font-weight="600">上传Excel文件</text>
+      <text x="105" y="54" text-anchor="middle" font-size="9" fill="#94A3B8">一"票" 2-3 个文档</text>
+    </g>
+
+    <line x1="170" y1="46" x2="188" y2="46" stroke="#CBD5E1" stroke-width="1.5"/>
+    <polygon points="188,42 196,46 188,50" fill="#CBD5E1"/>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="196" y="24" width="130" height="44" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <text x="261" y="40" text-anchor="middle" font-size="10" fill="#1E3A5F" font-weight="600">智能字段识别</text>
+      <text x="261" y="54" text-anchor="middle" font-size="9" fill="#94A3B8">精确/模糊/AI 三级映射</text>
+    </g>
+
+    <line x1="326" y1="46" x2="344" y2="46" stroke="#CBD5E1" stroke-width="1.5"/>
+    <polygon points="344,42 352,46 344,50" fill="#CBD5E1"/>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="352" y="24" width="130" height="44" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <text x="417" y="40" text-anchor="middle" font-size="10" fill="#1E3A5F" font-weight="600">查询税率数据库</text>
+      <text x="417" y="54" text-anchor="middle" font-size="9" fill="#94A3B8">codeflagai.com</text>
+    </g>
+
+    <line x1="482" y1="46" x2="500" y2="46" stroke="#CBD5E1" stroke-width="1.5"/>
+    <polygon points="500,42 508,46 500,50" fill="#CBD5E1"/>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="508" y="24" width="130" height="44" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <text x="573" y="40" text-anchor="middle" font-size="10" fill="#1E3A5F" font-weight="600">HS编码优化</text>
+      <text x="573" y="54" text-anchor="middle" font-size="9" fill="#94A3B8">选低税率·品类约束</text>
+    </g>
+
+    <line x1="638" y1="46" x2="656" y2="46" stroke="#CBD5E1" stroke-width="1.5"/>
+    <polygon points="656,42 664,46 656,50" fill="#CBD5E1"/>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="664" y="24" width="130" height="44" rx="6" fill="white" stroke="#E2E8F0" stroke-width="1"/>
+      <text x="729" y="40" text-anchor="middle" font-size="10" fill="#1E3A5F" font-weight="600">生成清关文件</text>
+      <text x="729" y="54" text-anchor="middle" font-size="9" fill="#94A3B8">清关.xlsx + 日志</text>
+    </g>
+
+    <line x1="794" y1="46" x2="812" y2="46" stroke="#CBD5E1" stroke-width="1.5"/>
+    <polygon points="812,42 820,46 812,50" fill="#CBD5E1"/>
+
+    <g filter="url(#shadow-sm)">
+      <rect x="820" y="24" width="130" height="44" rx="6" fill="#0D9488"/>
+      <text x="885" y="40" text-anchor="middle" font-size="10" fill="white" font-weight="600">下载结果</text>
+      <text x="885" y="54" text-anchor="middle" font-size="9" fill="#A7F3D0">支持审计追溯</text>
+    </g>
+
+    <!-- Success Metrics -->
+    <g transform="translate(40, 90)">
+      <text x="0" y="0" font-size="12" fill="#1E3A5F" font-weight="600">成功指标</text>
+      <g transform="translate(0, 14)">
+        <rect x="0" y="0" width="18" height="18" rx="3" fill="#10B981"/>
+        <text x="9" y="13" text-anchor="middle" font-size="9" fill="white" font-weight="600">✓</text>
+        <text x="26" y="13" font-size="11" fill="#374151">字段映射准确率 &gt; 80%</text>
+
+        <rect x="200" y="0" width="18" height="18" rx="3" fill="#10B981"/>
+        <text x="209" y="13" text-anchor="middle" font-size="9" fill="white" font-weight="600">✓</text>
+        <text x="226" y="13" font-size="11" fill="#374151">全流程操作日志可追溯</text>
+
+        <rect x="420" y="0" width="18" height="18" rx="3" fill="#10B981"/>
+        <text x="429" y="13" text-anchor="middle" font-size="9" fill="white" font-weight="600">✓</text>
+        <text x="446" y="13" font-size="11" fill="#374151">自动化降低清关税金</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- Footer -->
+  <rect x="0" y="680" width="1200" height="20" fill="#F1F5F9"/>
+  <text x="40" y="694" font-size="10" fill="#94A3B8">customs-optimizer · 技术架构路线图 · 基于 01-项目概述 &amp; 02-核心模块设计</text>
+  <text x="1160" y="694" text-anchor="end" font-size="10" fill="#94A3B8">迭代周期: 1-2周/阶段</text>
+</svg>

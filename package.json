@@ -1,0 +1,44 @@
+{
+  "name": "customs-optimizer",
+  "version": "1.0.0",
+  "description": "清关优化系统 - 桌面应用",
+  "main": "electron/main.js",
+  "author": "Your Name",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n \"frontend,backend,electron\" -c \"blue,green,yellow\" \"npm run dev:frontend\" \"npm run dev:backend\" \"npm run dev:electron\"",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000",
+    "dev:electron": "wait-on http://127.0.0.1:5173 http://127.0.0.1:8000/health && cross-env NODE_ENV=development electron .",
+    "build": "npm run build:frontend && npm run build:electron",
+    "build:frontend": "cd frontend && npm run build",
+    "build:electron": "electron-builder --config build/electron-builder.yml",
+    "build:win": "electron-builder --win --config build/electron-builder.yml",
+    "build:mac": "electron-builder --mac --config build/electron-builder.yml",
+    "build:linux": "electron-builder --linux --config build/electron-builder.yml",
+    "pack": "electron-builder --dir --config build/electron-builder.yml",
+    "dist": "npm run build",
+    "dist:win": "npm run build:win",
+    "dist:mac": "npm run build:mac",
+    "dist:linux": "npm run build:linux",
+    "postinstall": "electron-builder install-app-deps",
+    "clean": "rimraf dist frontend/dist backend/__pycache__ backend/**/__pycache__"
+  },
+  "dependencies": {
+    "axios": "^1.6.5",
+    "electron-store": "^8.1.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1",
+    "rimraf": "^5.0.5",
+    "wait-on": "^7.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}
