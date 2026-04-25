@@ -42,7 +42,7 @@ npm run dev:electron
 ## 项目结构
 
 ```
-customs-optimizer/
+DutyWise/
 ├── electron/                    # Electron 主进程
 │   ├── main.js                  # 主进程入口
 │   ├── preload.js               # 预加载脚本（安全桥接）
@@ -177,9 +177,9 @@ store.delete('settings');
 ```
 
 存储位置：
-- Windows: `%APPDATA%/customs-optimizer/config.json`
-- macOS: `~/Library/Application Support/customs-optimizer/config.json`
-- Linux: `~/.config/customs-optimizer/config.json`
+- Windows: `%APPDATA%/DutyWise/config.json`
+- macOS: `~/Library/Application Support/DutyWise/config.json`
+- Linux: `~/.config/DutyWise/config.json`
 
 ## 常见问题
 

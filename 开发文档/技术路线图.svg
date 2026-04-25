@@ -323,6 +323,6 @@
 
   <!-- Footer -->
   <rect x="0" y="680" width="1200" height="20" fill="#F1F5F9"/>
-  <text x="40" y="694" font-size="10" fill="#94A3B8">customs-optimizer · 技术架构路线图 · 基于 01-项目概述 &amp; 02-核心模块设计</text>
+  <text x="40" y="694" font-size="10" fill="#94A3B8">DutyWise · 技术架构路线图 · 基于 01-项目概述 &amp; 02-核心模块设计</text>
   <text x="1160" y="694" text-anchor="end" font-size="10" fill="#94A3B8">迭代周期: 1-2周/阶段</text>
 </svg>

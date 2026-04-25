@@ -1,7 +1,7 @@
 {
-  "name": "customs-optimizer",
+  "name": "dutywise",
   "version": "1.0.0",
-  "description": "清关优化系统 - 桌面应用",
+  "description": "DutyWise - 美国进口清关单证智能审核系统",
   "main": "electron/main.js",
   "author": "Your Name",
   "license": "MIT",

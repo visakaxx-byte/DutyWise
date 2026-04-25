@@ -1,11 +1,12 @@
-# 清关优化系统
+# DutyWise — 清关优化系统
 
 桌面应用版本 - 基于 Electron + React + FastAPI
 
 ## 项目结构
 
 ```
-customs-optimizer/
+DutyWise/
+├── electron/              # Electron 主进程
 ├── electron/              # Electron 主进程
 │   ├── main.js           # 主进程入口
 │   ├── preload.js        # 预加载脚本
@@ -186,9 +187,9 @@ if (window.electronAPI?.isElectron) {
 ### electron-store
 
 本地数据存储，自动保存在：
-- Windows: `%APPDATA%/customs-optimizer/config.json`
-- macOS: `~/Library/Application Support/customs-optimizer/config.json`
-- Linux: `~/.config/customs-optimizer/config.json`
+- Windows: `%APPDATA%/DutyWise/config.json`
+- macOS: `~/Library/Application Support/DutyWise/config.json`
+- Linux: `~/.config/DutyWise/config.json`
 
 ## 故障排查
 
