@@ -84,8 +84,8 @@ export const Settings: React.FC = () => {
   };
 
   return (
-    <div className="max-w-3xl mx-auto p-6">
-      <h1 className="text-2xl font-bold mb-6">设置</h1>
+    <div style={{ maxWidth: 768, margin: '0 auto', padding: 24 }}>
+      <h1 style={{ fontSize: 24, fontWeight: 'bold', marginBottom: 24 }}>设置</h1>
 
       <Form
         form={form}
@@ -94,7 +94,7 @@ export const Settings: React.FC = () => {
         onFinish={handleSave}
       >
         {/* LLM 配置 */}
-        <Card title="LLM 配置" className="mb-6">
+        <Card title="LLM 配置" style={{ marginBottom: 24 }}>
           <Form.Item label="预设模型" name="preset">
             <Radio.Group onChange={(e) => handlePresetChange(e.target.value)}>
               <Space direction="vertical">
@@ -137,7 +137,7 @@ export const Settings: React.FC = () => {
         </Card>
 
         {/* 优化设置 */}
-        <Card title="优化设置" className="mb-6">
+        <Card title="优化设置" style={{ marginBottom: 24 }}>
           <Form.Item
             label="排除有反倾销标记的HS编码"
             name="excludeAntiDumping"
@@ -160,7 +160,7 @@ export const Settings: React.FC = () => {
         </Card>
 
         {/* 爬虫配置 */}
-        <Card title="爬虫配置" className="mb-6">
+        <Card title="爬虫配置" style={{ marginBottom: 24 }}>
           <Form.Item
             label="网站账号"
             name="crawlerUsername"
@@ -178,7 +178,7 @@ export const Settings: React.FC = () => {
           </Form.Item>
         </Card>
 
-        <div className="flex gap-4">
+        <div style={{ display: 'flex', gap: 16 }}>
           <Button
             type="primary"
             htmlType="submit"

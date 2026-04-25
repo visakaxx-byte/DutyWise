@@ -26,10 +26,11 @@ export interface Shipment {
 
 export interface TaskStatus {
   taskId: string;
-  status: 'processing' | 'completed' | 'failed';
+  status: 'pending' | 'processing' | 'completed' | 'failed';
   progress: number;
   currentStep: string;
-  steps: Array<{
+  errorMessage?: string;
+  steps?: Array<{
     name: string;
     status: 'completed' | 'processing' | 'pending';
   }>;
@@ -37,14 +38,20 @@ export interface TaskStatus {
 
 export interface ProcessResult {
   shipmentId: number;
-  totalItems: number;
-  optimizedItems: number;
-  savedAmount: number;
-  outputFileId: string;
-  outputFileName: string;
+  shipmentNo: string;
+  status: string;
   statistics: {
-    totalTax: number;
-    optimizedTax: number;
-    savedTax: number;
+    total_items: number;
+    optimized_items: number;
+    optimization_rate: number;
   };
+  files: {
+    output_file: string | null;
+    log_file: string | null;
+  };
+  totalItems?: number;
+  optimizedItems?: number;
+  savedAmount?: number;
+  outputFileId?: string;
+  outputFileName?: string;
 }

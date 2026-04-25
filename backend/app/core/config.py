@@ -2,11 +2,13 @@
 配置文件
 """
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
 from typing import Optional
 
 
 class Settings(BaseSettings):
     """应用配置"""
+    model_config = ConfigDict(env_file=".env", extra="ignore", case_sensitive=True)
 
     # 应用配置
     APP_NAME: str = "清关文件处理系统"
@@ -42,16 +44,15 @@ class Settings(BaseSettings):
     DOUBAO_MODEL: str = "doubao-pro-32k"
 
     # 爬虫配置
+    CRAWLER_USERNAME: Optional[str] = None
+    CRAWLER_PASSWORD: Optional[str] = None
+    CRAWLER_BASE_URL: str = "https://www.codeflagai.com"
     CRAWLER_TIMEOUT: int = 30
     CRAWLER_RETRY: int = 3
     CRAWLER_DELAY: float = 1.0
 
     # 缓存配置
     CACHE_TTL: int = 7 * 24 * 3600  # 7天
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
 
 
 settings = Settings()

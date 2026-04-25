@@ -1,5 +1,5 @@
 import axios from 'axios';
-import type { LLMConfig, Settings, Shipment, TaskStatus, ProcessResult } from '../types';
+import type { Settings, TaskStatus, ProcessResult } from '../types';
 
 // 创建 axios 实例
 const api = axios.create({
@@ -40,8 +40,8 @@ export const uploadFiles = async (files: File[]) => {
 };
 
 // 开始处理
-export const startProcessing = async (shipmentId: number, options?: any) => {
-  const { data } = await api.post(`/shipments/${shipmentId}/process`, { options });
+export const startProcessing = async (shipmentId: number, options?: object) => {
+  const { data } = await api.post(`/shipments/${shipmentId}/process`, options || {});
   return data.data;
 };
 

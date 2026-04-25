@@ -59,34 +59,52 @@ class FieldMapper:
         }
 
     def _build_field_mapping(self, headers: List[str]) -> Dict[str, Any]:
-        """建立字段映射关系"""
+        """建立字段映射关系（按匹配度择优）"""
         mapping = {}
         logs = []
+        used_headers = set()
 
         for standard_field, keywords in self.STANDARD_FIELDS.items():
+            best_header = None
+            best_score = 0.0
+
             for header in headers:
-                if self._is_field_match(header, keywords):
-                    mapping[header] = standard_field
-                    logs.append({
-                        "source_field": header,
-                        "target_field": standard_field,
-                        "confidence": 0.95,
-                        "method": "keyword_match"
-                    })
-                    break
+                if header in used_headers:
+                    continue
+                score = self._match_score(header, keywords)
+                if score > best_score:
+                    best_score = score
+                    best_header = header
+
+            if best_header and best_score > 0:
+                used_headers.add(best_header)
+                mapping[best_header] = standard_field
+                logs.append({
+                    "source_field": best_header,
+                    "target_field": standard_field,
+                    "confidence": min(best_score, 0.95),
+                    "method": "keyword_match"
+                })
 
         return {"mapping": mapping, "logs": logs}
 
-    def _is_field_match(self, header: str, keywords: List[str]) -> bool:
-        """判断字段是否匹配"""
+    def _match_score(self, header: str, keywords: List[str]) -> float:
+        """返回匹配得分：精确匹配 > 边界匹配 > 包含匹配"""
         header_lower = str(header).lower().strip()
+        best = 0.0
 
-        for keyword in keywords:
-            keyword_lower = keyword.lower()
-            if keyword_lower == header_lower or keyword_lower in header_lower:
-                return True
+        for kw in keywords:
+            kw_lower = kw.lower()
+            if header_lower == kw_lower:
+                best = max(best, 1.0)
+            elif header_lower.startswith(kw_lower) or header_lower.endswith(kw_lower):
+                best = max(best, 0.9)
+            elif kw_lower in header_lower:
+                # 短关键词在长字段名中出现时降低权重（如 "品名" in "英文品名"）
+                ratio = len(kw_lower) / max(len(header_lower), 1)
+                best = max(best, 0.4 + ratio * 0.3)
 
-        return False
+        return best
 
     def _map_row(self, row: Dict[str, Any], mapping: Dict[str, str]) -> Dict[str, Any]:
         """映射单行数据"""

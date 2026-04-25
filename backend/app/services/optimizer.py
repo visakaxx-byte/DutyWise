@@ -13,7 +13,7 @@ class HSCodeOptimizer:
     def __init__(self, options: Dict[str, Any] = None):
         self.options = options or {}
         self.exclude_anti_dumping = self.options.get("exclude_anti_dumping", False)
-        self.min_similarity = self.options.get("min_similarity", 0.6)
+        self.min_similarity = self.options.get("min_similarity", 0.15)
 
     def optimize_batch(
         self,
@@ -125,8 +125,8 @@ class HSCodeOptimizer:
                 if info.get("certification_required"):
                     continue
 
-                # 计算相似度（简化）
-                similarity = self._calculate_similarity(original_name, info.get("description_cn", ""))
+                # 计算相似度（同前缀编码有基础分）
+                similarity = max(0.15, self._calculate_similarity(original_name, info.get("description_cn", "")))
 
                 if similarity >= self.min_similarity:
                     candidates.append({
@@ -140,23 +140,28 @@ class HSCodeOptimizer:
 
     def _calculate_similarity(self, name1: str, name2: str) -> float:
         """
-        计算相似度
-        简化实现：基于关键词匹配
+        计算文本相似度（bigram Jaccard + 字符重叠）
         """
         if not name1 or not name2:
             return 0.0
 
-        # 提取关键词
-        keywords1 = set(name1)
-        keywords2 = set(name2)
+        t1 = name1.replace(" ", "").replace("/", "").replace("-", "")
+        t2 = name2.replace(" ", "").replace("/", "").replace("-", "")
 
-        # 计算交集
-        intersection = keywords1 & keywords2
-
-        if not keywords1:
+        if not t1 or not t2:
             return 0.0
 
-        return len(intersection) / len(keywords1)
+        # Bigram
+        def bigrams(text):
+            return {text[i:i+2] for i in range(len(text)-1)} if len(text) >= 2 else set(text)
+        bg1, bg2 = bigrams(t1), bigrams(t2)
+        bg_score = len(bg1 & bg2) / max(len(bg1 | bg2), 1) if bg1 and bg2 else 0.0
+
+        # 单字
+        c1, c2 = set(t1), set(t2)
+        char_score = len(c1 & c2) / max(len(c1 | c2), 1) if c1 and c2 else 0.0
+
+        return bg_score * 0.5 + char_score * 0.5
 
     def _select_best_candidate(
         self,
@@ -186,24 +191,34 @@ class HSCodeOptimizer:
         best = candidates[0]
 
         # 只有当得分明显更好时才返回
-        if best["final_score"] > 0.7:
+        # 阈值0.55: 最优情况下0%税率+最低相似度(0.15) → 1.0*0.6+0.15*0.4=0.66 > 0.55
+        if best["final_score"] > 0.55:
             return best
 
         return None
 
     def _calculate_tax_score(self, original_rate: str, new_rate: str) -> float:
         """计算税率得分"""
-        if new_rate.lower() == "free":
-            return 1.0
+        new_val = self._parse_rate(new_rate)
+        original_val = self._parse_rate(original_rate)
 
-        # 简化处理：提取数字
-        try:
-            original_val = float(original_rate.replace("%", ""))
-            new_val = float(new_rate.replace("%", ""))
-
-            if new_val < original_val:
-                return 1.0 - (new_val / 100)
-            else:
-                return 0.0
-        except:
+        if original_val is None or new_val is None:
             return 0.5
+
+        if new_val < original_val:
+            return 1.0 - (new_val / 100)
+        else:
+            return 0.0
+
+    @staticmethod
+    def _parse_rate(rate_str: str) -> Optional[float]:
+        """解析税率字符串为数值，Free/0% → 0.0"""
+        if not rate_str:
+            return None
+        lowered = str(rate_str).lower().strip()
+        if lowered in ("free", "0", "0%"):
+            return 0.0
+        try:
+            return float(lowered.replace("%", ""))
+        except (ValueError, TypeError):
+            return None

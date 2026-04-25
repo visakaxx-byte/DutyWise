@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { Table, Card, Tag, Button, Space, message } from 'antd';
-import { ReloadOutlined, DownloadOutlined } from '@ant-design/icons';
+import { ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
-import { getShipments, downloadFile } from '../services/api';
+import { getShipments } from '../services/api';
 import type { Shipment } from '../types';
 import dayjs from 'dayjs';
 
@@ -117,7 +117,7 @@ export const History: React.FC = () => {
             <Button
               type="link"
               size="small"
-              icon={<DownloadOutlined />}
+              icon={<span>⬇</span>}
               onClick={() => {
                 // 这里需要从后端获取文件ID
                 message.info('下载功能待实现');
@@ -132,9 +132,9 @@ export const History: React.FC = () => {
   ];
 
   return (
-    <div className="max-w-7xl mx-auto p-6">
-      <div className="flex justify-between items-center mb-6">
-        <h1 className="text-2xl font-bold">历史记录</h1>
+    <div style={{ maxWidth: 1280, margin: '0 auto', padding: 24 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 'bold' }}>历史记录</h1>
         <Button
           icon={<ReloadOutlined />}
           onClick={handleRefresh}

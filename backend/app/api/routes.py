@@ -2,8 +2,10 @@
 API 路由
 """
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 from typing import List
 import shutil
+import asyncio
 from pathlib import Path
 import logging
 
@@ -153,6 +155,7 @@ async def get_task_status(task_id: str):
 
     return APIResponse(
         code=200,
+        message="查询成功",
         data=task
     )
 
@@ -170,11 +173,25 @@ async def get_shipment_result(shipment_id: int):
 
     return APIResponse(
         code=200,
+        message="查询成功",
         data=shipment.get("result", {})
     )
 
 
-async def process_shipment_task(task_id: str, shipment_id: int, options: dict):
+@router.get("/files/download")
+async def download_file(path: str, name: str = "output.xlsx"):
+    """下载生成的文件"""
+    file_path = Path(path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(
+        path=str(file_path),
+        filename=name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+
+def process_shipment_task(task_id: str, shipment_id: int, options: dict):
     """处理票据任务（后台任务）"""
     try:
         shipment = shipments_db[shipment_id]
@@ -202,7 +219,7 @@ async def process_shipment_task(task_id: str, shipment_id: int, options: dict):
         # 3. 查询税率
         update_progress(50, "查询税率")
         crawler = TaxRateCrawler()
-        tax_data = await crawler.batch_search(mapped_data)
+        tax_data = asyncio.run(crawler.batch_search(mapped_data))
 
         # 4. 优化HS编码
         update_progress(70, "优化HS编码")
@@ -213,19 +230,15 @@ async def process_shipment_task(task_id: str, shipment_id: int, options: dict):
         update_progress(90, "生成文件")
         output_dir = ensure_dir(settings.OUTPUT_DIR)
 
-        # 这里需要模板文件路径（实际使用时需要配置）
-        template_path = "template.xlsx"  # 需要实际的模板文件
+        # 模板文件路径
+        template_path = settings.UPLOAD_DIR + "/../template.xlsx"
 
         generator = FileGenerator()
+        output_file = None
+        log_file = None
 
-        # 如果模板存在，生成文件
-        if Path(template_path).exists():
-            output_file = generator.generate(
-                optimized_result["items"],
-                template_path,
-                str(output_dir)
-            )
-
+        # 始终生成日志文件（不需要模板）
+        try:
             log_file = generator.generate_log_file(
                 {
                     "optimization_logs": optimized_result["optimization_logs"],
@@ -234,9 +247,21 @@ async def process_shipment_task(task_id: str, shipment_id: int, options: dict):
                 },
                 str(output_dir)
             )
+        except Exception as e:
+            logger.warning(f"生成日志文件失败: {e}")
+
+        # 如果有模板，生成清关文件（使用全部映射数据）
+        if Path(template_path).exists():
+            try:
+                output_file = generator.generate(
+                    optimized_result["items"],
+                    template_path,
+                    str(output_dir)
+                )
+            except Exception as e:
+                logger.warning(f"生成清关文件失败: {e}")
         else:
-            output_file = None
-            log_file = None
+            logger.warning(f"模板文件不存在: {template_path}")
 
         # 更新票据状态
         shipments_db[shipment_id].update({

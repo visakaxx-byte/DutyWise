@@ -10,13 +10,13 @@ interface FileUploadProps {
 }
 
 export const FileUpload: React.FC<FileUploadProps> = ({ onFilesSelected }) => {
-  const handleChange: UploadProps['onChange'] = useCallback((info) => {
+  const handleChange: UploadProps['onChange'] = useCallback((info: any) => {
     const { fileList } = info;
 
     // 过滤出有效的文件
     const validFiles = fileList
-      .filter(file => file.originFileObj)
-      .map(file => file.originFileObj as File);
+      .filter((file: any) => file.originFileObj)
+      .map((file: any) => file.originFileObj as File);
 
     onFilesSelected(validFiles);
   }, [onFilesSelected]);

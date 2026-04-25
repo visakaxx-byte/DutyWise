@@ -34,13 +34,14 @@ export const Home: React.FC = () => {
 
       // 1. 上传文件
       const uploadResult = await uploadFiles(files);
-      const { shipment_id, task_id } = uploadResult;
+      const { shipment_id } = uploadResult;
 
       message.destroy();
       message.success('文件上传成功，开始处理...');
 
       // 2. 开始处理
-      await startProcessing(shipment_id);
+      const processResult = await startProcessing(shipment_id);
+      const task_id = processResult.task_id;
 
       // 3. 轮询任务状态
       const pollInterval = setInterval(async () => {
@@ -83,16 +84,16 @@ export const Home: React.FC = () => {
   };
 
   return (
-    <div className="max-w-4xl mx-auto p-6">
-      <h1 className="text-3xl font-bold mb-8">清关优化系统</h1>
+    <div style={{ maxWidth: 1024, margin: '0 auto', padding: 24 }}>
+      <h1 style={{ fontSize: 30, fontWeight: 'bold', marginBottom: 32 }}>清关优化系统</h1>
 
       {status === 'idle' && (
         <>
           <FileUpload onFilesSelected={handleFilesSelected} />
 
           {files.length > 0 && (
-            <Card className="mt-6">
-              <h3 className="text-lg font-semibold mb-4">已上传文件</h3>
+            <Card style={{ marginTop: 24 }}>
+              <h3 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>已上传文件</h3>
               <List
                 dataSource={files}
                 renderItem={(file, index) => (
@@ -119,7 +120,7 @@ export const Home: React.FC = () => {
               <Button
                 type="primary"
                 size="large"
-                className="mt-6 w-full"
+                style={{ marginTop: 24, width: '100%' }}
                 onClick={handleStartProcessing}
               >
                 开始处理
@@ -143,9 +144,9 @@ export const Home: React.FC = () => {
 
       {status === 'failed' && (
         <Card>
-          <div className="text-center py-12">
-            <p className="text-xl text-red-500 mb-4">处理失败</p>
-            <p className="text-gray-600 mb-6">请检查文件格式是否正确，或稍后重试</p>
+          <div style={{ textAlign: 'center', paddingTop: 48, paddingBottom: 48 }}>
+            <p style={{ fontSize: 20, color: '#ff4d4f', marginBottom: 16 }}>处理失败</p>
+            <p style={{ color: '#666', marginBottom: 24 }}>请检查文件格式是否正确，或稍后重试</p>
             <Button type="primary" onClick={handleReset}>
               重新开始
             </Button>
