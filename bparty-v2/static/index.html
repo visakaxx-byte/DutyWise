@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BParty V2</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace" aria-labelledby="page-title">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">BParty V2</p>
+            <h1 id="page-title">清关处理台</h1>
+          </div>
+          <div class="status-pill" id="statusPill">待上传</div>
+        </header>
+
+        <form id="processForm" class="panel" novalidate>
+          <div class="form-grid">
+            <label class="upload-card" for="manifestInput">
+              <span class="upload-icon">XLS</span>
+              <span class="upload-title">上传清单 Excel</span>
+              <span class="upload-hint">支持 .xlsx / .xls</span>
+              <input id="manifestInput" name="manifest" type="file" accept=".xlsx,.xls,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
+              <span class="file-name" id="manifestName">未选择文件</span>
+            </label>
+
+            <label class="upload-card" for="billInput">
+              <span class="upload-icon pdf">PDF</span>
+              <span class="upload-title">上传运输提单 PDF</span>
+              <span class="upload-hint">支持 .pdf</span>
+              <input id="billInput" name="bill" type="file" accept=".pdf,application/pdf" required />
+              <span class="file-name" id="billName">未选择文件</span>
+            </label>
+          </div>
+
+          <div class="target-grid">
+            <label class="field" for="targetTaxInput">
+              <span>期望税金金额</span>
+              <input id="targetTaxInput" name="target_tax_amount" type="number" min="0.01" step="0.01" placeholder="例如 700" required />
+            </label>
+            <label class="field" for="targetCountInput">
+              <span>目标输出行数</span>
+              <input id="targetCountInput" name="target_item_count" type="number" min="1" max="30" step="1" placeholder="例如 10" required />
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="submitButton" type="submit">预处理评估</button>
+            <button id="confirmButton" type="button" class="confirm hidden">确认执行</button>
+            <button id="resetButton" type="button" class="secondary">重置</button>
+          </div>
+        </form>
+
+        <section class="result-layout" aria-live="polite">
+          <article id="precheckPanel" class="panel precheck-panel hidden">
+            <div class="section-head">
+              <h2>预处理评估</h2>
+              <span id="precheckBadge" class="precheck-badge">未评估</span>
+            </div>
+            <div id="precheckGrid" class="stats-grid empty">暂无评估</div>
+            <div id="precheckReasons" class="reason-list empty">暂无风险提示</div>
+          </article>
+
+          <article class="panel">
+            <div class="section-head">
+              <h2>统计</h2>
+              <span id="taskId" class="muted"></span>
+            </div>
+            <div id="statsGrid" class="stats-grid empty">暂无结果</div>
+          </article>
+
+          <article class="panel">
+            <div class="section-head">
+              <h2>提单品类</h2>
+            </div>
+            <div id="categoryList" class="tag-list empty">暂无结果</div>
+          </article>
+
+          <article class="panel">
+            <div class="section-head">
+              <h2>流程</h2>
+            </div>
+            <div id="flowList" class="flow-list empty">暂无结果</div>
+          </article>
+
+          <article class="panel output-panel">
+            <div class="section-head">
+              <h2>输出行</h2>
+              <a id="downloadLink" class="download-link hidden" href="#" download>下载结果</a>
+            </div>
+            <div class="table-wrap">
+              <table id="outputTable">
+                <thead></thead>
+                <tbody>
+                  <tr>
+                    <td class="empty-cell">暂无结果</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>

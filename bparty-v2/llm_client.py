@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from typing import Any, Optional
+
+import httpx
+
+from config import LLMSettings, get_llm_settings
+
+
+class LLMError(RuntimeError):
+    pass
+
+
+class LLMClient:
+    def __init__(self, settings: Optional[LLMSettings] = None):
+        self.settings = settings or get_llm_settings()
+        if not self.settings.api_key:
+            raise LLMError("缺少 LLM_API_KEY 或 DOUBAO_API_KEY")
+
+    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1) -> dict[str, Any]:
+        payload = {
+            "model": self.settings.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": 4096,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.settings.api_key}",
+            "Content-Type": "application/json",
+        }
+        timeout = httpx.Timeout(connect=20.0, read=self.settings.timeout, write=30.0, pool=20.0)
+        last_timeout = None
+        for attempt in range(1, 3):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(f"{self.settings.base_url}/chat/completions", headers=headers, json=payload)
+                break
+            except httpx.TimeoutException as exc:
+                last_timeout = exc
+                if attempt >= 2:
+                    raise LLMError(f"LLM 请求超时，已重试 {attempt} 次") from exc
+                await asyncio.sleep(3)
+        else:
+            raise LLMError("LLM 请求超时") from last_timeout
+
+        if response.status_code != 200:
+            raise LLMError(f"LLM HTTP {response.status_code}: {response.text[:500]}")
+
+        try:
+            body = response.json()
+            content = body["choices"][0]["message"]["content"]
+        except Exception as exc:
+            raise LLMError(f"LLM 响应结构异常: {response.text[:500]}") from exc
+
+        return parse_json_object(content)
+
+
+def parse_json_object(content: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+    if not match:
+        raise LLMError("LLM 未返回 JSON object")
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError as exc:
+        raise LLMError("LLM 返回 JSON 无法解析") from exc
+    if not isinstance(parsed, dict):
+        raise LLMError("LLM JSON 顶层必须是 object")
+    return parsed

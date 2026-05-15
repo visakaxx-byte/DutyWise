@@ -1,0 +1,4 @@
+# One allowed certification or regulatory phrase per line.
+# A candidate is usable when certification hints are empty, or only mention allowed terms.
+Lacey Act
+TSCA
