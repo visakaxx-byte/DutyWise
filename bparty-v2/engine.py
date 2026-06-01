@@ -7,7 +7,8 @@ import uuid
 import asyncio
 import hashlib
 import inspect
-import time
+import base64
+import io
 from copy import copy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -16,6 +17,8 @@ from typing import Any, Callable, Optional
 
 from openpyxl import load_workbook
 from pypdf import PdfReader
+import pypdfium2 as pdfium
+from PIL import Image
 
 from crawler_client import StrictTaxCrawler
 from llm_client import LLMClient
@@ -29,6 +32,9 @@ RULES_ROOT = APP_DIR / "rules"
 MAX_OUTPUT_ITEMS = 30
 BASE_TAX_LIMIT = 0.2
 TAX_TOLERANCE_USD = 1.0
+TAX_FINAL_TOLERANCE_USD = 20.0
+MIN_ROW_TAX_AMOUNT_USD = 30.0
+MAX_ZERO_TAX_ROWS = 2
 TAX_UNDER_TARGET_ALLOWANCE_USD = 100.0
 DEFAULT_KG_PER_CTN_MIN = 0.5
 DEFAULT_KG_PER_CTN_MAX = 80.0
@@ -36,10 +42,10 @@ DEFAULT_KG_PER_PC_MIN = 0.01
 DEFAULT_KG_PER_PC_MAX = 50.0
 DEFAULT_UNIT_PRICE_MIN = 0.05
 DEFAULT_UNIT_PRICE_MAX = 50.0
-PRECHECK_MANIFEST_SAMPLE_LIMIT = 12
-PRECHECK_REPLACEMENT_SAMPLE_LIMIT = 6
-PRECHECK_GREEN_THRESHOLD = 0.7
-PRECHECK_YELLOW_THRESHOLD = 0.35
+BILL_TEXT_MIN_CHARS = 80
+BILL_VISION_MAX_PAGES = 2
+BILL_VISION_MAX_SIDE = 1800
+BILL_VISION_JPEG_QUALITY = 80
 
 DEFAULT_REFERENCE_STYLE_ROWS = [
     {"中文品名": "花园围栏", "英文品名": "Garden fence", "商品编码": "3926400090", "材质": "Plastic", "用途": "HOME", "单价": 1.3},
@@ -79,6 +85,9 @@ HEADERS = (
     "毛重",
     "原产国",
 )
+DISPLAY_TAX_RATE_FIELD = "税率"
+DISPLAY_TAX_AMOUNT_FIELD = "税金"
+WORKBOOK_HEADERS = (*HEADERS, DISPLAY_TAX_RATE_FIELD, DISPLAY_TAX_AMOUNT_FIELD)
 
 FIELD_TRANSLATION_ACRONYMS = {
     "ABS",
@@ -325,9 +334,22 @@ class BillInfo:
     shipment_no: str = ""
     eta: str = ""
     cartons: Optional[float] = None
+    carton_evidence: str = ""
     gross_weight: Optional[float] = None
     cbm: Optional[float] = None
     product_entries: list[BillProduct] = field(default_factory=list)
+    parse_source: str = "text"
+    text_chars: int = 0
+    vision_pages: int = 0
+
+
+@dataclass
+class BillLLMFields:
+    product_entries: list[BillProduct]
+    shipper: str = ""
+    consignee: str = ""
+    carton_count: Optional[float] = None
+    carton_evidence: str = ""
 
 
 @dataclass(frozen=True)
@@ -435,6 +457,8 @@ async def build_clearance(
     llm_generation_used = False
     if manifest.total_real_weight <= 0:
         raise RuntimeError("清单 Excel 未识别到有效总重量，不能继续生成")
+    if not bill.cartons or bill.cartons <= 0:
+        raise RuntimeError("提单未识别到有效总箱数，不能生成与提单箱数对齐的输出")
 
     flow: list[dict[str, Any]] = [
         {
@@ -491,7 +515,7 @@ async def build_clearance(
                 "stage": "bill_products",
                 "status": "running",
                 "progress": 58,
-                "message": "正在按提单品类查询 HS/税率",
+                "message": "正在按提单品类查询税率",
             },
         )
         bill_required, bill_filtered = await qualify_bill_product_candidates(
@@ -512,13 +536,13 @@ async def build_clearance(
                 "bill_products": len(bill.products),
                 "qualified": len(bill_required),
                 "filtered": len(bill_filtered),
-                "message": "提单品类必须来自提单 HS、品类查询或 LLM 查询扩展的真实 codeflagai 候选",
+                "message": "提单品类按 codeflagai 实际税率保留，不受 20% 税率上限限制；认证仍需校验",
             }
         )
         if len(bill_required) < len(bill.products):
             missing = [item.zh for item in bill_filtered if item.source == "bill"] or bill.products
             raise RuntimeError(
-                "提单品类缺少合格 HS/税率候选，不能套用无关品名；"
+                "提单品类缺少合格税率候选，不能套用无关品名；"
                 f"请补充 HS 或调整品类: {', '.join(missing)}"
             )
 
@@ -602,6 +626,7 @@ async def build_clearance(
         bill,
         options,
     )
+    await translate_output_chinese_names_with_llm(llm_client, rows)
     llm_generation_used = True
     validate_output_rows(rows)
     estimated_tax = round(sum((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0) for row in rows), 2)
@@ -649,6 +674,9 @@ async def build_clearance(
         "weight_evidence": manifest.weight_evidence,
         "weight_confidence": manifest.weight_confidence,
         "manifest_rows": manifest.row_count,
+        "bill_parse_source": bill.parse_source,
+        "bill_text_chars": bill.text_chars,
+        "bill_vision_pages": bill.vision_pages,
         "input_categories": len(manifest.categories),
         "target_item_count": options.target_item_count,
         "output_rows": len(rows),
@@ -713,236 +741,6 @@ def validate_processing_options(
     )
 
 
-async def build_precheck(
-    manifest_path: str | Path,
-    bill_path: str | Path,
-    requested_profile: str = "auto",
-    target_tax_amount: Optional[float] = None,
-    target_item_count: Optional[int] = None,
-    crawler: Optional[StrictTaxCrawler] = None,
-    bill_parser: Optional[LLMClient] = None,
-    manifest_parser: Optional[LLMClient] = None,
-    llm: Optional[LLMClient] = None,
-    query_cache: Optional[QueryCache] = None,
-    manifest_sample_limit: int = PRECHECK_MANIFEST_SAMPLE_LIMIT,
-    replacement_sample_limit: int = PRECHECK_REPLACEMENT_SAMPLE_LIMIT,
-) -> dict[str, Any]:
-    options = validate_processing_options(target_tax_amount, target_item_count, requested_profile)
-    query_cache = query_cache if query_cache is not None else {"product": {}, "hs": {}, "bill": {}}
-    llm_client = llm or bill_parser or manifest_parser or LLMClient()
-    manifest = await parse_manifest(manifest_path, manifest_parser or llm_client, query_cache)
-    bill = await parse_bill(bill_path, bill_parser or llm_client, query_cache)
-    rules = load_selection_rules()
-    manifest_candidates: list[ProductCandidate] = []
-    replacement_candidates = sorted(load_replacement_candidates(), key=lambda item: selection_score(item, rules), reverse=True)
-
-    early_reasons: list[str] = []
-    if manifest.total_real_weight <= 0:
-        early_reasons.append("清单 Excel 未识别到有效总重量")
-    if len(bill.products) > options.target_item_count:
-        early_reasons.append(f"提单品类 {len(bill.products)} 个超过目标输出行数 {options.target_item_count}")
-    total_candidate_capacity = len(bill.products) + len(manifest_candidates) + len(replacement_candidates)
-    if options.target_item_count > total_candidate_capacity:
-        early_reasons.append(
-            f"目标条目数 {options.target_item_count} 超过客户候选和替换候选总数 {total_candidate_capacity}"
-        )
-
-    sampled_manifest: list[ProductCandidate] = []
-    sampled_replacements: list[ProductCandidate] = []
-    manifest_filtered: list[ProductCandidate] = []
-    replacement_filtered: list[ProductCandidate] = []
-    bill_required: list[ProductCandidate] = []
-    bill_filtered: list[ProductCandidate] = []
-    sample_elapsed = 0.0
-
-    if not early_reasons:
-        crawler = crawler or StrictTaxCrawler()
-        sampled_manifest_source = manifest_candidates[: max(0, manifest_sample_limit)]
-        sampled_replacement_source = replacement_candidates[: max(0, replacement_sample_limit)]
-        start = time.perf_counter()
-        bill_required, bill_filtered = await qualify_bill_product_candidates(
-            crawler,
-            bill,
-            [],
-            replacement_candidates,
-            rules,
-            options,
-            query_cache=query_cache,
-            llm=llm_client,
-        )
-        sampled_manifest, manifest_filtered = await qualify_candidates(
-            crawler,
-            sampled_manifest_source,
-            rules,
-            query_cache=query_cache,
-        )
-        sampled_replacements, replacement_filtered = await qualify_candidates(
-            crawler,
-            sampled_replacement_source,
-            rules,
-            query_cache=query_cache,
-        )
-        sample_elapsed = time.perf_counter() - start
-
-    summary = estimate_precheck_summary(
-        options=options,
-        manifest=manifest,
-        bill=bill,
-        manifest_candidate_count=len(manifest_candidates),
-        replacement_candidate_count=len(replacement_candidates),
-        manifest_sample_count=min(len(manifest_candidates), max(0, manifest_sample_limit)),
-        replacement_sample_count=min(len(replacement_candidates), max(0, replacement_sample_limit)),
-        sampled_manifest=sampled_manifest,
-        sampled_replacements=sampled_replacements,
-        manifest_filtered=manifest_filtered,
-        replacement_filtered=replacement_filtered,
-        bill_required=bill_required,
-        bill_filtered=bill_filtered,
-        sample_elapsed=sample_elapsed,
-        crawler_delay=(crawler.settings.delay if crawler else 0.0),
-        early_reasons=early_reasons,
-    )
-    return {
-        "precheck": summary,
-        "manifest": manifest_to_public_dict(manifest),
-        "bill": bill_to_public_dict(bill),
-        "query_cache": query_cache,
-        "input": {
-            "manifest_path": str(manifest_path),
-            "bill_path": str(bill_path),
-            "target_tax_amount": options.target_tax_amount,
-            "target_item_count": options.target_item_count,
-            "requested_profile": options.requested_profile,
-        },
-    }
-
-
-def estimate_precheck_summary(
-    *,
-    options: ProcessingOptions,
-    manifest: ManifestSummary,
-    bill: BillInfo,
-    manifest_candidate_count: int,
-    replacement_candidate_count: int,
-    manifest_sample_count: int,
-    replacement_sample_count: int,
-    sampled_manifest: list[ProductCandidate],
-    sampled_replacements: list[ProductCandidate],
-    manifest_filtered: list[ProductCandidate],
-    replacement_filtered: list[ProductCandidate],
-    bill_required: list[ProductCandidate],
-    bill_filtered: list[ProductCandidate],
-    sample_elapsed: float,
-    crawler_delay: float,
-    early_reasons: list[str],
-) -> dict[str, Any]:
-    sampled_qualified = [*bill_required, *sampled_manifest, *sampled_replacements]
-    sampled_count = len(bill_required) + len(bill_filtered) + manifest_sample_count + replacement_sample_count
-    manifest_rate = len(sampled_manifest) / manifest_sample_count if manifest_sample_count else 0.0
-    replacement_rate = len(sampled_replacements) / replacement_sample_count if replacement_sample_count else 0.0
-    positive_rate = (
-        len([candidate for candidate in sampled_qualified if candidate_tax_rate(candidate) > 0]) / len(sampled_qualified)
-        if sampled_qualified
-        else 0.0
-    )
-
-    projected_manifest = math.floor(manifest_candidate_count * manifest_rate * 0.85)
-    projected_replacements = math.floor(replacement_candidate_count * replacement_rate * 0.85)
-    estimated_usable_items = max(len(sampled_qualified), projected_manifest + projected_replacements)
-    estimated_positive_items = math.floor(estimated_usable_items * positive_rate)
-
-    if options.target_item_count <= 0:
-        success_probability = 0.0
-    else:
-        success_probability = min(1.0, estimated_usable_items / options.target_item_count)
-
-    risk_reasons = list(early_reasons)
-    missing_bill_products = [candidate.zh for candidate in bill_filtered if candidate.source == "bill"]
-    if missing_bill_products:
-        risk_reasons.append("提单品类预查询未找到合格 HS/税率候选: " + ", ".join(missing_bill_products))
-    if not early_reasons and estimated_usable_items < options.target_item_count:
-        risk_reasons.append(f"预计合格品名约 {estimated_usable_items} 个，低于目标 {options.target_item_count} 个")
-    if not early_reasons and sampled_count and estimated_positive_items <= 0:
-        risk_reasons.append("抽样未发现正综合税率候选，可能无法按期望税金反推申报价")
-
-    if early_reasons or missing_bill_products or success_probability < PRECHECK_YELLOW_THRESHOLD or (sampled_count and estimated_positive_items <= 0):
-        status = "red"
-        decision = "blocked"
-    elif success_probability < PRECHECK_GREEN_THRESHOLD:
-        status = "yellow"
-        decision = "allowed"
-    else:
-        status = "green"
-        decision = "allowed"
-
-    average_candidate_seconds = sample_elapsed / sampled_count if sampled_count else 0.0
-    average_candidate_seconds = max(average_candidate_seconds, crawler_delay)
-    expected_replacement_attempts = estimate_replacement_attempts(
-        options.target_item_count,
-        manifest_candidate_count,
-        replacement_candidate_count,
-        manifest_rate,
-        replacement_rate,
-    )
-    estimated_query_items = manifest_candidate_count + expected_replacement_attempts
-    estimated_seconds = math.ceil(max(1.0, average_candidate_seconds * estimated_query_items * 1.15))
-    if estimated_seconds >= 600:
-        risk_reasons.append("预计执行超过 10 分钟，正式处理将进入后台任务")
-
-    suggested_item_count = max(1, min(options.target_item_count, estimated_usable_items or len(sampled_qualified) or 1))
-    filtered_reasons = summarize_filter_reasons([*bill_filtered, *manifest_filtered, *replacement_filtered])
-    return {
-        "status": status,
-        "decision": decision,
-        "can_start": decision == "allowed",
-        "success_probability": round(success_probability, 4),
-        "success_probability_percent": round(success_probability * 100, 1),
-        "estimated_seconds": estimated_seconds,
-        "estimated_minutes": round(estimated_seconds / 60, 1),
-        "estimated_usable_items": estimated_usable_items,
-        "estimated_positive_tax_items": estimated_positive_items,
-        "suggested_item_count": suggested_item_count,
-        "target_item_count": options.target_item_count,
-        "target_tax_amount": options.target_tax_amount,
-        "manifest_rows": manifest.row_count,
-        "manifest_candidate_count": manifest_candidate_count,
-        "replacement_candidate_count": replacement_candidate_count,
-        "bill_product_count": len(bill.products),
-        "qualified_bill_products": len(bill_required),
-        "filtered_bill_products": len(bill_filtered),
-        "manifest_sample_count": manifest_sample_count,
-        "replacement_sample_count": replacement_sample_count,
-        "sampled_qualified_manifest": len(sampled_manifest),
-        "sampled_qualified_replacement": len(sampled_replacements),
-        "manifest_sample_pass_rate": round(manifest_rate, 4),
-        "replacement_sample_pass_rate": round(replacement_rate, 4),
-        "sample_elapsed_seconds": round(sample_elapsed, 2),
-        "estimated_query_items": estimated_query_items,
-        "manifest_total_weight": manifest.total_real_weight,
-        "manifest_weight_source": manifest.weight_source,
-        "manifest_weight_evidence": manifest.weight_evidence,
-        "bill_gross_weight": bill.gross_weight,
-        "risk_reasons": risk_reasons,
-        "filter_summary": filtered_reasons,
-    }
-
-
-def estimate_replacement_attempts(
-    target_item_count: int,
-    manifest_candidate_count: int,
-    replacement_candidate_count: int,
-    manifest_rate: float,
-    replacement_rate: float,
-) -> int:
-    expected_manifest_usable = manifest_candidate_count * manifest_rate * 0.85
-    needed = max(0.0, target_item_count - expected_manifest_usable)
-    if needed <= 0:
-        return 0
-    if replacement_rate <= 0:
-        return replacement_candidate_count
-    return min(replacement_candidate_count, math.ceil(needed / replacement_rate))
-
-
 async def qualify_bill_product_candidates(
     crawler: StrictTaxCrawler,
     bill: BillInfo,
@@ -957,6 +755,8 @@ async def qualify_bill_product_candidates(
     filtered: list[ProductCandidate] = []
     seen: set[tuple[str, str, str]] = set()
     for product in bill.products:
+        bill_entry = bill_product_entry_for(bill, product)
+        bill_material = infer_bill_material_from_entry(bill_entry) if bill_entry else ""
         rejected_matches = [
             candidate
             for candidate in qualified_manifest
@@ -980,13 +780,13 @@ async def qualify_bill_product_candidates(
             None,
         )
         if not match:
-            bill_entry = bill_product_entry_for(bill, product)
             if bill_entry and bill_entry.hs_code_hint:
-                result = await qualify_bill_hs_candidate(
+                result = await qualify_bill_hs_tax_candidate(
                     crawler,
                     build_bill_product_candidate(bill, bill_entry, options),
                     rules,
                     query_cache=query_cache,
+                    llm=llm,
                 )
                 if result.filter_reason:
                     filtered.append(result)
@@ -998,7 +798,7 @@ async def qualify_bill_product_candidates(
                 bill,
                 product,
                 product,
-                "",
+                bill_material,
                 rules,
                 options,
                 query_cache=query_cache,
@@ -1016,7 +816,13 @@ async def qualify_bill_product_candidates(
                 if attempts > 0:
                     await asyncio.sleep(crawler.settings.delay)
                 attempts += 1
-                result = await qualify_single_candidate(crawler, replacement, rules, query_cache=query_cache)
+                result = await qualify_single_candidate(
+                    crawler,
+                    replacement,
+                    rules,
+                    query_cache=query_cache,
+                    enforce_tax_limit=False,
+                )
                 if result.filter_reason:
                     filtered.append(result)
                     continue
@@ -1102,7 +908,7 @@ async def qualify_bill_product_query_candidate(
         return replace(candidate, filter_reason=product_reason)
     try:
         product_results = await cached_search_product(crawler, query_name or product, material, query_cache)
-        selected = select_qualified_tax_data(product_results, rules)
+        selected = select_qualified_tax_data(product_results, rules, enforce_tax_limit=False)
         if selected:
             return attach_tax_data(candidate, selected, match_source)
         return replace(candidate, filter_reason=f"提单品类查询无合格税率/认证结果: {product} -> {query_name}")
@@ -1130,7 +936,7 @@ def build_bill_product_query_candidate(
         zh=name,
         en=name.title() if name.isupper() else name,
         hs="",
-        material=material or "General",
+        material=material,
         usage="HOME",
         ctns=ctns,
         qty=qty,
@@ -1167,7 +973,7 @@ def build_bill_product_candidate(
         zh=entry.name,
         en=entry.name.title() if entry.name.isupper() else entry.name,
         hs=entry.hs_code_hint,
-        material="General",
+        material=infer_bill_material_from_entry(entry),
         usage="HOME",
         ctns=ctns,
         qty=qty,
@@ -1178,11 +984,12 @@ def build_bill_product_candidate(
     )
 
 
-async def qualify_bill_hs_candidate(
+async def qualify_bill_hs_tax_candidate(
     crawler: StrictTaxCrawler,
     candidate: ProductCandidate,
     rules: SelectionRules,
     query_cache: Optional[QueryCache] = None,
+    llm: Optional[LLMClient] = None,
 ) -> ProductCandidate:
     product_reason = product_rule_reason(candidate, rules)
     if product_reason:
@@ -1192,9 +999,18 @@ async def qualify_bill_hs_candidate(
 
     try:
         hs_results = await cached_search(crawler, candidate.hs, query_cache)
-        selected = select_qualified_tax_data(hs_results, rules)
+        selected = select_qualified_tax_data(hs_results, rules, required_hs=candidate.hs, enforce_tax_limit=False)
         if selected:
-            return attach_tax_data(candidate, selected, "bill_hs")
+            material = candidate.material
+            if should_infer_material_from_hs(candidate.material):
+                material = await infer_material_from_hs_description(
+                    crawler,
+                    candidate.hs,
+                    selected,
+                    llm=llm,
+                    query_cache=query_cache,
+                )
+            return attach_bill_hs_tax_data(candidate, selected, material)
         return replace(candidate, filter_reason="提单 HS hint 查询无合格税率/认证结果")
     except Exception as exc:
         return replace(candidate, filter_reason=f"提单 HS hint 查询失败: {exc}")
@@ -1230,6 +1046,65 @@ def candidate_matches_single_bill_product(candidate: ProductCandidate, product: 
 
 def candidate_has_product_tax_match(candidate: ProductCandidate) -> bool:
     return candidate.tax_match_source in {"product", "bill_hs", "bill_product", "llm_query"} and bool(normalize_hs(candidate.hs))
+
+
+def infer_bill_material_from_entry(entry: BillProduct) -> str:
+    text = normalize_text(entry.name)
+    if "plastic" in text or "塑料" in text or "塑胶" in text or "pvc" in text or "polypropylene" in text or "polyethylene" in text:
+        return "Plastic"
+    if "iron" in text or "steel" in text or "metal" in text or "metallic" in text or "铁" in text or "金属" in text:
+        return "Metal"
+    if "wood" in text or "木" in text:
+        return "Wood"
+    if "glass" in text or "玻璃" in text:
+        return "Glass"
+    if "paper" in text or "纸" in text:
+        return "Paper"
+    if "fabric" in text or "cloth" in text or "布" in text or "纺" in text:
+        return "Fabric"
+    if "rubber" in text or "橡胶" in text:
+        return "Rubber"
+    if "ceramic" in text or "陶瓷" in text:
+        return "Ceramic"
+    if "silicone" in text or "硅胶" in text:
+        return "Silicone"
+    return ""
+
+
+def should_infer_material_from_hs(material: str) -> bool:
+    normalized = normalize_text(material)
+    return not normalized or normalized in {"general", "mixed"}
+
+
+async def infer_material_from_hs_description(
+    crawler: StrictTaxCrawler,
+    hs_hint: str,
+    selected: dict[str, Any],
+    llm: Optional[LLMClient] = None,
+    query_cache: Optional[QueryCache] = None,
+) -> str:
+    description = clean_text(selected.get("description_cn"))
+    if not description:
+        return ""
+    prompt = (
+        "你是海关商品材质识别专家。请根据 HS 描述判断最合适的英文材质，"
+        "只输出一个词或短语，如 Plastic, Metal, Wood, Glass, Paper, Fabric, Rubber, Ceramic, Silicone, Acrylic, Polyester, Nylon, Iron. "
+        "如果无法判断，输出 Mixed。\n"
+        f"HS描述: {description}"
+    )
+    try:
+        llm_client = llm or LLMClient()
+        payload = await llm_client.chat_json(
+            [
+                {"role": "system", "content": "只输出 JSON object。"},
+                {"role": "user", "content": f"{prompt}\nJSON格式：{{\"material\":\"\"}}"},
+            ],
+            temperature=0.0,
+        )
+        material = clean_text(payload.get("material"))
+        return material or ""
+    except Exception:
+        return ""
 
 
 def load_selection_rules(rules_dir: Path = RULES_ROOT) -> SelectionRules:
@@ -1324,6 +1199,7 @@ async def qualify_single_candidate(
     candidate: ProductCandidate,
     rules: SelectionRules,
     query_cache: Optional[QueryCache] = None,
+    enforce_tax_limit: bool = True,
 ) -> ProductCandidate:
     product_reason = product_rule_reason(candidate, rules)
     if product_reason:
@@ -1333,7 +1209,12 @@ async def qualify_single_candidate(
     if candidate.source == "replacement" and normalize_hs(candidate.hs):
         try:
             hs_results = await cached_search(crawler, candidate.hs, query_cache)
-            selected = select_qualified_tax_data(hs_results, rules, required_hs=candidate.hs)
+            selected = select_qualified_tax_data(
+                hs_results,
+                rules,
+                required_hs=candidate.hs,
+                enforce_tax_limit=enforce_tax_limit,
+            )
             if selected:
                 return attach_tax_data(candidate, selected, "replacement_hs")
             errors.append("替换清单原始 HTS 查询无合格结果")
@@ -1346,6 +1227,7 @@ async def qualify_single_candidate(
             product_results,
             rules,
             required_hs=(candidate.hs if candidate.source == "replacement" else ""),
+            enforce_tax_limit=enforce_tax_limit,
         )
         if selected:
             return attach_tax_data(candidate, selected, "product")
@@ -1359,7 +1241,12 @@ async def qualify_single_candidate(
     if candidate.hs and candidate.source != "replacement":
         try:
             hs_results = await cached_search(crawler, candidate.hs, query_cache)
-            selected = select_qualified_tax_data(hs_results, rules, required_hs=candidate.hs)
+            selected = select_qualified_tax_data(
+                hs_results,
+                rules,
+                required_hs=candidate.hs,
+                enforce_tax_limit=enforce_tax_limit,
+            )
             if selected:
                 return attach_tax_data(candidate, selected, "hs")
             errors.append("原始 HTS 兜底查询无合格结果")
@@ -1519,19 +1406,20 @@ def select_qualified_tax_data(
     candidates: dict[str, dict[str, Any]],
     rules: SelectionRules,
     required_hs: str = "",
+    enforce_tax_limit: bool = True,
 ) -> Optional[dict[str, Any]]:
     ranked: list[tuple[int, float, dict[str, Any]]] = []
     for data in candidates.values():
         if required_hs and not tax_candidate_matches_required_hs(data, required_hs):
             continue
-        reason = tax_filter_reason(data, rules)
+        reason = tax_filter_reason(data, rules, enforce_tax_limit=enforce_tax_limit)
         if reason:
             continue
         anti_dumping_penalty = 1 if data.get("anti_dumping") else 0
-        ranked.append((anti_dumping_penalty, base_tax_rate(data) or 0, data))
+        ranked.append((anti_dumping_penalty, effective_tax_rate(data), base_tax_rate(data) or 0, data))
     if not ranked:
         return None
-    return sorted(ranked, key=lambda item: (item[0], item[1]))[0][2]
+    return sorted(ranked, key=lambda item: (item[0], item[1], item[2]))[0][3]
 
 
 def tax_candidate_matches_required_hs(data: dict[str, Any], required_hs: str) -> bool:
@@ -1548,15 +1436,19 @@ def tax_candidate_matches_required_hs(data: dict[str, Any], required_hs: str) ->
     return False
 
 
-def tax_filter_reason(data: dict[str, Any], rules: SelectionRules) -> str:
+def tax_filter_reason(data: dict[str, Any], rules: SelectionRules, enforce_tax_limit: bool = True) -> str:
     hs = normalize_hs(data.get("hs_code_us"))
     if len(hs) != 10:
         return "美国 HTS 不是 10 位"
     base_rate = base_tax_rate(data)
     if base_rate is None:
         return "基础税率为空或无法解析"
-    if base_rate >= BASE_TAX_LIMIT:
-        return f"基础税率 {format_rate(base_rate)} 不小于 20%"
+    if enforce_tax_limit:
+        if base_rate >= BASE_TAX_LIMIT:
+            return f"基础税率 {format_rate(base_rate)} 不小于 20%"
+        combined_rate = effective_tax_rate(data)
+        if combined_rate >= BASE_TAX_LIMIT:
+            return f"综合税率 {format_rate(combined_rate)} 不小于 20%"
     cert_reason = certification_filter_reason(data.get("certification_texts") or [], rules)
     if cert_reason:
         return cert_reason
@@ -1573,6 +1465,26 @@ def attach_tax_data(candidate: ProductCandidate, data: dict[str, Any], match_sou
         effective_tax_rate=effective_tax_rate(data),
         tax_match_source=match_source,
         certification_texts=list(data.get("certification_texts") or []),
+        filter_reason="",
+    )
+
+
+def attach_bill_hs_tax_data(
+    candidate: ProductCandidate,
+    data: dict[str, Any],
+    material: str,
+) -> ProductCandidate:
+    returned_hs = normalize_hs(data.get("hs_code_us"))
+    output_hs = returned_hs if len(returned_hs) == 10 else normalize_hs(candidate.hs)
+    return replace(
+        candidate,
+        hs=output_hs,
+        tax_data=data,
+        base_tax_rate=base_tax_rate(data) or 0,
+        effective_tax_rate=effective_tax_rate(data),
+        tax_match_source="bill_hs",
+        certification_texts=list(data.get("certification_texts") or []),
+        material=material or candidate.material or "Mixed",
         filter_reason="",
     )
 
@@ -1823,7 +1735,9 @@ def parse_non_exempt_additional_tax_rate(value: Any, details: Any = None) -> flo
             if is_exempt_additional_tax_text(text):
                 continue
             total += parse_tax_rate(rate_value if rate_value not in (None, "") else text) or 0
-        return total
+        if total or not clean_text(value):
+            return total
+        return parse_non_exempt_additional_tax_rate(value)
     if isinstance(details, dict):
         return parse_non_exempt_additional_tax_rate([details])
 
@@ -2286,13 +2200,14 @@ def build_output_rows(
             "综合税率": round(tax_rate, 6),
             "加征税率": clean_text(candidate.tax_data.get("additional_tax_rate")),
             "预计税金": round(plan.total_value * tax_rate, 2),
-            "爬虫匹配HS": candidate.hs,
+            "爬虫匹配HS": candidate.tax_data.get("hs_code_us") or candidate.hs,
             "爬虫品名": candidate.tax_data.get("description_cn", ""),
             "认证信息": "; ".join(candidate.certification_texts),
             "重量规则来源": plan.plausibility.source or "默认规则",
             "约束提示": "; ".join(plan.warnings),
             "source_rows": candidate.source_rows,
         }
+        update_row_tax_display(row)
         rows.append(row)
 
     normalize_output_language_fields(rows)
@@ -2320,7 +2235,7 @@ async def generate_valid_output_rows_with_llm(
             feedback_history.append(last_error)
             feedback = (
                 "上一次草案未通过代码硬校验，请只修正数值和行分配后重新输出 JSON。"
-                f"错误：{last_error}。不能放宽税率、认证、总重量、税金区间、行数和合理范围。"
+                f"错误：{last_error}。不能放宽税率、认证、总重量、税金±20区间、行数和合理范围。"
             )
     raise RuntimeError(f"LLM 草案连续不合格: {last_error}")
 
@@ -2357,15 +2272,16 @@ def build_output_draft_prompt(
     feedback: str = "",
 ) -> str:
     candidates = [candidate_to_llm_dict(candidate) for candidate in selected]
+    if not bill.cartons or bill.cartons <= 0:
+        raise RuntimeError("提单未识别到有效总箱数，不能生成与提单箱数对齐的输出")
     return (
         "请基于给定候选生成最终清关行草案。\n"
         "硬要求：\n"
         f"1. 输出 rows 数量必须等于 {options.target_item_count}，且每个候选必须输出一行，不得新增/删除/改名/改 HS。\n"
         f"2. 毛重请按品类合理分配；代码会按 Excel 总重量 {manifest.total_real_weight} kg 等比例倒推并强制闭合。\n"
-        f"3. 总税金必须大于等于 {max(0.0, options.target_tax_amount - TAX_UNDER_TARGET_ALLOWANCE_USD)} USD，"
-        f"且不得超过 {options.target_tax_amount} USD；税金=总价*综合税率。\n"
-        f"4. 总箱数建议等于 {manifest.total_ctns}；若为 0 则按候选合理分配。\n"
-        "5. 每行单价和每箱数量必须落入 candidate.plausibility_range；毛重可服务于总重量闭合。\n"
+        f"3. 总税金必须落在 {max(0.0, options.target_tax_amount - TAX_FINAL_TOLERANCE_USD)}-{options.target_tax_amount + TAX_FINAL_TOLERANCE_USD} USD 之间；税金=总价*综合税率；每行税金只能等于 0 或不低于 {MIN_ROW_TAX_AMOUNT_USD} USD，且税金为 0 的行数最多 {MAX_ZERO_TAX_ROWS} 行。\n"
+        f"4. 总箱数必须等于提单总箱数 {bill.cartons}，不得使用清单箱数替代。\n"
+        "5. 每行数量必须大于等于箱数，且数量必须是箱数的整数倍；每行单价和每箱数量必须落入 candidate.plausibility_range；毛重可服务于总重量闭合。\n"
         "6. 不要让所有行数量相同，不要让所有行单件重量相同，不要给电器/机器类低到不合理的单价。\n"
         "7. 单价、数量、毛重、箱数要像真实装箱清单，优先使用候选原始参数或合理范围中位数；毛重最终以 Excel 总重量倒推为准。\n"
         f"{'修正反馈：' + feedback if feedback else ''}\n"
@@ -2446,7 +2362,7 @@ def normalize_llm_output_draft(payload: dict[str, Any], selected: list[ProductCa
             "综合税率": round(tax_rate, 6),
             "加征税率": clean_text(candidate.tax_data.get("additional_tax_rate")),
             "预计税金": round(total_value * tax_rate, 2),
-            "爬虫匹配HS": candidate.hs,
+            "爬虫匹配HS": candidate.tax_data.get("hs_code_us") or candidate.hs,
             "爬虫品名": candidate.tax_data.get("description_cn", ""),
             "认证信息": "; ".join(candidate.certification_texts),
             "重量规则来源": (candidate.plausibility_range.source if candidate.plausibility_range else ""),
@@ -2461,6 +2377,7 @@ def normalize_llm_output_draft(payload: dict[str, Any], selected: list[ProductCa
             "税率来源": candidate.tax_match_source,
             "查询词": candidate.query_name or candidate.zh,
         }
+        update_row_tax_display(row)
         rows.append(row)
     return rows
 
@@ -2480,21 +2397,99 @@ def validate_llm_output_rows(
         raise RuntimeError("LLM 草案必须一行对应一个候选，不能重复或遗漏候选")
     ensure_bill_products_present(rows, bill.products, selected)
 
+    reconcile_llm_rows_ctns(rows, bill.cartons)
+    reconcile_row_quantities_to_cartons(rows, selected)
     close_llm_rows_gross_weight(rows, manifest.total_real_weight)
+    close_llm_rows_tax_gap(rows, selected, options.target_tax_amount)
+    validate_candidate_tax_rates(selected)
+    validate_qty_ctn_relationship(rows)
+    validate_row_counts(rows, bill.cartons)
     tax_total = round(sum((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0) for row in rows), 2)
-    tax_lower_bound = max(0.0, round(options.target_tax_amount - TAX_UNDER_TARGET_ALLOWANCE_USD, 2))
-    if tax_total > options.target_tax_amount or tax_total < tax_lower_bound:
+    tax_lower_bound = max(0.0, round(options.target_tax_amount - TAX_FINAL_TOLERANCE_USD, 2))
+    tax_upper_bound = round(options.target_tax_amount + TAX_FINAL_TOLERANCE_USD, 2)
+    if tax_total > tax_upper_bound or tax_total < tax_lower_bound:
         feasible = estimate_tax_feasible_range(selected)
         raise RuntimeError(
             "合理范围内无法进入目标税金允许区间或 LLM 草案税金未闭合；"
-            f"允许区间 {tax_lower_bound}-{options.target_tax_amount}, 当前 {tax_total}, "
+            f"允许区间 {tax_lower_bound}-{tax_upper_bound}, 当前 {tax_total}, "
             f"可行税金区间约 {feasible[0]}-{feasible[1]}"
         )
+    validate_minimum_row_tax(rows)
     validate_row_plausibility(rows, selected)
     validate_distribution_realism(rows)
     normalize_output_language_fields(rows)
     for row in rows:
-        row["预计税金"] = round((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0), 2)
+        update_row_tax_display(row)
+
+
+def reconcile_llm_rows_ctns(rows: list[dict[str, Any]], bill_cartons: Optional[float]) -> None:
+    target_ctns = round(float(bill_cartons), 2) if bill_cartons and bill_cartons > 0 else 0.0
+    if target_ctns <= 0:
+        raise RuntimeError("提单未识别到有效总箱数，不能生成与提单箱数对齐的输出")
+
+    current_values = [max(0.01, to_float(row.get("箱数")) or 0.0) for row in rows]
+    scaled = scale_integer(current_values, target_ctns)
+    for row, old_ctns, ctns in zip(rows, current_values, scaled):
+        row["LLM草案箱数"] = row.get("LLM草案箱数", old_ctns)
+        row["箱数"] = ctns
+        row["箱数闭合调整"] = round(ctns - old_ctns, 2)
+
+    ctn_total = round(sum(to_float(row.get("箱数")) or 0 for row in rows), 2)
+    if abs(ctn_total - target_ctns) > 0.01:
+        raise RuntimeError(f"总箱数未闭合: 目标 {target_ctns}, 当前 {ctn_total}")
+
+
+def reconcile_row_quantities_to_cartons(rows: list[dict[str, Any]], selected: list[ProductCandidate]) -> None:
+    for row, candidate in zip(rows, selected):
+        ctns = max(1, int(round(to_float(row.get("箱数")) or 1)))
+        draft_qty = max(1, int(round(to_float(row.get("数量")) or to_float(candidate.qty) or ctns)))
+        desired_per_ctn = max(1, int(math.ceil(draft_qty / ctns)))
+        plausibility = candidate.plausibility_range
+        if plausibility and plausibility.qty_per_ctn_min is not None:
+            desired_per_ctn = max(desired_per_ctn, int(math.ceil(plausibility.qty_per_ctn_min)))
+        if plausibility and plausibility.qty_per_ctn_max is not None:
+            max_per_ctn = max(1, int(math.floor(plausibility.qty_per_ctn_max)))
+            desired_per_ctn = min(desired_per_ctn, max_per_ctn)
+        qty = max(ctns, ctns * max(1, desired_per_ctn))
+        row["LLM草案数量"] = row.get("LLM草案数量", draft_qty)
+        row["数量"] = qty
+        row["每箱数量"] = round(qty / ctns, 6)
+
+
+def validate_qty_ctn_relationship(rows: list[dict[str, Any]]) -> None:
+    for idx, row in enumerate(rows, start=1):
+        ctns_float = to_float(row.get("箱数"))
+        qty_float = to_float(row.get("数量"))
+        if ctns_float is None or qty_float is None:
+            raise RuntimeError(f"第 {idx} 行箱数/数量缺失")
+        ctns = int(round(ctns_float))
+        qty = int(round(qty_float))
+        if abs(ctns_float - ctns) > 0.0001 or ctns <= 0:
+            raise RuntimeError(f"第 {idx} 行箱数必须为正整数: {row.get('箱数')}")
+        if abs(qty_float - qty) > 0.0001 or qty <= 0:
+            raise RuntimeError(f"第 {idx} 行数量必须为正整数: {row.get('数量')}")
+        if qty < ctns:
+            raise RuntimeError(f"第 {idx} 行数量不能小于箱数: 数量 {qty}, 箱数 {ctns}")
+        if qty % ctns != 0:
+            raise RuntimeError(f"第 {idx} 行数量必须是箱数的整数倍: 数量 {qty}, 箱数 {ctns}")
+
+
+def validate_candidate_tax_rates(selected: list[ProductCandidate]) -> None:
+    for idx, candidate in enumerate(selected, start=1):
+        rate = candidate_tax_rate(candidate)
+        if rate >= BASE_TAX_LIMIT:
+            raise RuntimeError(
+                f"第 {idx} 行综合税率 {format_rate(rate)} 不小于 20%，禁止输出: "
+                f"{candidate.zh} / {candidate.hs}"
+            )
+
+
+def validate_row_counts(rows: list[dict[str, Any]], target_ctns: Optional[float]) -> None:
+    if not target_ctns or target_ctns <= 0:
+        return
+    current = round(sum(to_float(row.get("箱数")) or 0 for row in rows), 2)
+    if abs(current - round(float(target_ctns), 2)) > 0.01:
+        raise RuntimeError(f"总箱数未闭合: 目标 {round(float(target_ctns), 2)}, 当前 {current}")
 
 
 def close_llm_rows_gross_weight(rows: list[dict[str, Any]], target_gross: float) -> None:
@@ -2514,6 +2509,31 @@ def close_llm_rows_gross_weight(rows: list[dict[str, Any]], target_gross: float)
         raise RuntimeError(f"总毛重未闭合: 目标 {target_gross}, 当前 {gross_total}")
 
 
+def close_llm_rows_tax_gap(rows: list[dict[str, Any]], selected: list[ProductCandidate], target_tax_amount: float) -> None:
+    unit_prices: list[float] = []
+    quantities: list[int] = []
+    mins: list[float] = []
+    maxes: list[float] = []
+    for row, candidate in zip(rows, selected):
+        qty = max(1, int(round(to_float(row.get("数量")) or to_float(candidate.qty) or 1)))
+        unit_price = max(0.0001, to_float(row.get("单价")) or 0.0)
+        plausibility = candidate.plausibility_range
+        min_price = plausibility.unit_price_min if plausibility and plausibility.unit_price_min is not None else DEFAULT_UNIT_PRICE_MIN
+        max_price = plausibility.unit_price_max if plausibility and plausibility.unit_price_max is not None else DEFAULT_UNIT_PRICE_MAX
+        unit_prices.append(unit_price)
+        quantities.append(qty)
+        mins.append(max(0.0001, min_price))
+        maxes.append(max(mins[-1], max_price))
+
+    enforce_minimum_row_tax(unit_prices, mins, maxes, selected, quantities, MIN_ROW_TAX_AMOUNT_USD)
+    adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount, MIN_ROW_TAX_AMOUNT_USD)
+
+    for row, unit_price, qty in zip(rows, unit_prices, quantities):
+        row["单价"] = round(unit_price, 4)
+        row["总价"] = round(unit_price * qty, 2)
+        update_row_tax_display(row)
+
+
 def validate_row_plausibility(rows: list[dict[str, Any]], selected: list[ProductCandidate]) -> None:
     for idx, (row, candidate) in enumerate(zip(rows, selected), start=1):
         if normalize_hs(row.get("商品编码")) != normalize_hs(candidate.hs):
@@ -2527,10 +2547,12 @@ def validate_row_plausibility(rows: list[dict[str, Any]], selected: list[Product
         ctns = to_float(row.get("箱数")) or 0
         gross = to_float(row.get("毛重")) or 0
         unit_price = to_float(row.get("单价")) or 0
+        qty_per_ctn_min = max(1.0, plausibility.qty_per_ctn_min or 1.0)
+        qty_per_ctn_max = max(qty_per_ctn_min, plausibility.qty_per_ctn_max or qty_per_ctn_min)
         checks = [
             ("单价", unit_price, plausibility.unit_price_min, plausibility.unit_price_max, True),
             ("单件重量", gross / qty if qty else 0, plausibility.kg_per_pc_min, plausibility.kg_per_pc_max, False),
-            ("每箱数量", qty / ctns if ctns else 0, plausibility.qty_per_ctn_min, plausibility.qty_per_ctn_max, True),
+            ("每箱数量", qty / ctns if ctns else 0, qty_per_ctn_min, qty_per_ctn_max, True),
             ("单箱重量", gross / ctns if ctns else 0, plausibility.kg_per_ctn_min, plausibility.kg_per_ctn_max, False),
         ]
         warnings: list[str] = []
@@ -2565,6 +2587,26 @@ def validate_distribution_realism(rows: list[dict[str, Any]]) -> None:
         raise RuntimeError("单件重量分布过于机械，多个品类单体重量几乎相同")
 
 
+def validate_minimum_row_tax(rows: list[dict[str, Any]]) -> None:
+    zero_tax_rows = 0
+    for idx, row in enumerate(rows, start=1):
+        tax_amount = to_float(row.get(DISPLAY_TAX_AMOUNT_FIELD))
+        if tax_amount is None:
+            rate = to_float(row.get("综合税率")) or 0.0
+            total_value = to_float(row.get("总价")) or 0.0
+            tax_amount = round(total_value * rate, 2)
+        if abs(tax_amount) <= 0.005:
+            zero_tax_rows += 1
+            continue
+        if tax_amount + 0.005 < MIN_ROW_TAX_AMOUNT_USD:
+            raise RuntimeError(
+                f"第 {idx} 行税金必须等于 0 或不低于 {MIN_ROW_TAX_AMOUNT_USD} USD: "
+                f"{row.get('中文品名')} / {row.get('商品编码')} = {tax_amount}"
+            )
+    if zero_tax_rows > MAX_ZERO_TAX_ROWS:
+        raise RuntimeError(f"税金为 0 的行数不能超过 {MAX_ZERO_TAX_ROWS} 行，当前 {zero_tax_rows} 行")
+
+
 def estimate_tax_feasible_range(selected: list[ProductCandidate]) -> tuple[float, float]:
     min_tax = 0.0
     max_tax = 0.0
@@ -2575,7 +2617,7 @@ def estimate_tax_feasible_range(selected: list[ProductCandidate]) -> tuple[float
             continue
         min_qty = max(1, math.ceil((candidate.ctns or 1) * (plausibility.qty_per_ctn_min or 1)))
         max_qty = max(min_qty, math.ceil((candidate.ctns or 1) * (plausibility.qty_per_ctn_max or min_qty)))
-        min_tax += min_qty * (plausibility.unit_price_min or 0) * rate
+        min_tax += max(MIN_ROW_TAX_AMOUNT_USD, min_qty * (plausibility.unit_price_min or 0) * rate)
         max_tax += max_qty * (plausibility.unit_price_max or 0) * rate
     return round(min_tax, 2), round(max_tax, 2)
 
@@ -2589,7 +2631,9 @@ def build_plausible_row_plans(
     plausibility_ranges: dict[tuple[str, str, str], PlausibilityRange],
 ) -> list[RowPlan]:
     target_gross = round(manifest.total_real_weight, 2)
-    target_ctns = manifest.total_ctns or bill.cartons or sum(candidate.ctns for candidate in selected) or options.target_item_count
+    if not bill.cartons or bill.cartons <= 0:
+        raise RuntimeError("提单未识别到有效总箱数，不能生成与提单箱数对齐的输出")
+    target_ctns = bill.cartons
     target_ctns = max(options.target_item_count, int(round(target_ctns)))
     ctn_values = [candidate.ctns or 1 for candidate in selected]
     ctns = scale_positive_integers(ctn_values, target_ctns)
@@ -2762,6 +2806,10 @@ def choose_plausible_quantity(
         min_qty = max(min_qty, math.ceil(ctns * plausibility.qty_per_ctn_min))
     if plausibility.qty_per_ctn_max:
         max_qty = min(max_qty, max(1, math.floor(ctns * plausibility.qty_per_ctn_max)))
+    tax_rate = candidate_tax_rate(candidate)
+    max_unit_price = plausibility.unit_price_max or DEFAULT_UNIT_PRICE_MAX
+    if tax_rate > 0 and max_unit_price > 0:
+        min_qty = max(min_qty, math.ceil(MIN_ROW_TAX_AMOUNT_USD / (max_unit_price * tax_rate)))
     if min_qty > max_qty:
         raise RuntimeError(
             "优化无解：单件重量和单箱件数范围无法同时满足；"
@@ -2799,7 +2847,8 @@ def allocate_plausible_prices(
             desired = candidate.unit_price or min_price
         unit_prices.append(min(max(desired, min_price), max_price))
 
-    adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount)
+    enforce_minimum_row_tax(unit_prices, mins, maxes, selected, quantities, MIN_ROW_TAX_AMOUNT_USD)
+    adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount, MIN_ROW_TAX_AMOUNT_USD)
     prices: list[tuple[float, float]] = []
     for unit_price, qty in zip(unit_prices, quantities):
         rounded_unit = round(unit_price, 4)
@@ -2807,7 +2856,7 @@ def allocate_plausible_prices(
         prices.append((rounded_unit, total_value))
 
     estimated_tax = round(sum(total * candidate_tax_rate(candidate) for candidate, (_, total) in zip(selected, prices)), 2)
-    tolerance = max(TAX_TOLERANCE_USD, target_tax_amount * 0.01)
+    tolerance = TAX_FINAL_TOLERANCE_USD
     if abs(estimated_tax - target_tax_amount) > tolerance:
         raise RuntimeError(
             "优化无解：在重量和单价常理范围内无法贴近期望税金；"
@@ -2823,10 +2872,11 @@ def adjust_price_gap(
     selected: list[ProductCandidate],
     quantities: list[int],
     target_tax_amount: float,
+    min_row_tax_amount: float = 0.0,
 ) -> None:
     current_tax = sum(price * qty * candidate_tax_rate(candidate) for price, qty, candidate in zip(unit_prices, quantities, selected))
     diff = target_tax_amount - current_tax
-    if abs(diff) <= max(TAX_TOLERANCE_USD, target_tax_amount * 0.01):
+    if abs(diff) <= TAX_FINAL_TOLERANCE_USD:
         return
     if diff > 0:
         order = sorted(range(len(unit_prices)), key=lambda idx: (maxes[idx] - unit_prices[idx]) * quantities[idx] * candidate_tax_rate(selected[idx]), reverse=True)
@@ -2849,7 +2899,10 @@ def adjust_price_gap(
             rate = candidate_tax_rate(selected[idx])
             if rate <= 0:
                 continue
-            capacity_tax = (unit_prices[idx] - mins[idx]) * quantities[idx] * rate
+            min_price = mins[idx]
+            if min_row_tax_amount > 0:
+                min_price = max(min_price, min_row_tax_amount / (quantities[idx] * rate))
+            capacity_tax = (unit_prices[idx] - min_price) * quantities[idx] * rate
             if capacity_tax <= 0:
                 continue
             take_tax = min(need, capacity_tax)
@@ -2857,6 +2910,31 @@ def adjust_price_gap(
             need -= take_tax
             if need <= 0.0001:
                 break
+
+
+def enforce_minimum_row_tax(
+    unit_prices: list[float],
+    mins: list[float],
+    maxes: list[float],
+    selected: list[ProductCandidate],
+    quantities: list[int],
+    min_row_tax_amount: float,
+) -> None:
+    for idx, candidate in enumerate(selected):
+        rate = candidate_tax_rate(candidate)
+        qty = quantities[idx]
+        if rate <= 0 or qty <= 0:
+            continue
+        current_tax = unit_prices[idx] * qty * rate
+        if current_tax + 0.005 >= min_row_tax_amount:
+            continue
+        required_unit_price = min_row_tax_amount / (qty * rate)
+        if required_unit_price > maxes[idx] + 0.0001:
+            raise RuntimeError(
+                f"第 {idx + 1} 行税金无法达到最低 {min_row_tax_amount} USD: "
+                f"{selected[idx].zh} 最大约 {round(maxes[idx] * qty * rate, 2)}"
+            )
+        unit_prices[idx] = max(unit_prices[idx], mins[idx], required_unit_price)
 
 
 def candidate_tax_rate(candidate: ProductCandidate) -> float:
@@ -2893,10 +2971,10 @@ def near_bound(value: float, low: Optional[float], high: Optional[float]) -> boo
 def adjust_tax_gap(rows: list[dict[str, Any]], target_tax_amount: float) -> None:
     current = sum((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0) for row in rows)
     diff = round(target_tax_amount - current, 2)
-    tolerance = max(TAX_TOLERANCE_USD, target_tax_amount * 0.01)
+    tolerance = TAX_FINAL_TOLERANCE_USD
     if abs(diff) <= tolerance:
         for row in rows:
-            row["预计税金"] = round((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0), 2)
+            update_row_tax_display(row)
         return
     adjustable = [row for row in rows if (to_float(row.get("综合税率")) or 0) > 0]
     if not adjustable:
@@ -2908,7 +2986,17 @@ def adjust_tax_gap(rows: list[dict[str, Any]], target_tax_amount: float) -> None
     qty = to_float(row.get("数量")) or 1
     row["单价"] = round(row["总价"] / qty, 4)
     for item in rows:
-        item["预计税金"] = round((to_float(item.get("总价")) or 0) * (to_float(item.get("综合税率")) or 0), 2)
+        update_row_tax_display(item)
+
+
+def update_row_tax_display(row: dict[str, Any]) -> None:
+    rate = to_float(row.get("综合税率")) or to_float(row.get(DISPLAY_TAX_RATE_FIELD)) or 0.0
+    total_value = to_float(row.get("总价")) or 0.0
+    tax_amount = round(total_value * rate, 2)
+    row["综合税率"] = round(rate, 6)
+    row["预计税金"] = tax_amount
+    row[DISPLAY_TAX_RATE_FIELD] = format_rate(rate)
+    row[DISPLAY_TAX_AMOUNT_FIELD] = tax_amount
 
 
 def summarize_filter_reasons(candidates: list[ProductCandidate]) -> dict[str, int]:
@@ -3177,23 +3265,81 @@ async def parse_manifest(
 
 async def parse_bill(path: str | Path, llm: LLMClient, query_cache: Optional[QueryCache] = None) -> BillInfo:
     source = Path(path)
-    reader = PdfReader(str(source))
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    product_entries = await parse_bill_product_entries_with_llm(text, llm, query_cache)
+    text = extract_bill_text(source)
+    text_chars = len(normalize_text(text))
+    parse_source = "text"
+    vision_pages = 0
+    if text_chars >= BILL_TEXT_MIN_CHARS:
+        parsed_fields = await parse_bill_fields_from_text(text, llm, query_cache)
+    else:
+        image_data_urls = render_bill_pdf_pages(source)
+        vision_pages = len(image_data_urls)
+        parse_source = "vision"
+        try:
+            parsed_fields = await parse_bill_fields_from_images(source, image_data_urls, llm, query_cache)
+        except RuntimeError as exc:
+            if "LLM 未从提单中识别到可靠货物品类" in str(exc):
+                raise RuntimeError("提单为扫描件，视觉模型未识别到可靠货物品类") from exc
+            raise
+    product_entries = parsed_fields.product_entries
     products = [entry.name for entry in product_entries]
+    text_cartons = extract_number(r"(\d+(?:\.\d+)?)\s*CARTONS?", text)
+    cartons = parsed_fields.carton_count or text_cartons
+    if not cartons or cartons <= 0:
+        source_label = "扫描件视觉模型" if parse_source == "vision" else "文本/LLM"
+        raise RuntimeError(f"提单未识别到有效总箱数，{source_label}未返回 carton_count")
     return BillInfo(
         filename=source.name,
         raw_text=text,
         products=products,
-        shipper=extract_shipper(text),
-        consignee=extract_consignee(text),
+        shipper=parsed_fields.shipper or extract_shipper(text),
+        consignee=parsed_fields.consignee or extract_consignee(text),
         shipment_no=extract_shipment_no(text),
         eta=extract_eta(text),
-        cartons=extract_number(r"(\d+(?:\.\d+)?)\s*CARTONS?", text),
+        cartons=cartons,
+        carton_evidence=parsed_fields.carton_evidence,
         gross_weight=extract_number(r"(\d+(?:\.\d+)?)\s*KGS?", text),
         cbm=extract_number(r"(\d+(?:\.\d+)?)\s*CBM", text),
         product_entries=product_entries,
+        parse_source=parse_source,
+        text_chars=text_chars,
+        vision_pages=vision_pages,
     )
+
+
+def extract_bill_text(path: str | Path) -> str:
+    reader = PdfReader(str(path))
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def render_bill_pdf_pages(
+    path: str | Path,
+    *,
+    max_pages: int = BILL_VISION_MAX_PAGES,
+    max_side: int = BILL_VISION_MAX_SIDE,
+    jpeg_quality: int = BILL_VISION_JPEG_QUALITY,
+) -> list[str]:
+    document = pdfium.PdfDocument(str(path))
+    try:
+        page_count = min(len(document), max_pages)
+        result: list[str] = []
+        for page_index in range(page_count):
+            page = document[page_index]
+            try:
+                bitmap = page.render(scale=2.0)
+                image = bitmap.to_pil().convert("RGB")
+            finally:
+                page.close()
+            image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
+            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            result.append(f"data:image/jpeg;base64,{encoded}")
+        if not result:
+            raise RuntimeError("提单 PDF 没有可渲染页面")
+        return result
+    finally:
+        document.close()
 
 
 async def parse_bill_products_with_llm(
@@ -3201,7 +3347,7 @@ async def parse_bill_products_with_llm(
     llm: LLMClient,
     query_cache: Optional[QueryCache] = None,
 ) -> list[str]:
-    return [entry.name for entry in await parse_bill_product_entries_with_llm(text, llm, query_cache)]
+    return [entry.name for entry in await parse_bill_product_entries_from_text(text, llm, query_cache)]
 
 
 async def parse_bill_product_entries_with_llm(
@@ -3209,19 +3355,91 @@ async def parse_bill_product_entries_with_llm(
     llm: LLMClient,
     query_cache: Optional[QueryCache] = None,
 ) -> list[BillProduct]:
-    cache_key = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+    return await parse_bill_product_entries_from_text(text, llm, query_cache)
+
+
+async def parse_bill_product_entries_from_text(
+    text: str,
+    llm: LLMClient,
+    query_cache: Optional[QueryCache] = None,
+) -> list[BillProduct]:
+    return (await parse_bill_fields_from_text(text, llm, query_cache)).product_entries
+
+
+async def parse_bill_fields_from_text(
+    text: str,
+    llm: LLMClient,
+    query_cache: Optional[QueryCache] = None,
+) -> BillLLMFields:
+    cache_key = "text:v3:" + hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
     if query_cache is not None:
         bill_cache = query_cache.setdefault("bill", {})
         if cache_key in bill_cache:
             cached = bill_cache[cache_key]
             if isinstance(cached, dict):
-                return normalize_bill_llm_product_entries(cached)
+                return normalize_bill_llm_fields(cached)
 
     payload = await llm.chat_json(build_bill_parser_messages(text), temperature=0.0)
-    products = normalize_bill_llm_product_entries(payload)
+    fields = normalize_bill_llm_fields(payload)
     if query_cache is not None:
         query_cache.setdefault("bill", {})[cache_key] = payload
-    return products
+    return fields
+
+
+async def parse_bill_product_entries_from_images(
+    path: str | Path,
+    image_data_urls: list[str],
+    llm: LLMClient,
+    query_cache: Optional[QueryCache] = None,
+) -> list[BillProduct]:
+    return (await parse_bill_fields_from_images(path, image_data_urls, llm, query_cache)).product_entries
+
+
+async def parse_bill_fields_from_images(
+    path: str | Path,
+    image_data_urls: list[str],
+    llm: LLMClient,
+    query_cache: Optional[QueryCache] = None,
+) -> BillLLMFields:
+    source = Path(path)
+    cache_key = "vision:v3:" + hashlib.sha256(source.read_bytes()).hexdigest()
+    if query_cache is not None:
+        bill_cache = query_cache.setdefault("bill", {})
+        if cache_key in bill_cache:
+            cached = bill_cache[cache_key]
+            if isinstance(cached, dict):
+                return normalize_bill_llm_fields(cached)
+
+    payload = await llm.chat_json_with_images(
+        build_bill_vision_prompt(source.name),
+        image_data_urls,
+        temperature=0.0,
+    )
+    fields = normalize_bill_llm_fields(payload)
+    if query_cache is not None:
+        query_cache.setdefault("bill", {})[cache_key] = payload
+    return fields
+
+
+def build_bill_vision_prompt(filename: str) -> str:
+    return (
+        "你是国际海运提单图像识别和商业字段解析专家。请从上传的提单扫描图中识别发货人、收货人、总箱数和真实货物品类。\n"
+        f"文件名：{filename}\n"
+        "规则：\n"
+        "1. shipper 提取 SHIPPER/EXPORTER/FROM 栏位的完整公司名和地址；consignee 提取 CONSIGNEE/TO 栏位的完整公司名和地址。\n"
+        "2. shipper/consignee 不要填船公司、港口、通知方、货物描述、日期或付款条款；尽量保留原文换行，用 \\n 连接多行。\n"
+        "3. products 只放真实货物品类英文名，保持提单原文语义，可去掉 HS CODE 和编码。\n"
+        "4. 如果同一行出现逗号分隔的多个货物和多个 HS，例如 'PLASTIC ORNAMENTS,NECKLACE HS:392640,711790'，"
+        "必须拆成两条 products：PLASTIC ORNAMENTS/392640 和 NECKLACE/711790。\n"
+        "5. 不得把 SHIPPED ON BOARD、ON BOARD、PORT OF LOADING、PORT OF DISCHARGE、FREIGHT、"
+        "EXPRESS BILL、TOTAL NUMBER OF CONTAINERS、日期、港口、船司、付款条款、公司名、地址识别为品类。\n"
+        "6. 如果图中出现类似 'STORAGE BAG HS CODE:420222'，品类是 'STORAGE BAG'，hs_code_hint 是 '420222'。\n"
+        "7. carton_count 是货物总箱数/包装数，不是集装箱数量、件数、重量、CBM、日期或提单号；优先读取 TOTAL、NO. OF PKGS、CTNS、CARTONS、PACKAGES、SAY ... CARTONS ONLY 附近的总数。\n"
+        "8. 如果没有可靠货物品类，返回空数组，不要猜；如果没有可靠总箱数，carton_count 返回 null，不要猜。\n"
+        "JSON格式：{\"shipper\":\"\",\"consignee\":\"\",\"carton_count\":null,\"carton_evidence\":\"\","
+        "\"products\":[{\"name\":\"\",\"hs_code_hint\":\"\",\"evidence\":\"\",\"confidence\":0.0}],"
+        "\"ignored_phrases\":[{\"text\":\"\",\"reason\":\"\"}]}"
+    )
 
 
 def build_bill_parser_messages(text: str) -> list[dict[str, str]]:
@@ -3229,21 +3447,25 @@ def build_bill_parser_messages(text: str) -> list[dict[str, str]]:
         {
             "role": "system",
             "content": (
-                "你是国际海运提单商业字段解析专家。你的任务是从 pypdf 提取出的提单原始文本里识别真实货物品类。"
+                "你是国际海运提单商业字段解析专家。你的任务是从 pypdf 提取出的提单原始文本里识别发货人、收货人、总箱数和真实货物品类。"
                 "必须区分货物品类和提单字段、日期、港口、船司、付款条款、装船批注。只返回 JSON object。"
             ),
         },
         {
             "role": "user",
             "content": (
-                "从以下提单文本中提取真实货物品类。\n"
+                "从以下提单文本中提取 SHIPPER、CONSIGNEE、总箱数和真实货物品类。\n"
                 "规则：\n"
-                "1. products 只放货物品类英文名，保持提单原文语义，可去掉 HS CODE 和编码。\n"
-                "2. 不要把 SHIPPED ON BOARD、ON BOARD、PORT OF LOADING、FREIGHT、EXPRESS BILL、"
+                "1. shipper 提取 SHIPPER/EXPORTER/FROM 栏位的完整公司名和地址；consignee 提取 CONSIGNEE/TO 栏位的完整公司名和地址。\n"
+                "2. shipper/consignee 不要填船公司、港口、通知方、货物描述、日期或付款条款；尽量保留原文换行，用 \\n 连接多行。\n"
+                "3. products 只放货物品类英文名，保持提单原文语义，可去掉 HS CODE 和编码。\n"
+                "4. 不要把 SHIPPED ON BOARD、ON BOARD、PORT OF LOADING、FREIGHT、EXPRESS BILL、"
                 "TOTAL NUMBER OF CONTAINERS、日期、港口、公司名、地址识别为品类。\n"
-                "3. 如果文本中出现类似 'STORAGE BAG HS CODE:420222'，品类是 'STORAGE BAG'。\n"
-                "4. 如果没有可靠品类，返回空数组，不要猜。\n"
-                "JSON格式：{\"products\":[{\"name\":\"\",\"hs_code_hint\":\"\",\"evidence\":\"\",\"confidence\":0.0}],"
+                "5. 如果文本中出现类似 'STORAGE BAG HS CODE:420222'，品类是 'STORAGE BAG'。\n"
+                "6. carton_count 是货物总箱数/包装数，不是集装箱数量、件数、重量、CBM、日期或提单号；优先读取 TOTAL、NO. OF PKGS、CTNS、CARTONS、PACKAGES、SAY ... CARTONS ONLY 附近的总数。\n"
+                "7. 如果没有可靠品类，返回空数组，不要猜；如果没有可靠总箱数，carton_count 返回 null，不要猜。\n"
+                "JSON格式：{\"shipper\":\"\",\"consignee\":\"\",\"carton_count\":null,\"carton_evidence\":\"\","
+                "\"products\":[{\"name\":\"\",\"hs_code_hint\":\"\",\"evidence\":\"\",\"confidence\":0.0}],"
                 "\"ignored_phrases\":[{\"text\":\"\",\"reason\":\"\"}]}\n"
                 f"提单文本：\n{text[:12000]}"
             ),
@@ -3253,6 +3475,43 @@ def build_bill_parser_messages(text: str) -> list[dict[str, str]]:
 
 def normalize_bill_llm_products(payload: dict[str, Any]) -> list[str]:
     return [entry.name for entry in normalize_bill_llm_product_entries(payload)]
+
+
+def normalize_bill_llm_fields(payload: dict[str, Any]) -> BillLLMFields:
+    return BillLLMFields(
+        product_entries=normalize_bill_llm_product_entries(payload),
+        shipper=normalize_party_block(payload.get("shipper")),
+        consignee=normalize_party_block(payload.get("consignee")),
+        carton_count=normalize_carton_count(payload.get("carton_count") or payload.get("cartons") or payload.get("total_cartons")),
+        carton_evidence=clean_text(payload.get("carton_evidence") or payload.get("carton_count_evidence") or payload.get("package_evidence")),
+    )
+
+
+def normalize_carton_count(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    numeric = to_float(value)
+    if numeric is not None and numeric > 0:
+        return numeric
+    text = clean_text(value)
+    if not text:
+        return None
+    match = re.search(r"(\d+(?:,\d{3})*(?:\.\d+)?)", text)
+    if not match:
+        return None
+    return to_float(match.group(1))
+
+
+def normalize_party_block(value: Any) -> str:
+    if isinstance(value, list):
+        parts = [clean_text(item) for item in value if clean_text(item)]
+        text = "\n".join(parts)
+    else:
+        text = clean_text(value)
+    if not text:
+        return ""
+    lines = [re.sub(r"\s+", " ", line).strip(" ,;") for line in re.split(r"[\r\n]+", text) if line.strip(" ,;")]
+    return "\n".join(lines)
 
 
 def normalize_bill_llm_product_entries(payload: dict[str, Any]) -> list[BillProduct]:
@@ -3273,25 +3532,51 @@ def normalize_bill_llm_product_entries(payload: dict[str, Any]) -> list[BillProd
             confidence = None
             hs_code_hint = ""
             evidence = ""
-        name = normalize_bill_llm_product_name(name)
-        if not name:
-            continue
+        entries = split_bill_product_entry(name, hs_code_hint, evidence, confidence)
         if confidence is not None and confidence < 0.5:
             continue
-        key = normalize_text(name)
-        if key and key not in seen:
-            seen.add(key)
-            products.append(
-                BillProduct(
-                    name=name,
-                    hs_code_hint=hs_code_hint,
-                    evidence=evidence,
-                    confidence=confidence if confidence is not None else 1.0,
+        for entry_name, entry_hs, entry_evidence, entry_confidence in entries:
+            entry_name = normalize_bill_llm_product_name(entry_name)
+            if not entry_name:
+                continue
+            key = normalize_text(entry_name)
+            if key and key not in seen:
+                seen.add(key)
+                products.append(
+                    BillProduct(
+                        name=entry_name,
+                        hs_code_hint=entry_hs,
+                        evidence=entry_evidence,
+                        confidence=entry_confidence if entry_confidence is not None else 1.0,
+                    )
                 )
-            )
     if not products:
         raise RuntimeError("LLM 未从提单中识别到可靠货物品类")
     return products
+
+
+def split_bill_product_entry(
+    name: str,
+    hs_code_hint: str,
+    evidence: str,
+    confidence: Optional[float],
+) -> list[tuple[str, str, str, Optional[float]]]:
+    name = clean_text(name)
+    hs_parts = re.findall(r"\d{4,10}", clean_text(hs_code_hint))
+    name_parts = [part.strip(" ;:/") for part in re.split(r"\s*,\s*", name) if part.strip(" ;:/")]
+    if (not hs_parts or (len(name_parts) > 1 and len(hs_parts) < len(name_parts))) and evidence:
+        hs_text = clean_text(evidence)
+        hs_match = re.search(r"\bHS(?:\s*CODE)?\s*[:：]?\s*([0-9,\s./-]{4,80})", hs_text, flags=re.IGNORECASE)
+        if hs_match:
+            evidence_hs_parts = re.findall(r"\d{4,10}", hs_match.group(1))
+            if len(evidence_hs_parts) > len(hs_parts):
+                hs_parts = evidence_hs_parts
+    if len(name_parts) > 1 and len(hs_parts) >= len(name_parts):
+        return [
+            (part, normalize_hs(hs_parts[idx]), evidence, confidence)
+            for idx, part in enumerate(name_parts)
+        ]
+    return [(name, normalize_hs(hs_code_hint), evidence, confidence)]
 
 
 def normalize_bill_llm_product_name(value: str) -> str:
@@ -3403,7 +3688,7 @@ def build_llm_prompt(manifest: ManifestSummary, bill: BillInfo, input_tax_data: 
         f"allowed_reference_names={json.dumps(allowed_reference_names, ensure_ascii=False, separators=(',', ':'))}\n"
         "强制规则:\n"
         "1. 输出必须包含提单品类，每个提单品类必须出现在某一行的中英文品名里，并同时写入该行 bill_sources。\n"
-        "2. 输出总箱数必须等于输入清单 total_ctns。\n"
+        f"2. 输出总箱数必须等于提单总箱数 {bill.cartons}，不得使用输入清单 total_ctns 替代。\n"
         "3. 输出总毛重必须等于输入清单 total_real_weight。\n"
         "4. 每行净重等于毛重减箱数；每行总价等于数量乘单价。\n"
         "5. 输出行数建议 8-13 行。除提单品类中文直译行以外，中文品名必须从 allowed_reference_names 选择，不得自造泛名。\n"
@@ -3538,7 +3823,9 @@ def normalize_llm_rows(payload: dict[str, Any], manifest: ManifestSummary, bill:
 
     apply_bill_product_names(rows, bill.products)
     ensure_bill_products_present(rows, bill.products)
-    reconcile_totals(rows, manifest.total_ctns, manifest.total_real_weight)
+    if not bill.cartons or bill.cartons <= 0:
+        raise RuntimeError("提单未识别到有效总箱数，不能生成与提单箱数对齐的输出")
+    reconcile_totals(rows, bill.cartons, manifest.total_real_weight)
     validate_output_rows(rows)
     return rows
 
@@ -3704,7 +3991,7 @@ def validate_output_rows(rows: list[dict[str, Any]]) -> None:
             if field not in row or row[field] in (None, ""):
                 raise RuntimeError(f"输出第 {idx} 行缺少字段: {field}")
         hs = normalize_hs(row["商品编码"])
-        if not (8 <= len(hs) <= 10):
+        if not (6 <= len(hs) <= 10):
             raise RuntimeError(f"输出第 {idx} 行 HS 编码不合法: {row['商品编码']}")
         for field in ("箱数", "数量", "单价", "总价", "净重", "毛重"):
             value = to_float(row[field])
@@ -3835,6 +4122,93 @@ def normalize_output_language_fields(rows: list[dict[str, Any]]) -> None:
         row["用途"] = translate_usage_to_english(row.get("用途"))
 
 
+def has_cjk_text(value: Any) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", clean_text(value)))
+
+
+def has_latin_text(value: Any) -> bool:
+    return bool(re.search(r"[A-Za-z]", clean_text(value)))
+
+
+def chinese_name_needs_translation(value: Any) -> bool:
+    text = clean_text(value)
+    return not text or not has_cjk_text(text) or has_latin_text(text)
+
+
+def validate_chinese_name_column(rows: list[dict[str, Any]]) -> None:
+    for idx, row in enumerate(rows, start=1):
+        name = clean_text(row.get("中文品名"))
+        if chinese_name_needs_translation(name):
+            raise RuntimeError(f"输出第 {idx} 行中文品名必须为简体中文，当前: {name}")
+
+
+async def translate_output_chinese_names_with_llm(llm: LLMClient, rows: list[dict[str, Any]]) -> None:
+    pending = [
+        {
+            "index": idx,
+            "中文品名": clean_text(row.get("中文品名")),
+            "英文品名": clean_text(row.get("英文品名")),
+            "材质": clean_text(row.get("材质")),
+            "商品编码": clean_text(row.get("商品编码")),
+        }
+        for idx, row in enumerate(rows)
+        if chinese_name_needs_translation(row.get("中文品名"))
+    ]
+    if not pending:
+        validate_chinese_name_column(rows)
+        return
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是清关 Commercial Invoice 品名翻译员。"
+                "只把中文品名列翻译成简体中文品名，不改变英文品名、HS、材质、数量、税率或任何数值。"
+                "只返回 JSON object。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "把以下 rows 的中文品名翻译为简体中文。要求：\n"
+                "1. translation 必须是简体中文商品名，不能包含英文字母、拼音、繁体字或解释。\n"
+                "2. 结合英文品名、材质和 HS 语义翻译，不要改变品类含义。\n"
+                "3. 常见示例：PLASTIC ORNAMENTS=塑料装饰品；STORAGE BAG=收纳袋；PLASTIC SHELL=塑料外壳。\n"
+                "JSON格式：{\"translations\":[{\"index\":0,\"translation\":\"塑料装饰品\"}]}\n"
+                f"rows={json.dumps(pending, ensure_ascii=False, separators=(',', ':'))}"
+            ),
+        },
+    ]
+    payload = await llm.chat_json(messages, temperature=0.0)
+    translations = payload.get("translations")
+    if not isinstance(translations, list):
+        raise RuntimeError("LLM 未返回中文品名 translations")
+
+    by_index: dict[int, str] = {}
+    for item in translations:
+        if not isinstance(item, dict):
+            continue
+        index_value = to_float(item.get("index"))
+        translation = clean_text(item.get("translation"))
+        if index_value is None or int(index_value) != index_value:
+            continue
+        if not translation:
+            continue
+        by_index[int(index_value)] = translation
+
+    missing: list[str] = []
+    for item in pending:
+        idx = int(item["index"])
+        translation = by_index.get(idx, "")
+        if chinese_name_needs_translation(translation):
+            missing.append(f"{idx + 1}:{item['中文品名'] or item['英文品名']}")
+            continue
+        rows[idx]["中文品名"] = translation
+    if missing:
+        raise RuntimeError("LLM 未能输出有效简体中文品名: " + ", ".join(missing))
+    validate_chinese_name_column(rows)
+
+
 def translate_material_to_english(value: Any) -> str:
     return translate_field_to_english(value, MATERIAL_TRANSLATIONS, "Mixed")
 
@@ -3957,7 +4331,9 @@ def write_workbook(bill: BillInfo, rows: list[dict[str, Any]], output_path: Path
     workbook = load_workbook(LOCAL_TEMPLATE_PATH)
     sheet = workbook[workbook.sheetnames[0]]
     fill_metadata(sheet, bill, metadata)
+    ensure_tax_display_columns(sheet)
     clear_output_area(sheet, start_row=6, end_row=max(sheet.max_row, 80))
+    validate_chinese_name_column(rows)
     for idx, row in enumerate(rows, start=6):
         write_output_row(sheet, idx, row)
     workbook.save(output_path)
@@ -3978,13 +4354,14 @@ def fill_metadata(sheet, bill: BillInfo, metadata: dict[str, Any]) -> None:
 
 def clear_output_area(sheet, start_row: int, end_row: int) -> None:
     for row in range(start_row, end_row + 1):
-        for col in range(1, 15):
+        for col in range(1, len(WORKBOOK_HEADERS) + 1):
             sheet.cell(row, col).value = None
 
 
 def write_output_row(sheet, row_idx: int, row: dict[str, Any]) -> None:
     if row_idx != 6:
-        copy_row_style(sheet, 6, row_idx, max_col=14)
+        copy_row_style(sheet, 6, row_idx, max_col=len(WORKBOOK_HEADERS))
+    update_row_tax_display(row)
     values = [
         row["中文品名"],
         row["英文品名"],
@@ -4000,9 +4377,36 @@ def write_output_row(sheet, row_idx: int, row: dict[str, Any]) -> None:
         row["净重"],
         row["毛重"],
         row["原产国"],
+        row[DISPLAY_TAX_RATE_FIELD],
+        row[DISPLAY_TAX_AMOUNT_FIELD],
     ]
     for col, value in enumerate(values, start=1):
         sheet.cell(row_idx, col).value = value
+
+
+def ensure_tax_display_columns(sheet) -> None:
+    header_row = 5
+    first_tax_col = len(HEADERS) + 1
+    for col in range(first_tax_col, len(WORKBOOK_HEADERS) + 1):
+        source = sheet.cell(header_row, len(HEADERS))
+        target = sheet.cell(header_row, col)
+        if source.has_style:
+            target._style = copy(source._style)
+        if source.number_format:
+            target.number_format = source.number_format
+        if source.alignment:
+            target.alignment = copy(source.alignment)
+        if source.font:
+            target.font = copy(source.font)
+        if source.fill:
+            target.fill = copy(source.fill)
+        if source.border:
+            target.border = copy(source.border)
+        target.value = WORKBOOK_HEADERS[col - 1]
+        sheet.column_dimensions[target.column_letter].width = max(
+            sheet.column_dimensions[target.column_letter].width or 0,
+            12,
+        )
 
 
 def copy_row_style(sheet, source_row: int, target_row: int, max_col: int) -> None:
@@ -4163,6 +4567,7 @@ def bill_to_public_dict(bill: BillInfo) -> dict[str, Any]:
         "shipment_no": bill.shipment_no,
         "eta": bill.eta,
         "cartons": bill.cartons,
+        "carton_evidence": bill.carton_evidence,
         "gross_weight": bill.gross_weight,
         "cbm": bill.cbm,
         "shipper": bill.shipper,

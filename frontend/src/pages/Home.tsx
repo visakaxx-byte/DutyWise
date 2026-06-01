@@ -13,6 +13,7 @@ export const Home: React.FC = () => {
   const [status, setStatus] = useState<Status>('idle');
   const [taskStatus, setTaskStatus] = useState<TaskStatus | null>(null);
   const [result, setResult] = useState<ProcessResult | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string>('');
 
   const handleFilesSelected = (selectedFiles: File[]) => {
     setFiles(selectedFiles);
@@ -60,12 +61,12 @@ export const Home: React.FC = () => {
           } else if (status.status === 'failed') {
             clearInterval(pollInterval);
             setStatus('failed');
-            message.error('处理失败，请检查文件格式或重试');
+            setErrorMessage(status.errorMessage || '处理失败，请检查文件格式或重试');
           }
         } catch (error) {
           clearInterval(pollInterval);
           setStatus('failed');
-          message.error('获取任务状态失败');
+          setErrorMessage('获取任务状态失败，请检查网络连接后重试');
         }
       }, 2000);
 
@@ -81,6 +82,7 @@ export const Home: React.FC = () => {
     setStatus('idle');
     setTaskStatus(null);
     setResult(null);
+    setErrorMessage('');
   };
 
   return (
@@ -89,7 +91,19 @@ export const Home: React.FC = () => {
 
       {status === 'idle' && (
         <>
-          <FileUpload onFilesSelected={handleFilesSelected} />
+          <FileUpload
+            onFilesSelected={handleFilesSelected}
+            accept={{
+              extensions: ['.xlsx', '.xls'],
+              mimeTypes: [
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'application/vnd.ms-excel',
+                'application/octet-stream',
+              ],
+              mimeLabel: 'Excel',
+            }}
+            multiple
+          />
 
           {files.length > 0 && (
             <Card style={{ marginTop: 24 }}>
@@ -146,7 +160,9 @@ export const Home: React.FC = () => {
         <Card>
           <div style={{ textAlign: 'center', paddingTop: 48, paddingBottom: 48 }}>
             <p style={{ fontSize: 20, color: '#ff4d4f', marginBottom: 16 }}>处理失败</p>
-            <p style={{ color: '#666', marginBottom: 24 }}>请检查文件格式是否正确，或稍后重试</p>
+            <p style={{ color: '#666', marginBottom: 24, whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
+              {errorMessage || '请检查文件格式是否正确，或稍后重试'}
+            </p>
             <Button type="primary" onClick={handleReset}>
               重新开始
             </Button>

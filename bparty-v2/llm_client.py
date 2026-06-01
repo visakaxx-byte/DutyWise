@@ -20,13 +20,42 @@ class LLMClient:
         if not self.settings.api_key:
             raise LLMError("缺少 LLM_API_KEY 或 DOUBAO_API_KEY")
 
-    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1) -> dict[str, Any]:
+    async def chat_json(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float = 0.1,
+        model: Optional[str] = None,
+        max_tokens: int = 4096,
+    ) -> dict[str, Any]:
         payload = {
-            "model": self.settings.model,
+            "model": model or self.settings.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
         }
+        return await self._post_chat_json(payload)
+
+    async def chat_json_with_images(
+        self,
+        text: str,
+        image_data_urls: list[str],
+        *,
+        temperature: float = 0.0,
+        model: Optional[str] = None,
+        max_tokens: int = 4096,
+    ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        content.extend({"type": "image_url", "image_url": {"url": url}} for url in image_data_urls)
+        payload = {
+            "model": model or self.settings.vision_model or self.settings.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        return await self._post_chat_json(payload)
+
+    async def _post_chat_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.settings.api_key}",
             "Content-Type": "application/json",

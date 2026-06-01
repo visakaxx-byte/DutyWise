@@ -28,6 +28,7 @@ class LLMSettings:
     api_key: str
     base_url: str
     model: str
+    vision_model: str
     timeout: float = 90.0
 
 
@@ -43,10 +44,12 @@ class CrawlerSettings:
 
 
 def get_llm_settings() -> LLMSettings:
+    model = env_value("LLM_MODEL", "DOUBAO_MODEL", default="doubao-pro-32k")
     return LLMSettings(
         api_key=env_value("LLM_API_KEY", "DOUBAO_API_KEY"),
         base_url=env_value("LLM_BASE_URL", "DOUBAO_ENDPOINT", "DOUBAO_BASE_URL", default="https://ark.cn-beijing.volces.com/api/coding/v3").rstrip("/"),
-        model=env_value("LLM_MODEL", "DOUBAO_MODEL", default="doubao-pro-32k"),
+        model=model,
+        vision_model=env_value("LLM_VISION_MODEL", "DOUBAO_VISION_MODEL", default=model),
         timeout=float(env_value("LLM_TIMEOUT", default="240") or 240),
     )
 
@@ -79,6 +82,6 @@ def require_runtime_config() -> dict:
         raise RuntimeError("缺少必需配置，不能执行 LLM/爬虫流程: " + ", ".join(missing))
 
     return {
-        "llm": {"base_url": llm.base_url, "model": llm.model},
+        "llm": {"base_url": llm.base_url, "model": llm.model, "vision_model": llm.vision_model},
         "crawler": {"base_url": crawler.base_url, "username_configured": True},
     }

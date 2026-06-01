@@ -1,21 +1,18 @@
 # DutyWise 未完成任务清单
 
-> 最后更新: 2026-04-25
+> 最后更新: 2026-04-26
 
-## 1. 爬虫API登录对接 (codeflagai.com) 🔴 高优先级
+## 1. 爬虫API登录对接 (codeflagai.com) ✅ 已完成
 
-**当前状态**: 登录始终返回 `1401 登录过期`，所有HS编码查询回退到内置税率库
+**状态**: AES-128-ECB加密登录 + CusAuthorization JWT + classification/search 全部打通
 
-**根因**: 
-- 正确的API Host是 `api.codeflagai.com`，而非当前配置的 `www.codeflagai.com`
-- `api.codeflagai.com` 要求 `appId` 参数 (返回码510: "缺少必要参数appId")
-- 当前未知: 正确的 `appId` 值、登录接口完整参数、Token获取方式
-
-**待调查**:
-- [ ] 通过浏览器抓包 codeflagai.com 登录流程，获取完整API地址和参数
-- [ ] 找到 `appId` 或 `client_id` 值
-- [ ] 确认 Token 存储位置 (header/cookie/response body)
-- [ ] 更新 `.env` 中的 CRAWLER_BASE_URL 和爬虫登录逻辑
+**实现细节**:
+- 登录: `POST /xhqUser/login` — body用AES-128-ECB(key="imageBatchCompon")加密
+- Token: 从响应头 `CusAuthorization` 提取JWT
+- 搜索: `POST /classification/search` — 带 CusAuthorization header
+- 税率字段: `classificationCodeList[].importTariffRate`
+- 反倾销: `classificationCodeList[].antiDumpingCountervailingRate`
+- 每次batch前强制重新登录，遇1401自动清除token并重试
 
 **相关文件**:
 - `backend/app/services/crawler.py` — `_do_login()`, `_api_search()`
@@ -34,7 +31,7 @@
 
 ---
 
-## 3. 前端硬编码 localhost 🟡 中优先级
+## 3. ~~前端硬编码 localhost~~ → 已降级 🟢 低优先级
 
 **当前状态**: `ResultCard.tsx` 中的下载链接硬编码为 `http://localhost:8000`
 

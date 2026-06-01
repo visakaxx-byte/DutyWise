@@ -40,7 +40,7 @@ class HSCodeOptimizer:
             if result["log"]:
                 optimization_logs.append(result["log"])
 
-        logger.info(f"优化完成，共优化 {len(optimization_logs)} 个商品")
+        logger.info(f"优化完成，共 {len(items)} 个商品，tax_data {len(tax_data)} 个编码，优化 {len(optimization_logs)} 个")
 
         return {
             "items": optimized_items,
@@ -61,12 +61,15 @@ class HSCodeOptimizer:
 
         if not original_tax_info:
             # 没有税率信息，不优化
+            if original_hs_code:
+                logger.debug(f"无税率数据: {original_hs_code} ({original_name})")
             return {"item": item, "log": None}
 
         # 查找候选编码（这里简化处理，实际需要更复杂的逻辑）
         candidates = self._find_candidates(original_hs_code, original_name, tax_data)
 
         if not candidates:
+            logger.debug(f"无候选编码: {original_hs_code} ({original_name}), tax_rate={original_tax_info.get('tax_rate')}, prefix={original_hs_code[:4]}")
             return {"item": item, "log": None}
 
         # 选择最优编码
@@ -77,6 +80,7 @@ class HSCodeOptimizer:
         )
 
         if best_candidate:
+            logger.info(f"优化: {original_name} {original_hs_code}({original_tax_info.get('tax_rate')}) → {best_candidate['hs_code']}({best_candidate['tax_rate']}) score={best_candidate['final_score']:.3f}")
             # 创建优化后的商品
             optimized_item = item.copy()
             optimized_item["商品编码"] = best_candidate["hs_code"]
@@ -98,6 +102,7 @@ class HSCodeOptimizer:
 
             return {"item": optimized_item, "log": log}
 
+        logger.debug(f"未选中候选: {original_hs_code} ({original_name}), candidates={len(candidates)}, rates={[c['tax_rate'] for c in candidates[:3]]}")
         return {"item": item, "log": None}
 
     def _find_candidates(
