@@ -267,7 +267,7 @@ Amazon 官方 PA-API 文档显示旧 PA-API 已提示迁移到 Creators API，�
 - `summarize_replacement_usage()`
 - `validate_hs_semantic_match()`
 - `validate_weight_plausibility_hard()`
-- `validate_price_and_value_floor()`
+- `validate_price_evidence()`
 
 重点是移除当前 `qualified_manifest = []` 的跳过逻辑，让归纳后的清单品类成为主候选池。
 
@@ -318,7 +318,7 @@ Amazon 官方 PA-API 文档显示旧 PA-API 已提示迁移到 Creators API，�
 
 - 新增价格服务和缓存。
 - 引入外部价格证据。
-- 增加总货值下限和单价合理性硬校验。
+- 取消总货值下限硬校验，保留单价合理性硬校验；最终税金不得超过目标税金上浮 10%。
 
 ### 第四阶段：审计输出
 

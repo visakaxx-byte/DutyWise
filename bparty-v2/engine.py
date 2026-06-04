@@ -36,9 +36,8 @@ TAX_TOLERANCE_USD = 1.0
 TAX_FINAL_TOLERANCE_USD = 20.0
 MIN_ROW_TAX_AMOUNT_USD = 30.0
 MAX_ZERO_TAX_ROWS = 2
-TAX_UNDER_TARGET_ALLOWANCE_USD = 100.0
+MAX_TAX_OVER_TARGET_RATIO = 0.1
 DECLARED_RETAIL_PRICE_RATIO = 0.3
-MIN_TOTAL_VALUE_RATIO = 0.1
 DEFAULT_KG_PER_CTN_MIN = 0.5
 DEFAULT_KG_PER_CTN_MAX = 80.0
 DEFAULT_KG_PER_PC_MIN = 0.01
@@ -669,7 +668,7 @@ async def build_clearance(
     validate_output_rows(rows)
     estimated_tax = round(sum((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0) for row in rows), 2)
     tax_gap = round(estimated_tax - options.target_tax_amount, 2)
-    validate_price_and_value_floor(rows, selected, manifest)
+    validate_price_evidence(rows, selected)
     flow.append(
         {
             "stage": "optimize_output",
@@ -1909,11 +1908,7 @@ def adjust_plausibility_with_price_evidence(
     )
 
 
-def validate_price_and_value_floor(
-    rows: list[dict[str, Any]],
-    selected: list[ProductCandidate],
-    manifest: ManifestSummary,
-) -> None:
+def validate_price_evidence(rows: list[dict[str, Any]], selected: list[ProductCandidate]) -> None:
     for idx, (row, candidate) in enumerate(zip(rows, selected), start=1):
         evidence = candidate.price_evidence or {}
         declared = to_float(evidence.get("declared_unit_price"))
@@ -1930,14 +1925,6 @@ def validate_price_and_value_floor(
         row["价格依据"] = evidence.get("basis", "")
         row["价格置信度"] = evidence.get("confidence", "")
         row["零售参考单价"] = evidence.get("retail_unit_price", "")
-
-    total_value = round(sum(to_float(row.get("总价")) or 0 for row in rows), 2)
-    value_floor = round((manifest.total_declared_value or 0) * MIN_TOTAL_VALUE_RATIO, 2)
-    if value_floor > 0 and total_value + 0.01 < value_floor:
-        raise RuntimeError(
-            f"输出总货值过低: {total_value} USD，低于原清单货值 {manifest.total_declared_value} "
-            f"的 {round(MIN_TOTAL_VALUE_RATIO * 100)}% 下限 {value_floor} USD"
-        )
 
 
 def build_audit_summary(
@@ -2432,6 +2419,10 @@ def candidate_key_from_parts(zh: Any, en: Any, hs: Any) -> tuple[str, str, str]:
     return (normalize_text(zh), normalize_text(en), normalize_hs(hs))
 
 
+def target_tax_upper_bound(target_tax_amount: float) -> float:
+    return round(target_tax_amount * (1 + MAX_TAX_OVER_TARGET_RATIO), 2)
+
+
 def build_output_rows(
     selected: list[ProductCandidate],
     manifest: ManifestSummary,
@@ -2562,7 +2553,7 @@ def build_output_draft_prompt(
         "硬要求：\n"
         f"1. 输出 rows 数量必须等于 {options.target_item_count}，且每个候选必须输出一行，不得新增/删除/改名/改 HS。\n"
         f"2. 毛重请按品类合理分配；代码会按 Excel 总重量 {manifest.total_real_weight} kg 等比例倒推并强制闭合。\n"
-        f"3. 总税金必须落在 {max(0.0, options.target_tax_amount - TAX_FINAL_TOLERANCE_USD)}-{options.target_tax_amount + TAX_FINAL_TOLERANCE_USD} USD 之间；税金=总价*综合税率；每行税金只能等于 0 或不低于 {MIN_ROW_TAX_AMOUNT_USD} USD，且税金为 0 的行数最多 {MAX_ZERO_TAX_ROWS} 行。\n"
+        f"3. 总税金尽量贴近目标 {options.target_tax_amount} USD，最终不得高于 {target_tax_upper_bound(options.target_tax_amount)} USD（目标上浮 10%）；税金=总价*综合税率；每行税金只能等于 0 或不低于 {MIN_ROW_TAX_AMOUNT_USD} USD，且税金为 0 的行数最多 {MAX_ZERO_TAX_ROWS} 行。\n"
         f"4. 总箱数必须等于提单总箱数 {bill.cartons}，不得使用清单箱数替代。\n"
         "5. 每行数量必须大于等于箱数，且数量必须是箱数的整数倍；每行单价和每箱数量必须落入 candidate.plausibility_range；毛重可服务于总重量闭合。\n"
         "6. 不要让所有行数量相同，不要让所有行单件重量相同，不要给电器/机器类低到不合理的单价。\n"
@@ -2692,13 +2683,12 @@ def validate_llm_output_rows(
     validate_qty_ctn_relationship(rows)
     validate_row_counts(rows, bill.cartons)
     tax_total = round(sum((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0) for row in rows), 2)
-    tax_lower_bound = max(0.0, round(options.target_tax_amount - TAX_FINAL_TOLERANCE_USD, 2))
-    tax_upper_bound = round(options.target_tax_amount + TAX_FINAL_TOLERANCE_USD, 2)
-    if tax_total > tax_upper_bound or tax_total < tax_lower_bound:
+    tax_upper_bound = target_tax_upper_bound(options.target_tax_amount)
+    if tax_total > tax_upper_bound + 0.01:
         feasible = estimate_tax_feasible_range(selected)
         raise RuntimeError(
-            "合理范围内无法进入目标税金允许区间或 LLM 草案税金未闭合；"
-            f"允许区间 {tax_lower_bound}-{tax_upper_bound}, 当前 {tax_total}, "
+            "税金超过目标上浮 10% 上限；"
+            f"目标 {options.target_tax_amount}, 最高 {tax_upper_bound}, 当前 {tax_total}, "
             f"可行税金区间约 {feasible[0]}-{feasible[1]}"
         )
     validate_minimum_row_tax(rows)
@@ -3156,11 +3146,11 @@ def allocate_plausible_prices(
         prices.append((rounded_unit, total_value))
 
     estimated_tax = round(sum(total * candidate_tax_rate(candidate) for candidate, (_, total) in zip(selected, prices)), 2)
-    tolerance = TAX_FINAL_TOLERANCE_USD
-    if abs(estimated_tax - target_tax_amount) > tolerance:
+    tax_upper_bound = target_tax_upper_bound(target_tax_amount)
+    if estimated_tax > tax_upper_bound + 0.01:
         raise RuntimeError(
-            "优化无解：在重量和单价常理范围内无法贴近期望税金；"
-            f"目标 {target_tax_amount}，可行预计 {estimated_tax}，差额 {round(estimated_tax - target_tax_amount, 2)}"
+            "优化无解：在重量和单价常理范围内无法压到目标税金上浮 10% 以内；"
+            f"目标 {target_tax_amount}，最高 {tax_upper_bound}，可行预计 {estimated_tax}"
         )
     return prices
 
@@ -3176,7 +3166,7 @@ def adjust_price_gap(
 ) -> None:
     current_tax = sum(price * qty * candidate_tax_rate(candidate) for price, qty, candidate in zip(unit_prices, quantities, selected))
     diff = target_tax_amount - current_tax
-    if abs(diff) <= TAX_FINAL_TOLERANCE_USD:
+    if current_tax <= target_tax_upper_bound(target_tax_amount) and abs(diff) <= TAX_FINAL_TOLERANCE_USD:
         return
     if diff > 0:
         order = sorted(range(len(unit_prices)), key=lambda idx: (maxes[idx] - unit_prices[idx]) * quantities[idx] * candidate_tax_rate(selected[idx]), reverse=True)

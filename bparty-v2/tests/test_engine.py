@@ -53,9 +53,9 @@ from engine import (
     translate_output_chinese_names_with_llm,
     normalize_generated_candidate,
     validate_llm_output_rows,
+    validate_price_evidence,
     validate_qty_ctn_relationship,
     infer_bill_material_from_entry,
-    validate_price_and_value_floor,
 )
 from crawler_client import parse_classification_results
 from price_search import build_price_evidence, extract_price_samples, parse_pack_qty
@@ -294,7 +294,7 @@ class PriceSearchTests(unittest.TestCase):
         self.assertGreaterEqual(len(evidence.samples), 2)
         self.assertAlmostEqual(evidence.declared_unit_price, evidence.retail_unit_price * 0.3, places=4)
 
-    def test_validate_price_and_value_floor_rejects_too_low_total_value(self) -> None:
+    def test_validate_price_evidence_allows_low_total_value(self) -> None:
         candidate = ProductCandidate(
             source="manifest_group",
             source_label="input",
@@ -315,10 +315,11 @@ class PriceSearchTests(unittest.TestCase):
                 "总价": 1.0,
             }
         ]
-        manifest = ManifestSummary("input.xlsx", 1, 1, 1, 1000, [])
 
-        with self.assertRaisesRegex(RuntimeError, "输出总货值过低"):
-            validate_price_and_value_floor(rows, [candidate], manifest)
+        validate_price_evidence(rows, [candidate])
+
+        self.assertEqual(rows[0]["价格依据"], "test")
+        self.assertEqual(rows[0]["零售参考单价"], 0.33)
 
 
 class CertificationRuleTests(unittest.TestCase):
@@ -1002,7 +1003,7 @@ class OutputOptimizationTests(unittest.TestCase):
                 plausibility_ranges={},
             )
 
-    def test_plausible_row_plans_block_impossible_tax(self) -> None:
+    def test_plausible_row_plans_allow_tax_below_target_when_upper_bound_is_safe(self) -> None:
         candidates = [
             ProductCandidate(
                 source="manifest",
@@ -1024,14 +1025,17 @@ class OutputOptimizationTests(unittest.TestCase):
         bill = BillInfo("bill.pdf", "", [], gross_weight=192, cartons=12)
         options = ProcessingOptions(target_tax_amount=1000, target_item_count=1)
         ranges = load_plausibility_ranges(Path(__file__).resolve().parents[1] / "docs/海关编码查找.xlsx")
-        with self.assertRaisesRegex(RuntimeError, "税金无法达到最低 30.0 USD|无法贴近期望税金"):
-            build_plausible_row_plans(
-                selected=candidates,
-                manifest=manifest,
-                bill=bill,
-                options=options,
-                plausibility_ranges=ranges,
-            )
+        plans = build_plausible_row_plans(
+            selected=candidates,
+            manifest=manifest,
+            bill=bill,
+            options=options,
+            plausibility_ranges=ranges,
+        )
+
+        total_tax = sum(plan.total_value * (plan.candidate.effective_tax_rate or plan.candidate.base_tax_rate) for plan in plans)
+        self.assertLess(total_tax, 1000)
+        self.assertLessEqual(total_tax, 1100)
 
 
 class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
@@ -2486,7 +2490,7 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
                 "candidate_index": 0,
             }
         ]
-        with self.assertRaisesRegex(RuntimeError, "允许区间 780.0-820"):
+        with self.assertRaisesRegex(RuntimeError, "税金超过目标上浮 10% 上限"):
             validate_llm_output_rows(
                 rows,
                 candidates,
