@@ -37,6 +37,17 @@ TAX_FINAL_TOLERANCE_USD = 20.0
 MIN_ROW_TAX_AMOUNT_USD = 30.0
 MAX_ZERO_TAX_ROWS = 2
 MAX_TAX_OVER_TARGET_RATIO = 0.1
+UNDETAILED_BILL_TAX_SHARE = 0.20
+UNDETAILED_BILL_CARTON_SHARE = 0.06
+PRICE_FIT_MIN_REFERENCE_RATIO = 0.25
+PRICE_REPAIR_POOL_SIZE = 24
+PRICE_REPAIR_MAX_PASSES = 8
+PRICE_REPAIR_MAX_WEB_LOOKUPS = 12
+PRICE_REPAIR_MIN_SCORE_GAIN = 5.0
+PRICE_REPAIR_SEARCH_TIMEOUT_SECONDS = 3.0
+PRICE_REPAIR_SEARCH_MAX_PAGES = 2
+PRICE_SEARCH_TIMEOUT_SECONDS = 3.0
+PRICE_SEARCH_MAX_PAGES = 2
 LLM_DRAFT_TIMEOUT_SECONDS = 180.0
 LLM_TRANSLATION_TIMEOUT_SECONDS = 60.0
 DECLARED_RETAIL_PRICE_RATIO = 0.3
@@ -453,6 +464,9 @@ class RowPlan:
     unit_price: float
     plausibility: PlausibilityRange
     warnings: tuple[str, ...] = ()
+    tax_budget: float = 0.0
+    price_reference: float = 0.0
+    quantity_basis: str = ""
 
 
 QueryCache = dict[str, dict[str, Any]]
@@ -640,6 +654,7 @@ async def build_clearance(
             f"合格品名不足，目标 {options.target_item_count} 行，当前仅 {len(selected)} 行；"
             "请补充常用替换清单或放宽规则"
         )
+    price_repair_pool = select_price_repair_pool(qualified_manifest, selected, rules)
 
     await emit_progress(
         progress_callback,
@@ -659,8 +674,37 @@ async def build_clearance(
         query_cache,
     )
     selected = attach_price_evidence_to_candidates(selected, query_cache=query_cache)
+    if price_repair_pool:
+        await emit_progress(
+            progress_callback,
+            {
+                "stage": "price_fit_repair",
+                "status": "running",
+                "progress": 91,
+                "message": "正在准备客户清单备用候选，必要时按需搜索参考价",
+                "candidates": len(price_repair_pool),
+            },
+        )
+        price_repair_pool = prepare_price_repair_candidates(
+            price_repair_pool,
+            plausibility_ranges,
+            query_cache=query_cache,
+        )
+    selected, price_repair_summary = optimize_selected_candidates_for_price_fit(
+        selected,
+        price_repair_pool,
+        manifest,
+        bill,
+        options,
+        query_cache=query_cache,
+    )
     draft_attempts = 0
     draft_feedback: list[str] = ["最终草案默认由规则优化器生成，LLM 不参与数值草案生成"]
+    if price_repair_summary.get("swaps"):
+        draft_feedback.append(
+            "已按参考价可行性从客户清单备用候选重排 "
+            f"{price_repair_summary['swaps']} 行"
+        )
     rows = build_output_rows(selected, manifest, bill, options)
 
     try:
@@ -684,6 +728,7 @@ async def build_clearance(
             "final_draft_generator": "rules",
             "llm_draft_attempts": draft_attempts,
             "draft_feedback": draft_feedback[-1] if draft_feedback else "",
+            "price_fit_repair": price_repair_summary,
         }
     )
 
@@ -1087,6 +1132,52 @@ def select_initial_candidates(
         selected.append(candidate)
         selected_keys.add(key)
     return selected
+
+
+def select_price_repair_pool(
+    qualified_manifest: list[ProductCandidate],
+    selected: list[ProductCandidate],
+    rules: SelectionRules,
+    *,
+    limit: int = PRICE_REPAIR_POOL_SIZE,
+) -> list[ProductCandidate]:
+    selected_keys = {candidate_identity(candidate) for candidate in selected}
+    pool = [
+        candidate
+        for candidate in qualified_manifest
+        if candidate_identity(candidate) not in selected_keys
+    ]
+    return sorted(pool, key=lambda item: selection_score(item, rules), reverse=True)[:limit]
+
+
+def prepare_price_repair_candidates(
+    candidates: list[ProductCandidate],
+    known_ranges: dict[tuple[str, str, str], PlausibilityRange],
+    *,
+    query_cache: Optional[QueryCache] = None,
+) -> list[ProductCandidate]:
+    prepared: list[ProductCandidate] = []
+    for candidate in candidates:
+        with_range = attach_deterministic_plausibility_range(candidate, known_ranges)
+        if not with_range or not plausibility_range_is_complete(with_range.plausibility_range):
+            continue
+        prepared.append(with_range)
+    if not prepared:
+        return []
+    return prepared
+
+
+def attach_deterministic_plausibility_range(
+    candidate: ProductCandidate,
+    known_ranges: dict[tuple[str, str, str], PlausibilityRange],
+) -> Optional[ProductCandidate]:
+    known = lookup_plausibility_range(candidate, known_ranges)
+    if known and plausibility_range_is_complete(known):
+        return replace(candidate, plausibility_range=with_default_plausibility_bounds(known))
+    derived = derive_candidate_plausibility_range(candidate)
+    if plausibility_range_is_complete(derived):
+        return replace(candidate, plausibility_range=with_default_plausibility_bounds(derived))
+    return None
 
 
 def candidate_matches_single_bill_product(candidate: ProductCandidate, product: str) -> bool:
@@ -1532,8 +1623,26 @@ def product_is_allowed(candidate: ProductCandidate, rules: SelectionRules) -> bo
     return any(normalize_text(item) and normalize_text(item) in name for item in rules.allowed_products)
 
 
-def selection_score(candidate: ProductCandidate, rules: SelectionRules) -> tuple[int, float]:
-    return (1 if product_is_allowed(candidate, rules) else 0, candidate.score)
+def candidate_reference_unit_price(candidate: ProductCandidate) -> float:
+    evidence_price = to_float(candidate.price_evidence.get("declared_unit_price"))
+    if evidence_price and evidence_price > 0:
+        return evidence_price
+    if candidate.unit_price and candidate.unit_price > 0:
+        return candidate.unit_price
+    if candidate.declared_value and candidate.qty:
+        derived = candidate.declared_value / candidate.qty
+        if derived > 0:
+            return derived
+    return 0.0
+
+
+def selection_score(candidate: ProductCandidate, rules: SelectionRules) -> tuple[int, float, float]:
+    rate = candidate_tax_rate(candidate)
+    reference_price = candidate_reference_unit_price(candidate)
+    price_tax_pressure = max(0.0, reference_price) * max(0.0, rate)
+    penalty = 1.0 + rate * 8.0 + price_tax_pressure * 6.0
+    feasibility_score = candidate.score / penalty
+    return (1 if product_is_allowed(candidate, rules) else 0, feasibility_score, candidate.score)
 
 
 def select_qualified_tax_data(
@@ -1827,6 +1936,8 @@ def attach_price_evidence_to_candidates(
     candidates: list[ProductCandidate],
     *,
     query_cache: Optional[QueryCache] = None,
+    price_timeout: float = PRICE_SEARCH_TIMEOUT_SECONDS,
+    price_max_pages: int = PRICE_SEARCH_MAX_PAGES,
 ) -> list[ProductCandidate]:
     result: list[ProductCandidate] = []
     cache = query_cache.setdefault("price", {}) if query_cache is not None else {}
@@ -1842,6 +1953,8 @@ def attach_price_evidence_to_candidates(
                 evidence_obj = estimate_declared_unit_price_from_web(
                     query,
                     cache_dir=cache_dir,
+                    timeout=price_timeout,
+                    max_pages=price_max_pages,
                     declaration_ratio=DECLARED_RETAIL_PRICE_RATIO,
                 )
                 evidence = evidence_obj.to_dict()
@@ -2505,6 +2618,12 @@ def build_output_rows(
             "重量规则来源": plan.plausibility.source or "默认规则",
             "约束提示": "; ".join(plan.warnings),
             "source_rows": candidate.source_rows,
+            "单件重量": round(plan.gross_weight / plan.qty, 6) if plan.qty else 0,
+            "每箱数量": round(plan.qty / plan.ctns, 6) if plan.ctns else 0,
+            "单箱重量": round(plan.gross_weight / plan.ctns, 6) if plan.ctns else 0,
+            "税金预算": plan.tax_budget,
+            "参考单价": plan.price_reference,
+            "数量推导": plan.quantity_basis,
         }
         update_row_tax_display(row)
         rows.append(row)
@@ -2963,18 +3082,52 @@ def build_plausible_row_plans(
         raise RuntimeError("提单未识别到有效总箱数，不能生成与提单箱数对齐的输出")
     target_ctns = bill.cartons
     target_ctns = max(options.target_item_count, int(round(target_ctns)))
-    ctn_values = [candidate.ctns or 1 for candidate in selected]
-    ctns = scale_positive_integers(ctn_values, target_ctns)
     ranges = [resolve_plausibility_range(candidate, plausibility_ranges) for candidate in selected]
+    ctns = allocate_price_first_cartons(selected, target_ctns)
     weights = allocate_plausible_weights(selected, ctns, ranges, target_gross)
-    quantities = [
-        choose_plausible_quantity(candidate, row_ctns, gross, plausibility)
-        for candidate, row_ctns, gross, plausibility in zip(selected, ctns, weights, ranges)
+    price_references = [
+        price_reference_for_candidate(candidate, plausibility)
+        for candidate, plausibility in zip(selected, ranges)
     ]
-    prices = allocate_plausible_prices(selected, quantities, weights, ranges, options.target_tax_amount)
+    tax_budgets = allocate_row_tax_budgets(
+        selected,
+        options.target_tax_amount,
+        ctns=ctns,
+        weights=weights,
+        ranges=ranges,
+        price_references=price_references,
+    )
+    quantities = [
+        choose_plausible_quantity(
+            candidate,
+            row_ctns,
+            gross,
+            plausibility,
+            tax_budget=tax_budget,
+            price_reference=price_reference,
+        )
+        for candidate, row_ctns, gross, plausibility, tax_budget, price_reference in zip(
+            selected,
+            ctns,
+            weights,
+            ranges,
+            tax_budgets,
+            price_references,
+        )
+    ]
+    prices = allocate_plausible_prices(selected, quantities, weights, ranges, options.target_tax_amount, tax_budgets)
 
     plans: list[RowPlan] = []
-    for candidate, row_ctns, qty, gross, price, plausibility in zip(selected, ctns, quantities, weights, prices, ranges):
+    for candidate, row_ctns, qty, gross, price, plausibility, tax_budget, price_reference in zip(
+        selected,
+        ctns,
+        quantities,
+        weights,
+        prices,
+        ranges,
+        tax_budgets,
+        price_references,
+    ):
         unit_price, total_value = price
         warnings = tuple(build_constraint_warnings(row_ctns, qty, gross, unit_price, plausibility))
         plans.append(
@@ -2987,9 +3140,150 @@ def build_plausible_row_plans(
                 unit_price=unit_price,
                 plausibility=plausibility,
                 warnings=warnings,
+                tax_budget=round(tax_budget, 2),
+                price_reference=round(price_reference, 4),
+                quantity_basis="税金预算/参考单价反推，并受重量、箱数、每箱数量约束",
             )
         )
     return plans
+
+
+def optimize_selected_candidates_for_price_fit(
+    selected: list[ProductCandidate],
+    repair_pool: list[ProductCandidate],
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    options: ProcessingOptions,
+    *,
+    query_cache: Optional[QueryCache] = None,
+) -> tuple[list[ProductCandidate], dict[str, Any]]:
+    if not repair_pool:
+        return selected, {"swaps": 0, "message": "no repair pool"}
+
+    try:
+        best_plans = build_plausible_row_plans(
+            selected=selected,
+            manifest=manifest,
+            bill=bill,
+            options=options,
+            plausibility_ranges={},
+        )
+    except RuntimeError as exc:
+        return selected, {"swaps": 0, "message": f"initial plan failed: {exc}"}
+
+    best_selected = list(selected)
+    best_score = price_fit_score_for_plans(best_plans)
+    original_score = best_score
+    swaps: list[dict[str, Any]] = []
+    priced_repair_candidates: dict[tuple[str, str, str], ProductCandidate] = {}
+    web_lookups = 0
+
+    for _ in range(PRICE_REPAIR_MAX_PASSES):
+        bad_indexes = [
+            idx
+            for idx, plan in enumerate(best_plans)
+            if row_plan_price_fit_ratio(plan) is not None
+            and (row_plan_price_fit_ratio(plan) or 0.0) < PRICE_FIT_MIN_REFERENCE_RATIO
+            and not is_undetailed_bill_candidate(plan.candidate)
+        ]
+        bad_indexes.sort(key=lambda idx: row_plan_price_fit_ratio(best_plans[idx]) or 0.0)
+        if not bad_indexes:
+            break
+
+        improved = False
+        current_keys = {candidate_identity(candidate) for candidate in best_selected}
+        for bad_idx in bad_indexes:
+            for raw_candidate in sorted(repair_pool, key=price_repair_candidate_order):
+                replacement_key = candidate_identity(raw_candidate)
+                if replacement_key in current_keys:
+                    continue
+                replacement_candidate = priced_repair_candidates.get(replacement_key)
+                if replacement_candidate is None:
+                    evidence_price = to_float(raw_candidate.price_evidence.get("declared_unit_price"))
+                    if evidence_price and evidence_price > 0:
+                        replacement_candidate = raw_candidate
+                    elif web_lookups < PRICE_REPAIR_MAX_WEB_LOOKUPS:
+                        replacement_candidate = attach_price_evidence_to_candidates(
+                            [raw_candidate],
+                            query_cache=query_cache,
+                            price_timeout=PRICE_REPAIR_SEARCH_TIMEOUT_SECONDS,
+                            price_max_pages=PRICE_REPAIR_SEARCH_MAX_PAGES,
+                        )[0]
+                        web_lookups += 1
+                    else:
+                        continue
+                    priced_repair_candidates[replacement_key] = replacement_candidate
+                trial_selected = list(best_selected)
+                old_candidate = trial_selected[bad_idx]
+                trial_selected[bad_idx] = replacement_candidate
+                try:
+                    trial_plans = build_plausible_row_plans(
+                        selected=trial_selected,
+                        manifest=manifest,
+                        bill=bill,
+                        options=options,
+                        plausibility_ranges={},
+                    )
+                except RuntimeError:
+                    continue
+                trial_score = price_fit_score_for_plans(trial_plans)
+                score_gain = best_score - trial_score
+                if score_gain < max(PRICE_REPAIR_MIN_SCORE_GAIN, best_score * 0.05):
+                    continue
+                best_selected = trial_selected
+                best_plans = trial_plans
+                best_score = trial_score
+                swaps.append(
+                    {
+                        "from": old_candidate.zh or old_candidate.en,
+                        "to": replacement_candidate.zh or replacement_candidate.en,
+                        "score_gain": round(score_gain, 2),
+                    }
+                )
+                improved = True
+                break
+            if improved:
+                break
+        if not improved:
+            break
+
+    return best_selected, {
+        "swaps": len(swaps),
+        "initial_score": round(original_score, 2),
+        "final_score": round(best_score, 2),
+        "web_lookups": web_lookups,
+        "details": swaps,
+    }
+
+
+def price_repair_candidate_order(candidate: ProductCandidate) -> tuple[float, float, float]:
+    rate = candidate_tax_rate(candidate)
+    reference_price = candidate_reference_unit_price(candidate)
+    price_tax_pressure = max(0.0, reference_price) * max(0.0, rate)
+    return (price_tax_pressure, -candidate.score, -reference_price)
+
+
+def price_fit_score_for_plans(plans: list[RowPlan]) -> float:
+    score = 0.0
+    for plan in plans:
+        ratio = row_plan_price_fit_ratio(plan)
+        if ratio is None:
+            continue
+        if ratio <= 0:
+            score += 10000.0
+        elif ratio < PRICE_FIT_MIN_REFERENCE_RATIO:
+            row_tax = plan.total_value * candidate_tax_rate(plan.candidate)
+            score += ((PRICE_FIT_MIN_REFERENCE_RATIO / ratio) - 1.0) * max(1.0, row_tax)
+        min_price = plan.plausibility.unit_price_min
+        if min_price and min_price > 0 and plan.unit_price < min_price:
+            score += ((min_price - plan.unit_price) / min_price) * 250.0
+    return round(score, 4)
+
+
+def row_plan_price_fit_ratio(plan: RowPlan) -> Optional[float]:
+    if plan.price_reference <= 0 or plan.unit_price <= 0 or candidate_tax_rate(plan.candidate) <= 0:
+        return None
+    return plan.unit_price / plan.price_reference
 
 
 def resolve_plausibility_range(
@@ -3024,6 +3318,153 @@ def with_default_plausibility_bounds(value: PlausibilityRange) -> PlausibilityRa
         qty_per_ctn_max=value.qty_per_ctn_max,
         source=value.source,
     )
+
+
+def allocate_price_first_cartons(selected: list[ProductCandidate], target_ctns: float) -> list[int]:
+    target = max(len(selected), int(round(target_ctns)))
+    values = [candidate.ctns or 1 for candidate in selected]
+    undetailed_bill_indexes = [
+        idx
+        for idx, candidate in enumerate(selected)
+        if is_undetailed_bill_candidate(candidate)
+    ]
+    if not undetailed_bill_indexes or len(undetailed_bill_indexes) == len(selected):
+        return scale_positive_integers(values, target)
+
+    bill_total_cap = max(
+        len(undetailed_bill_indexes),
+        int(round(target * UNDETAILED_BILL_CARTON_SHARE)),
+    )
+    bill_row_cap = max(1, math.ceil(bill_total_cap / len(undetailed_bill_indexes)))
+    initial = scale_positive_integers(values, target)
+    if sum(initial[idx] for idx in undetailed_bill_indexes) <= bill_total_cap:
+        return initial
+
+    result = [0 for _ in selected]
+    used_bill = 0
+    for idx in undetailed_bill_indexes:
+        result[idx] = min(initial[idx], bill_row_cap)
+        used_bill += result[idx]
+
+    non_bill_indexes = [idx for idx in range(len(selected)) if idx not in set(undetailed_bill_indexes)]
+    remaining = max(len(non_bill_indexes), target - used_bill)
+    non_bill_values = [values[idx] for idx in non_bill_indexes]
+    non_bill_ctns = scale_positive_integers(non_bill_values, remaining)
+    for idx, ctn_value in zip(non_bill_indexes, non_bill_ctns):
+        result[idx] = ctn_value
+
+    diff = target - sum(result)
+    if diff:
+        order = sorted(non_bill_indexes, key=lambda idx: values[idx], reverse=True) or list(range(len(result)))
+        for step in range(abs(diff)):
+            idx = order[step % len(order)]
+            if diff > 0:
+                result[idx] += 1
+            elif result[idx] > 1:
+                result[idx] -= 1
+    return result
+
+
+def allocate_row_tax_budgets(
+    selected: list[ProductCandidate],
+    target_tax_amount: float,
+    *,
+    ctns: Optional[list[int]] = None,
+    weights: Optional[list[float]] = None,
+    ranges: Optional[list[PlausibilityRange]] = None,
+    price_references: Optional[list[float]] = None,
+) -> list[float]:
+    positive_indexes = [idx for idx, candidate in enumerate(selected) if candidate_tax_rate(candidate) > 0]
+    budgets = [0.0 for _ in selected]
+    if not positive_indexes:
+        return budgets
+
+    base = {idx: MIN_ROW_TAX_AMOUNT_USD for idx in positive_indexes}
+    demand = build_reference_tax_demands(selected, ctns, weights, ranges, price_references, base)
+    bill_indexes = [idx for idx in positive_indexes if is_undetailed_bill_candidate(selected[idx])]
+    non_bill_indexes = [idx for idx in positive_indexes if idx not in set(bill_indexes)]
+
+    if bill_indexes and non_bill_indexes:
+        non_bill_min = sum(base[idx] for idx in non_bill_indexes)
+        bill_min = sum(base[idx] for idx in bill_indexes)
+        bill_total = min(target_tax_amount * UNDETAILED_BILL_TAX_SHARE, max(bill_min, target_tax_amount - non_bill_min))
+        bill_total = max(bill_min, bill_total)
+        bill_total = min(bill_total, max(bill_min, target_tax_amount - non_bill_min))
+        distribute_tax_budget(budgets, bill_indexes, bill_total, base)
+        distribute_tax_budget(budgets, non_bill_indexes, max(non_bill_min, target_tax_amount - bill_total), base, demand)
+    else:
+        distribute_tax_budget(budgets, positive_indexes, target_tax_amount, base, demand)
+    return [round(value, 4) for value in budgets]
+
+
+def build_reference_tax_demands(
+    selected: list[ProductCandidate],
+    ctns: Optional[list[int]],
+    weights: Optional[list[float]],
+    ranges: Optional[list[PlausibilityRange]],
+    price_references: Optional[list[float]],
+    base: dict[int, float],
+) -> dict[int, float]:
+    if not ctns or not weights or not ranges or not price_references:
+        return {}
+    demand: dict[int, float] = {}
+    for idx, (candidate, row_ctns, gross, plausibility, reference_price) in enumerate(
+        zip(selected, ctns, weights, ranges, price_references)
+    ):
+        rate = candidate_tax_rate(candidate)
+        if rate <= 0 or reference_price <= 0:
+            continue
+        min_qty, _ = plausible_quantity_bounds(candidate, row_ctns, gross, plausibility)
+        target_tax = min_qty * reference_price * rate * PRICE_FIT_MIN_REFERENCE_RATIO
+        demand[idx] = max(base.get(idx, 0.0), target_tax)
+    return demand
+
+
+def distribute_tax_budget(
+    budgets: list[float],
+    indexes: list[int],
+    total: float,
+    base: dict[int, float],
+    demand: Optional[dict[int, float]] = None,
+) -> None:
+    if not indexes:
+        return
+    base_total = sum(base.get(idx, 0.0) for idx in indexes)
+    if total <= base_total:
+        for idx in indexes:
+            budgets[idx] = base.get(idx, 0.0)
+        return
+    extra = total - base_total
+    demand = demand or {}
+    demand_extra = {
+        idx: max(0.0, demand.get(idx, base.get(idx, 0.0)) - base.get(idx, 0.0))
+        for idx in indexes
+    }
+    demand_total = sum(demand_extra.values())
+    if demand_total > 0:
+        used = min(extra, demand_total)
+        for idx in indexes:
+            budgets[idx] = base.get(idx, 0.0) + used * demand_extra[idx] / demand_total
+        extra -= used
+    else:
+        for idx in indexes:
+            budgets[idx] = base.get(idx, 0.0)
+    if extra > 0:
+        for idx in indexes:
+            budgets[idx] += extra / float(len(indexes))
+
+
+def is_undetailed_bill_candidate(candidate: ProductCandidate) -> bool:
+    return candidate.source in {"bill", "bill_product"} or candidate.tax_match_source in {"bill_hs", "bill_product"}
+
+
+def price_reference_for_candidate(candidate: ProductCandidate, plausibility: PlausibilityRange) -> float:
+    reference = candidate_reference_unit_price(candidate)
+    if reference > 0:
+        return reference
+    min_price = plausibility.unit_price_min or DEFAULT_UNIT_PRICE_MIN
+    max_price = plausibility.unit_price_max or DEFAULT_UNIT_PRICE_MAX
+    return max(DEFAULT_UNIT_PRICE_MIN, min(max_price, max(min_price, (min_price + max_price) / 2)))
 
 
 def scale_positive_integers(values: list[float], target_total: float) -> list[int]:
@@ -3125,7 +3566,29 @@ def choose_plausible_quantity(
     ctns: int,
     gross_weight: float,
     plausibility: PlausibilityRange,
+    *,
+    tax_budget: float = 0.0,
+    price_reference: float = 0.0,
 ) -> int:
+    min_qty, max_qty = plausible_quantity_bounds(candidate, ctns, gross_weight, plausibility)
+    tax_rate = candidate_tax_rate(candidate)
+
+    old_ctns = candidate.ctns or ctns or 1
+    old_qty = candidate.qty or old_ctns
+    qty_per_ctn = old_qty / old_ctns if old_ctns else 1
+    if tax_rate > 0 and tax_budget > 0 and price_reference > 0:
+        desired = max(1, round(tax_budget / (price_reference * tax_rate)))
+    else:
+        desired = max(1, round(ctns * qty_per_ctn))
+    return int(min(max(desired, min_qty), max_qty))
+
+
+def plausible_quantity_bounds(
+    candidate: ProductCandidate,
+    ctns: int,
+    gross_weight: float,
+    plausibility: PlausibilityRange,
+) -> tuple[int, int]:
     min_pc = plausibility.kg_per_pc_min or DEFAULT_KG_PER_PC_MIN
     max_pc = plausibility.kg_per_pc_max or DEFAULT_KG_PER_PC_MAX
     min_qty = max(1, math.ceil(gross_weight / max_pc))
@@ -3143,12 +3606,7 @@ def choose_plausible_quantity(
             "优化无解：单件重量和单箱件数范围无法同时满足；"
             f"{candidate.zh}/{candidate.en} 毛重 {gross_weight} kg，箱数 {ctns}"
         )
-
-    old_ctns = candidate.ctns or ctns or 1
-    old_qty = candidate.qty or old_ctns
-    qty_per_ctn = old_qty / old_ctns if old_ctns else 1
-    desired = max(1, round(ctns * qty_per_ctn))
-    return int(min(max(desired, min_qty), max_qty))
+    return min_qty, max_qty
 
 
 def allocate_plausible_prices(
@@ -3157,23 +3615,28 @@ def allocate_plausible_prices(
     weights: list[float],
     ranges: list[PlausibilityRange],
     target_tax_amount: float,
+    tax_budgets: Optional[list[float]] = None,
 ) -> list[tuple[float, float]]:
     positive_weight = sum(weight for candidate, weight in zip(selected, weights) if candidate_tax_rate(candidate) > 0)
     unit_prices: list[float] = []
     mins: list[float] = []
     maxes: list[float] = []
-    for candidate, qty, weight, plausibility in zip(selected, quantities, weights, ranges):
+    row_tax_budgets = tax_budgets or []
+    for idx, (candidate, qty, weight, plausibility) in enumerate(zip(selected, quantities, weights, ranges)):
         min_price = plausibility.unit_price_min or DEFAULT_UNIT_PRICE_MIN
         max_price = max(min_price, plausibility.unit_price_max or DEFAULT_UNIT_PRICE_MAX)
         mins.append(min_price)
         maxes.append(max_price)
         tax_rate = candidate_tax_rate(candidate)
-        if tax_rate > 0 and positive_weight > 0:
+        if tax_rate > 0 and idx < len(row_tax_budgets) and row_tax_budgets[idx] > 0:
+            target_tax = row_tax_budgets[idx]
+            desired = target_tax / tax_rate / qty
+        elif tax_rate > 0 and positive_weight > 0:
             target_tax = target_tax_amount * weight / positive_weight
             desired = target_tax / tax_rate / qty
         else:
             desired = candidate.unit_price or min_price
-        unit_prices.append(min(max(desired, min_price), max_price))
+        unit_prices.append(min(max(desired, 0.0001), max_price))
 
     enforce_minimum_row_tax(unit_prices, mins, maxes, selected, quantities, MIN_ROW_TAX_AMOUNT_USD)
     adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount, MIN_ROW_TAX_AMOUNT_USD)

@@ -52,6 +52,7 @@ from engine import (
     translate_usage_to_english,
     translate_output_chinese_names_with_llm,
     normalize_generated_candidate,
+    optimize_selected_candidates_for_price_fit,
     validate_llm_output_rows,
     validate_price_evidence,
     validate_qty_ctn_relationship,
@@ -1106,6 +1107,101 @@ class OutputOptimizationTests(unittest.TestCase):
         self.assertLess(plans[0].unit_price, plans[0].plausibility.unit_price_min)
         self.assertLessEqual(plans[0].total_value * 0.1, 880)
         self.assertIn("单价低于合理下限", plans[0].warnings[0])
+
+    def test_price_fit_repair_swaps_low_reference_ratio_manifest_candidate(self) -> None:
+        bad = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx",
+            zh="高价鞋",
+            en="Shoes",
+            hs="6402999000",
+            material="Textile",
+            usage="HOME",
+            ctns=10,
+            qty=1000,
+            unit_price=50,
+            gross_weight=100,
+            base_tax_rate=0.1,
+            effective_tax_rate=0.1,
+            price_evidence={"declared_unit_price": 50, "confidence": 0.7},
+            plausibility_range=PlausibilityRange(
+                kg_per_ctn_min=5,
+                kg_per_ctn_max=20,
+                kg_per_pc_min=0.1,
+                kg_per_pc_max=0.2,
+                unit_price_min=30,
+                unit_price_max=60,
+                qty_per_ctn_min=50,
+                qty_per_ctn_max=200,
+                source="test range",
+            ),
+        )
+        anchor = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx",
+            zh="塑料桶",
+            en="Plastic bucket",
+            hs="3924901050",
+            material="Plastic",
+            usage="HOME",
+            ctns=10,
+            qty=80,
+            unit_price=2,
+            gross_weight=100,
+            base_tax_rate=0.1,
+            effective_tax_rate=0.1,
+            price_evidence={"declared_unit_price": 2, "confidence": 0.7},
+            plausibility_range=PlausibilityRange(
+                kg_per_ctn_min=5,
+                kg_per_ctn_max=20,
+                kg_per_pc_min=0.5,
+                kg_per_pc_max=5,
+                unit_price_min=1,
+                unit_price_max=10,
+                qty_per_ctn_min=1,
+                qty_per_ctn_max=50,
+                source="test range",
+            ),
+        )
+        better = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx",
+            zh="塑料收纳盒",
+            en="Plastic storage box",
+            hs="3924905650",
+            material="Plastic",
+            usage="HOME",
+            ctns=10,
+            qty=80,
+            unit_price=1.5,
+            gross_weight=100,
+            base_tax_rate=0.1,
+            effective_tax_rate=0.1,
+            price_evidence={"declared_unit_price": 1.5, "confidence": 0.7},
+            plausibility_range=PlausibilityRange(
+                kg_per_ctn_min=5,
+                kg_per_ctn_max=20,
+                kg_per_pc_min=1,
+                kg_per_pc_max=5,
+                unit_price_min=0.5,
+                unit_price_max=10,
+                qty_per_ctn_min=1,
+                qty_per_ctn_max=50,
+                source="test range",
+            ),
+        )
+
+        selected, summary = optimize_selected_candidates_for_price_fit(
+            [bad, anchor],
+            [better],
+            ManifestSummary("input.xlsx", 2, 20, 200, 1000, []),
+            BillInfo("bill.pdf", "", [], cartons=20),
+            ProcessingOptions(target_tax_amount=100, target_item_count=2),
+        )
+
+        self.assertEqual(summary["swaps"], 1)
+        self.assertEqual(selected[0].zh, "塑料收纳盒")
+        self.assertNotIn("高价鞋", [candidate.zh for candidate in selected])
 
 
 class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
