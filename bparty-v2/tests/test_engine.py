@@ -13,12 +13,15 @@ from engine import (
     BillInfo,
     BillLLMFields,
     BillProduct,
+    ManifestHsGroup,
+    ManifestItem,
     ManifestWeightInfo,
     ManifestSummary,
     ProductCandidate,
     ProcessingOptions,
     SelectionRules,
     apply_bill_product_names,
+    build_manifest_hs_groups,
     build_manifest_weight_context,
     build_output_rows,
     write_workbook,
@@ -52,8 +55,11 @@ from engine import (
     validate_llm_output_rows,
     validate_qty_ctn_relationship,
     infer_bill_material_from_entry,
+    validate_price_and_value_floor,
+    validate_replacement_ratio,
 )
 from crawler_client import parse_classification_results
+from price_search import build_price_evidence, extract_price_samples, parse_pack_qty
 
 
 def tax_result(rate: str = "3.4%", hs: str = "3924104000", certifications: list[str] | None = None) -> dict[str, dict]:
@@ -247,6 +253,78 @@ class TaxRateTests(unittest.TestCase):
         item = parsed["9017800000"]
         self.assertEqual(item["additional_tax_rate"], "25%+10%")
         self.assertEqual(item["certification_texts"], ["FD1: FDA data MAY BE required"])
+
+
+class ManifestHsGroupTests(unittest.TestCase):
+    def test_build_manifest_hs_groups_merges_same_hs_rows(self) -> None:
+        manifest = ManifestSummary(
+            filename="input.xlsx",
+            row_count=3,
+            total_ctns=6,
+            total_real_weight=15,
+            total_declared_value=30,
+            categories=[],
+            items=[
+                ManifestItem(2, "塑料发夹", "Plastic hair clip", "9615900000", "Plastic", "Hair", 2, 100, 0.1, 10, 4, 4),
+                ManifestItem(20, "发夹", "Hair clips", "9615900000", "Plastic", "Hair", 3, 200, 0.08, 16, 6, 6),
+                ManifestItem(21, "钥匙扣", "Keychain", "7326209000", "Metal", "Home", 1, 50, 0.12, 6, 5, 5),
+            ],
+        )
+
+        groups = build_manifest_hs_groups(manifest)
+        by_hs = {group.hs: group for group in groups}
+
+        self.assertEqual(by_hs["9615900000"].source_rows, [2, 20])
+        self.assertEqual(by_hs["9615900000"].total_qty, 300)
+        self.assertEqual(by_hs["9615900000"].total_ctns, 5)
+        self.assertEqual(by_hs["9615900000"].total_gross_weight, 10)
+        self.assertIn("塑料发夹", by_hs["9615900000"].zh_names)
+
+
+class ReplacementRatioTests(unittest.TestCase):
+    def test_validate_replacement_ratio_rejects_over_30_percent(self) -> None:
+        selected = [
+            ProductCandidate("manifest_group", "input", "A", "A", "1111111111", "Plastic", "HOME"),
+            ProductCandidate("replacement", "table", "B", "B", "2222222222", "Plastic", "HOME"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "替换表补充比例过高"):
+            validate_replacement_ratio(selected, 2)
+
+
+class PriceSearchTests(unittest.TestCase):
+    def test_parse_pack_qty_and_price_evidence(self) -> None:
+        self.assertEqual(parse_pack_qty("Plastic hair clips 100 pcs $6.99"), 100)
+        samples = extract_price_samples("<html>Plastic hair clips 100 pcs $6.99 Another pack of 50 $5.00</html>")
+        evidence = build_price_evidence("plastic hair clip", samples)
+
+        self.assertGreaterEqual(len(evidence.samples), 2)
+        self.assertAlmostEqual(evidence.declared_unit_price, evidence.retail_unit_price * 0.3, places=4)
+
+    def test_validate_price_and_value_floor_rejects_too_low_total_value(self) -> None:
+        candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input",
+            zh="塑料发夹",
+            en="Plastic hair clip",
+            hs="9615900000",
+            material="Plastic",
+            usage="HOME",
+            price_evidence={"declared_unit_price": 0.1, "confidence": 0.5, "basis": "test", "retail_unit_price": 0.33},
+        )
+        rows = [
+            {
+                "中文品名": "塑料发夹",
+                "英文品名": "Plastic hair clip",
+                "商品编码": "9615900000",
+                "单价": 0.1,
+                "数量": 10,
+                "总价": 1.0,
+            }
+        ]
+        manifest = ManifestSummary("input.xlsx", 1, 1, 1, 1000, [])
+
+        with self.assertRaisesRegex(RuntimeError, "输出总货值过低"):
+            validate_price_and_value_floor(rows, [candidate], manifest)
 
 
 class CertificationRuleTests(unittest.TestCase):
@@ -628,9 +706,9 @@ class OutputOptimizationTests(unittest.TestCase):
                 base_tax_rate=0.034,
                 effective_tax_rate=0.234,
                 plausibility_range=PlausibilityRange(
-                    kg_per_ctn_min=5,
+                    kg_per_ctn_min=0.5,
                     kg_per_ctn_max=20,
-                    kg_per_pc_min=0.5,
+                    kg_per_pc_min=0.05,
                     kg_per_pc_max=2,
                     unit_price_min=0.5,
                     unit_price_max=10,
@@ -1649,9 +1727,9 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
                 effective_tax_rate=0.1,
                 tax_match_source="product",
                 plausibility_range=PlausibilityRange(
-                    kg_per_ctn_min=5,
+                    kg_per_ctn_min=0.5,
                     kg_per_ctn_max=20,
-                    kg_per_pc_min=0.5,
+                    kg_per_pc_min=0.05,
                     kg_per_pc_max=2,
                     unit_price_min=90,
                     unit_price_max=91,
@@ -1710,10 +1788,10 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
                 effective_tax_rate=0.1,
                 tax_match_source="product",
                 plausibility_range=PlausibilityRange(
-                    kg_per_ctn_min=5,
+                    kg_per_ctn_min=0.5,
                     kg_per_ctn_max=20,
-                    kg_per_pc_min=0.5,
-                    kg_per_pc_max=2,
+                    kg_per_pc_min=0.05,
+                    kg_per_pc_max=0.2,
                     unit_price_min=0.1,
                     unit_price_max=1.0,
                     qty_per_ctn_min=5,
@@ -1737,10 +1815,10 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
                 effective_tax_rate=0.1,
                 tax_match_source="product",
                 plausibility_range=PlausibilityRange(
-                    kg_per_ctn_min=5,
+                    kg_per_ctn_min=0.5,
                     kg_per_ctn_max=20,
-                    kg_per_pc_min=0.5,
-                    kg_per_pc_max=2,
+                    kg_per_pc_min=0.05,
+                    kg_per_pc_max=0.2,
                     unit_price_min=0.1,
                     unit_price_max=1.0,
                     qty_per_ctn_min=5,
@@ -1791,7 +1869,7 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         validate_llm_output_rows(
             rows,
             candidates,
-            ManifestSummary("input.xlsx", 2, 0, 0, 1000, []),
+            ManifestSummary("input.xlsx", 2, 0, 817, 1000, []),
             BillInfo("bill.pdf", "", [], cartons=817),
             ProcessingOptions(target_tax_amount=160, target_item_count=2),
         )

@@ -22,6 +22,7 @@ from PIL import Image
 
 from crawler_client import StrictTaxCrawler
 from llm_client import LLMClient
+from price_search import PriceEvidence, estimate_declared_unit_price_from_web
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -36,6 +37,9 @@ TAX_FINAL_TOLERANCE_USD = 20.0
 MIN_ROW_TAX_AMOUNT_USD = 30.0
 MAX_ZERO_TAX_ROWS = 2
 TAX_UNDER_TARGET_ALLOWANCE_USD = 100.0
+MAX_REPLACEMENT_RATIO = 0.3
+DECLARED_RETAIL_PRICE_RATIO = 0.3
+MIN_TOTAL_VALUE_RATIO = 0.1
 DEFAULT_KG_PER_CTN_MIN = 0.5
 DEFAULT_KG_PER_CTN_MAX = 80.0
 DEFAULT_KG_PER_PC_MIN = 0.01
@@ -317,6 +321,27 @@ class ManifestWeightInfo:
 
 
 @dataclass
+class ManifestHsGroup:
+    hs: str
+    source_rows: list[int] = field(default_factory=list)
+    zh_names: list[str] = field(default_factory=list)
+    en_names: list[str] = field(default_factory=list)
+    materials: list[str] = field(default_factory=list)
+    usages: list[str] = field(default_factory=list)
+    total_ctns: float = 0.0
+    total_qty: float = 0.0
+    total_real_weight: float = 0.0
+    total_gross_weight: float = 0.0
+    total_declared_value: float = 0.0
+    unit_price_values: list[float] = field(default_factory=list)
+    canonical_zh: str = ""
+    canonical_en: str = ""
+    representative_material: str = ""
+    representative_usage: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
 class BillProduct:
     name: str
     hs_code_hint: str = ""
@@ -395,6 +420,7 @@ class ProductCandidate:
     plausibility_range: Optional["PlausibilityRange"] = None
     plausibility_confidence: float = 0.0
     plausibility_basis: str = ""
+    price_evidence: dict[str, Any] = field(default_factory=dict)
     llm_reason: str = ""
 
     @property
@@ -488,14 +514,26 @@ async def build_clearance(
     manifest_candidates = build_manifest_candidates(manifest)
     qualified_manifest: list[ProductCandidate] = []
     manifest_filtered: list[ProductCandidate] = []
+    manifest_query_limit = min(len(manifest_candidates), max(options.target_item_count * 4, options.target_item_count))
+    qualified_manifest, manifest_filtered = await qualify_candidates(
+        crawler,
+        manifest_candidates[:manifest_query_limit],
+        rules,
+        query_cache=query_cache,
+        progress_callback=progress_callback,
+        progress_stage="crawler_manifest_products",
+        progress_start=8,
+        progress_end=52,
+    )
     flow.append(
         {
             "stage": "crawler_manifest_products",
-            "status": "skipped",
-            "queried_rows": 0,
-            "qualified": 0,
-            "filtered": 0,
-            "message": "当前生成逻辑只使用 Excel 总重量，客户清单品名不作为输出候选池",
+            "status": "ok" if qualified_manifest else "insufficient",
+            "queried_rows": manifest_query_limit,
+            "candidate_groups": len(manifest_candidates),
+            "qualified": len(qualified_manifest),
+            "filtered": len(manifest_filtered),
+            "message": "已按客户清单 HS 归并池优先查询税率",
         }
     )
 
@@ -546,7 +584,7 @@ async def build_clearance(
                 f"请补充 HS 或调整品类: {', '.join(missing)}"
             )
 
-    selected = select_initial_candidates([], bill_required, rules, options.target_item_count)
+    selected = select_initial_candidates(qualified_manifest, bill_required, rules, options.target_item_count)
     replacement_filtered: list[ProductCandidate] = []
     replacement_used = 0
     if len(selected) < options.target_item_count:
@@ -586,6 +624,7 @@ async def build_clearance(
             selected.append(qualified[0])
             selected_keys.add(candidate_identity(qualified[0]))
             replacement_used += 1
+            validate_replacement_ratio(selected, options.target_item_count)
         flow.append(
             {
                 "stage": "replacement_products",
@@ -601,6 +640,7 @@ async def build_clearance(
             f"合格品名不足，目标 {options.target_item_count} 行，当前仅 {len(selected)} 行；"
             "请补充常用替换清单或放宽规则"
         )
+    validate_replacement_ratio(selected, options.target_item_count)
 
     await emit_progress(
         progress_callback,
@@ -619,6 +659,7 @@ async def build_clearance(
         llm_client,
         query_cache,
     )
+    selected = attach_price_evidence_to_candidates(selected, query_cache=query_cache)
     rows, draft_attempts, draft_feedback = await generate_valid_output_rows_with_llm(
         llm_client,
         selected,
@@ -631,6 +672,7 @@ async def build_clearance(
     validate_output_rows(rows)
     estimated_tax = round(sum((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0) for row in rows), 2)
     tax_gap = round(estimated_tax - options.target_tax_amount, 2)
+    validate_price_and_value_floor(rows, selected, manifest)
     flow.append(
         {
             "stage": "optimize_output",
@@ -694,6 +736,9 @@ async def build_clearance(
         "bill_products": len(bill.products),
         "qualified_manifest_candidates": len(qualified_manifest),
         "replacement_candidates_used": replacement_used,
+        "manifest_origin_rows": sum(1 for row in rows if clean_text(row.get("来源")) == "manifest_group"),
+        "replacement_ratio": round(replacement_used / max(1, len(rows)), 4),
+        "price_evidence_count": sum(1 for candidate in selected if candidate.price_evidence),
         "filtered_candidates": len(manifest_filtered) + len(replacement_filtered),
         "realism_status": "passed",
         "realism_warnings": sum(1 for row in rows if clean_text(row.get("约束提示"))),
@@ -715,6 +760,7 @@ async def build_clearance(
         "output_rows": rows,
         "input_tax_records": {candidate.hs: candidate.tax_data for candidate in qualified_manifest if candidate.hs},
         "output_tax_records": {normalize_hs(row.get("商品编码")): row.get("爬虫品名") for row in rows},
+        "audit": build_audit_summary(rows, selected, manifest),
         "filter_summary": summarize_filter_reasons([*manifest_filtered, *replacement_filtered]),
         "output_file": str(output_path),
     }
@@ -1129,29 +1175,105 @@ def read_rule_lines(path: Path) -> list[str]:
 
 
 def build_manifest_candidates(manifest: ManifestSummary) -> list[ProductCandidate]:
-    groups: dict[tuple[str, str, str, str, str], ProductCandidate] = {}
-    for item in manifest.items:
-        key = (item.zh, item.en, item.hs, item.material, item.usage)
-        if key not in groups:
-            groups[key] = ProductCandidate(
-                source="manifest",
-                source_label=manifest.filename,
-                zh=item.zh,
-                en=item.en or item.zh,
-                hs=item.hs,
-                material=item.material,
-                usage=item.usage or "HOME",
+    groups = build_manifest_hs_groups(manifest)
+    candidates: list[ProductCandidate] = []
+    for group in groups:
+        unit_price = median_or_first(group.unit_price_values)
+        qty = group.total_qty or group.total_ctns or 1
+        gross_weight = group.total_gross_weight or group.total_real_weight or 1
+        candidates.append(
+            ProductCandidate(
+                source="manifest_group",
+                source_label=f"{manifest.filename}/HS归并",
+                zh=group.canonical_zh,
+                en=group.canonical_en or group.canonical_zh,
+                hs=group.hs,
+                material=group.representative_material,
+                usage=group.representative_usage or "HOME",
+                ctns=group.total_ctns,
+                qty=qty,
+                unit_price=unit_price,
+                declared_value=group.total_declared_value,
+                real_weight=group.total_real_weight,
+                gross_weight=gross_weight,
+                source_rows=group.source_rows,
+                llm_reason="; ".join(group.warnings),
             )
-        candidate = groups[key]
-        candidate.ctns += item.ctns or 0
-        candidate.qty += item.qty or 0
-        candidate.unit_price = candidate.unit_price or item.unit_price or 0
-        candidate.declared_value += item.declared_value or 0
-        candidate.real_weight += item.real_weight or item.gross_weight or 0
-        candidate.gross_weight += item.gross_weight or item.real_weight or 0
-        candidate.source_rows.append(item.row)
+        )
+    return sorted(candidates, key=lambda item: item.score, reverse=True)
 
-    return sorted(groups.values(), key=lambda item: item.score, reverse=True)
+
+def build_manifest_hs_groups(manifest: ManifestSummary) -> list[ManifestHsGroup]:
+    groups: dict[str, ManifestHsGroup] = {}
+    skipped_rows: list[int] = []
+    for item in manifest.items:
+        hs = normalize_hs(item.hs)
+        if len(hs) != 10:
+            skipped_rows.append(item.row)
+            continue
+        group = groups.setdefault(hs, ManifestHsGroup(hs=hs))
+        group.source_rows.append(item.row)
+        append_unique(group.zh_names, item.zh)
+        append_unique(group.en_names, item.en)
+        append_unique(group.materials, item.material)
+        append_unique(group.usages, item.usage)
+        group.total_ctns += item.ctns or 0
+        group.total_qty += item.qty or 0
+        group.total_real_weight += item.real_weight or 0
+        group.total_gross_weight += item.gross_weight or item.real_weight or 0
+        group.total_declared_value += item.declared_value or 0
+        if item.unit_price and item.unit_price > 0:
+            group.unit_price_values.append(item.unit_price)
+
+    result: list[ManifestHsGroup] = []
+    for group in groups.values():
+        group.canonical_zh = choose_representative_text(group.zh_names)
+        group.canonical_en = choose_representative_text(group.en_names) or group.canonical_zh
+        group.representative_material = choose_representative_text(group.materials) or "Mixed"
+        group.representative_usage = choose_representative_text(group.usages) or "HOME"
+        if len({normalize_text(name) for name in group.zh_names if normalize_text(name)}) > 6:
+            group.warnings.append("同一 HS 下原始品名较多，代表品名仅用于搜索和申报候选")
+        if not group.total_qty:
+            group.warnings.append("该 HS group 缺少有效数量")
+        if not group.total_gross_weight and not group.total_real_weight:
+            group.warnings.append("该 HS group 缺少有效重量")
+        round_manifest_group_totals(group)
+        result.append(group)
+    return sorted(result, key=lambda item: item.total_gross_weight + item.total_declared_value / 100, reverse=True)
+
+
+def append_unique(values: list[str], value: Any) -> None:
+    text = clean_text(value)
+    if not text:
+        return
+    key = normalize_text(text)
+    if key and key not in {normalize_text(item) for item in values}:
+        values.append(text)
+
+
+def choose_representative_text(values: list[str]) -> str:
+    cleaned = [clean_text(value) for value in values if clean_text(value)]
+    if not cleaned:
+        return ""
+    return sorted(cleaned, key=lambda item: (len(item), -sum(ch.isascii() and ch.isalpha() for ch in item)))[0]
+
+
+def median_or_first(values: list[float]) -> float:
+    cleaned = sorted(value for value in values if value and value > 0)
+    if not cleaned:
+        return 0.0
+    middle = len(cleaned) // 2
+    if len(cleaned) % 2:
+        return round(cleaned[middle], 4)
+    return round((cleaned[middle - 1] + cleaned[middle]) / 2, 4)
+
+
+def round_manifest_group_totals(group: ManifestHsGroup) -> None:
+    group.total_ctns = round(group.total_ctns, 2)
+    group.total_qty = round(group.total_qty, 2)
+    group.total_real_weight = round(group.total_real_weight, 2)
+    group.total_gross_weight = round(group.total_gross_weight, 2)
+    group.total_declared_value = round(group.total_declared_value, 2)
 
 
 async def qualify_candidates(
@@ -1206,7 +1328,7 @@ async def qualify_single_candidate(
         return replace(candidate, filter_reason=product_reason)
 
     errors: list[str] = []
-    if candidate.source == "replacement" and normalize_hs(candidate.hs):
+    if candidate.source in {"replacement", "manifest_group"} and normalize_hs(candidate.hs):
         try:
             hs_results = await cached_search(crawler, candidate.hs, query_cache)
             selected = select_qualified_tax_data(
@@ -1216,17 +1338,17 @@ async def qualify_single_candidate(
                 enforce_tax_limit=enforce_tax_limit,
             )
             if selected:
-                return attach_tax_data(candidate, selected, "replacement_hs")
-            errors.append("替换清单原始 HTS 查询无合格结果")
+                return attach_tax_data(candidate, selected, f"{candidate.source}_hs")
+            errors.append("原始 HTS 查询无合格结果")
         except Exception as exc:
-            errors.append(f"替换清单原始 HTS 查询失败: {exc}")
+            errors.append(f"原始 HTS 查询失败: {exc}")
 
     try:
         product_results = await cached_search_product(crawler, candidate.zh or candidate.en, candidate.material, query_cache)
         selected = select_qualified_tax_data(
             product_results,
             rules,
-            required_hs=(candidate.hs if candidate.source == "replacement" else ""),
+            required_hs=(candidate.hs if candidate.source in {"replacement", "manifest_group"} else ""),
             enforce_tax_limit=enforce_tax_limit,
         )
         if selected:
@@ -1687,6 +1809,176 @@ def normalize_plausibility_range_bounds(value: PlausibilityRange) -> Plausibilit
         qty_per_ctn_max=qty_max,
         source=value.source,
     )
+
+
+def attach_price_evidence_to_candidates(
+    candidates: list[ProductCandidate],
+    *,
+    query_cache: Optional[QueryCache] = None,
+) -> list[ProductCandidate]:
+    result: list[ProductCandidate] = []
+    cache = query_cache.setdefault("price", {}) if query_cache is not None else {}
+    cache_dir = APP_DIR / "runtime" / "price_cache"
+    for candidate in candidates:
+        query = build_price_query(candidate)
+        key = product_cache_key(query, candidate.material)
+        evidence_payload = cache.get(key) if cache is not None else None
+        if isinstance(evidence_payload, dict):
+            evidence = evidence_payload
+        else:
+            try:
+                evidence_obj = estimate_declared_unit_price_from_web(
+                    query,
+                    cache_dir=cache_dir,
+                    declaration_ratio=DECLARED_RETAIL_PRICE_RATIO,
+                )
+                evidence = evidence_obj.to_dict()
+            except Exception as exc:
+                evidence = PriceEvidence(query=query, basis=f"web search failed: {exc}", confidence=0.0, source="fallback").to_dict()
+            if cache is not None:
+                cache[key] = evidence
+        evidence = apply_price_fallback(candidate, evidence)
+        plausibility = adjust_plausibility_with_price_evidence(candidate.plausibility_range, evidence)
+        result.append(replace(candidate, price_evidence=evidence, plausibility_range=plausibility))
+    return result
+
+
+def build_price_query(candidate: ProductCandidate) -> str:
+    parts = [
+        candidate.en if has_ascii_alpha(candidate.en) else "",
+        candidate.zh if not has_ascii_alpha(candidate.en) else "",
+        candidate.material,
+        "retail price",
+    ]
+    return clean_text(" ".join(part for part in parts if clean_text(part)))
+
+
+def has_ascii_alpha(value: Any) -> bool:
+    return any(ch.isascii() and ch.isalpha() for ch in str(value or ""))
+
+
+def apply_price_fallback(candidate: ProductCandidate, evidence: dict[str, Any]) -> dict[str, Any]:
+    declared = to_float(evidence.get("declared_unit_price"))
+    if declared and declared > 0:
+        return evidence
+    fallback = candidate.unit_price or None
+    source = "manifest grouped median unit price" if candidate.source == "manifest_group" else "candidate original unit price"
+    if fallback is None or fallback <= 0:
+        plausibility = candidate.plausibility_range
+        fallback = plausibility.unit_price_min if plausibility and plausibility.unit_price_min else DEFAULT_UNIT_PRICE_MIN
+        source = "plausibility minimum fallback"
+    retail = round(fallback / DECLARED_RETAIL_PRICE_RATIO, 4) if fallback else 0.0
+    return {
+        **evidence,
+        "retail_unit_price": retail,
+        "declared_unit_price": round(fallback, 4),
+        "basis": f"{source}; no usable public web search sample",
+        "confidence": max(0.25, to_float(evidence.get("confidence")) or 0.0),
+        "source": "fallback",
+        "samples": evidence.get("samples") or [],
+    }
+
+
+def adjust_plausibility_with_price_evidence(
+    plausibility: Optional[PlausibilityRange],
+    evidence: dict[str, Any],
+) -> Optional[PlausibilityRange]:
+    if plausibility is None:
+        return None
+    declared = to_float(evidence.get("declared_unit_price"))
+    confidence = to_float(evidence.get("confidence")) or 0.0
+    if declared is None or declared <= 0 or confidence < 0.2:
+        return plausibility
+    min_price = max(0.0001, declared * 0.67)
+    max_price = max(min_price, declared * 1.5)
+    if plausibility.unit_price_min is not None:
+        min_price = max(min_price, plausibility.unit_price_min)
+    if plausibility.unit_price_max is not None:
+        max_price = min(max_price, plausibility.unit_price_max)
+        if max_price < min_price:
+            max_price = min_price
+    return PlausibilityRange(
+        kg_per_ctn_min=plausibility.kg_per_ctn_min,
+        kg_per_ctn_max=plausibility.kg_per_ctn_max,
+        kg_per_pc_min=plausibility.kg_per_pc_min,
+        kg_per_pc_max=plausibility.kg_per_pc_max,
+        unit_price_min=round(min_price, 4),
+        unit_price_max=round(max_price, 4),
+        ctns_min=plausibility.ctns_min,
+        ctns_max=plausibility.ctns_max,
+        qty_per_ctn_min=plausibility.qty_per_ctn_min,
+        qty_per_ctn_max=plausibility.qty_per_ctn_max,
+        source=f"{plausibility.source}; price evidence: {clean_text(evidence.get('basis'))}",
+    )
+
+
+def validate_replacement_ratio(selected: list[ProductCandidate], target_item_count: int) -> None:
+    replacements = sum(1 for candidate in selected if candidate.source == "replacement")
+    ratio = replacements / max(1, target_item_count)
+    if ratio - MAX_REPLACEMENT_RATIO > 0.0001:
+        raise RuntimeError(
+            f"替换表补充比例过高: {replacements}/{target_item_count}={round(ratio * 100, 1)}%，"
+            f"上限 {round(MAX_REPLACEMENT_RATIO * 100)}%；请补充客户清单合格候选或降低输出行数"
+        )
+
+
+def validate_price_and_value_floor(
+    rows: list[dict[str, Any]],
+    selected: list[ProductCandidate],
+    manifest: ManifestSummary,
+) -> None:
+    for idx, (row, candidate) in enumerate(zip(rows, selected), start=1):
+        evidence = candidate.price_evidence or {}
+        declared = to_float(evidence.get("declared_unit_price"))
+        confidence = to_float(evidence.get("confidence")) or 0.0
+        unit_price = to_float(row.get("单价")) or 0.0
+        if declared and confidence >= 0.2:
+            low = declared * 0.67
+            high = declared * 1.5
+            if unit_price < low - 0.0001 or unit_price > high + 0.0001:
+                raise RuntimeError(
+                    f"第 {idx} 行单价超出价格证据范围: {row.get('中文品名')} "
+                    f"{unit_price} not in {round(low, 4)}-{round(high, 4)}"
+                )
+        row["价格依据"] = evidence.get("basis", "")
+        row["价格置信度"] = evidence.get("confidence", "")
+        row["零售参考单价"] = evidence.get("retail_unit_price", "")
+
+    total_value = round(sum(to_float(row.get("总价")) or 0 for row in rows), 2)
+    value_floor = round((manifest.total_declared_value or 0) * MIN_TOTAL_VALUE_RATIO, 2)
+    if value_floor > 0 and total_value + 0.01 < value_floor:
+        raise RuntimeError(
+            f"输出总货值过低: {total_value} USD，低于原清单货值 {manifest.total_declared_value} "
+            f"的 {round(MIN_TOTAL_VALUE_RATIO * 100)}% 下限 {value_floor} USD"
+        )
+
+
+def build_audit_summary(
+    rows: list[dict[str, Any]],
+    selected: list[ProductCandidate],
+    manifest: ManifestSummary,
+) -> dict[str, Any]:
+    line_items: list[dict[str, Any]] = []
+    for row, candidate in zip(rows, selected):
+        line_items.append(
+            {
+                "name": row.get("中文品名"),
+                "hs": normalize_hs(row.get("商品编码")),
+                "source": candidate.source,
+                "source_rows": candidate.source_rows,
+                "tax_match_source": candidate.tax_match_source,
+                "crawler_description": row.get("爬虫品名"),
+                "price_evidence": candidate.price_evidence,
+                "plausibility_source": row.get("合理性来源") or row.get("重量规则来源"),
+                "warnings": row.get("约束提示"),
+            }
+        )
+    return {
+        "manifest_total_declared_value": manifest.total_declared_value,
+        "manifest_origin_rows": sum(1 for candidate in selected if candidate.source == "manifest_group"),
+        "replacement_rows": sum(1 for candidate in selected if candidate.source == "replacement"),
+        "line_items": line_items,
+    }
 
 
 def ordered_optional(left: Optional[float], right: Optional[float]) -> tuple[Optional[float], Optional[float]]:
@@ -2313,6 +2605,7 @@ def candidate_to_llm_dict(candidate: ProductCandidate) -> dict[str, Any]:
         "plausibility_range": asdict(plausibility) if plausibility else None,
         "plausibility_confidence": candidate.plausibility_confidence,
         "plausibility_basis": candidate.plausibility_basis,
+        "price_evidence": candidate.price_evidence,
         "llm_reason": candidate.llm_reason,
     }
 
@@ -2376,6 +2669,9 @@ def normalize_llm_output_draft(payload: dict[str, Any], selected: list[ProductCa
             "合理性来源": (candidate.plausibility_range.source if candidate.plausibility_range else ""),
             "税率来源": candidate.tax_match_source,
             "查询词": candidate.query_name or candidate.zh,
+            "价格依据": candidate.price_evidence.get("basis", ""),
+            "价格置信度": candidate.price_evidence.get("confidence", ""),
+            "零售参考单价": candidate.price_evidence.get("retail_unit_price", ""),
         }
         update_row_tax_display(row)
         rows.append(row)
@@ -2551,9 +2847,9 @@ def validate_row_plausibility(rows: list[dict[str, Any]], selected: list[Product
         qty_per_ctn_max = max(qty_per_ctn_min, plausibility.qty_per_ctn_max or qty_per_ctn_min)
         checks = [
             ("单价", unit_price, plausibility.unit_price_min, plausibility.unit_price_max, True),
-            ("单件重量", gross / qty if qty else 0, plausibility.kg_per_pc_min, plausibility.kg_per_pc_max, False),
+            ("单件重量", gross / qty if qty else 0, plausibility.kg_per_pc_min, plausibility.kg_per_pc_max, True),
             ("每箱数量", qty / ctns if ctns else 0, qty_per_ctn_min, qty_per_ctn_max, True),
-            ("单箱重量", gross / ctns if ctns else 0, plausibility.kg_per_ctn_min, plausibility.kg_per_ctn_max, False),
+            ("单箱重量", gross / ctns if ctns else 0, plausibility.kg_per_ctn_min, plausibility.kg_per_ctn_max, True),
         ]
         warnings: list[str] = []
         for label, value, low, high, hard_limit in checks:
