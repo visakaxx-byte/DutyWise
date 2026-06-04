@@ -101,7 +101,7 @@
 
 替换清单使用规则：
 
-- 替换品行数默认不超过最终输出行数的 20%-30%。
+- 替换品只补清单归纳池不足的行数，原清单里能用多少就用多少；替换比例仅作为审计指标。
 - 替换品必须有替换原因，例如认证风险、HS 不可用、客户清单没有足够合规品类。
 - 替换品不能与客户清单语义完全无关。
 - 替换品不能为了降低税率强行引入高价值或高重量品类。
@@ -264,7 +264,7 @@ Amazon 官方 PA-API 文档显示旧 PA-API 已提示迁移到 Creators API，�
 - `build_manifest_candidate_pool()`
 - `map_bill_products_to_manifest_groups()`
 - `select_candidates_from_manifest_first()`
-- `validate_replacement_ratio()`
+- `summarize_replacement_usage()`
 - `validate_hs_semantic_match()`
 - `validate_weight_plausibility_hard()`
 - `validate_price_and_value_floor()`

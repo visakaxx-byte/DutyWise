@@ -56,7 +56,6 @@ from engine import (
     validate_qty_ctn_relationship,
     infer_bill_material_from_entry,
     validate_price_and_value_floor,
-    validate_replacement_ratio,
 )
 from crawler_client import parse_classification_results
 from price_search import build_price_evidence, extract_price_samples, parse_pack_qty
@@ -279,16 +278,6 @@ class ManifestHsGroupTests(unittest.TestCase):
         self.assertEqual(by_hs["9615900000"].total_ctns, 5)
         self.assertEqual(by_hs["9615900000"].total_gross_weight, 10)
         self.assertIn("塑料发夹", by_hs["9615900000"].zh_names)
-
-
-class ReplacementRatioTests(unittest.TestCase):
-    def test_validate_replacement_ratio_rejects_over_30_percent(self) -> None:
-        selected = [
-            ProductCandidate("manifest_group", "input", "A", "A", "1111111111", "Plastic", "HOME"),
-            ProductCandidate("replacement", "table", "B", "B", "2222222222", "Plastic", "HOME"),
-        ]
-        with self.assertRaisesRegex(RuntimeError, "替换表补充比例过高"):
-            validate_replacement_ratio(selected, 2)
 
 
 class PriceSearchTests(unittest.TestCase):

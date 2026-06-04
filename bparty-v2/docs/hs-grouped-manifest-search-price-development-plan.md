@@ -169,20 +169,20 @@ class PriceEvidence:
 
 - `select_candidates_manifest_first(manifest_candidates, bill, replacement_pool, options)`
 - `map_bill_products_to_hs_groups(bill, manifest_groups)`
-- `validate_replacement_ratio(selected, target_item_count)`
+- `summarize_replacement_usage(selected, target_item_count)`
 
 规则：
 
 - 先从清单 HS group 中选。
 - 提单品名必须覆盖，但优先映射到清单已有 HS group。
-- 替换表只补不足行数。
-- 默认替换表比例不超过 30%；如超过，任务应失败并说明原因。
+- 替换表只补不足行数，原清单里能用多少就用多少。
+- 替换表比例只作为审计指标记录，不作为硬失败条件。
 - 替换品不能与清单主语义明显无关。
 
 验收：
 
 - `CMDUCHN3357475` 输出大部分行来自清单归并池。
-- 替换表行数不超过阈值。
+- 替换表只补清单候选不足的行数，并记录替换比例。
 - 不再为了补行数引入明显无关品类。
 
 ### 3. HS 与 codeflagai 校验
@@ -332,7 +332,7 @@ class PriceEvidence:
 - HS 归并：同 HS 多行合并。
 - HS 异常：空 HS、粘连 HS、长度异常。
 - 代表品名选择：同 HS 多品名时保留 source_names 并选择可搜索名称。
-- 替换比例：超过 30% 阻断。
+- 替换补足：原清单候选能用多少就用多少，替换比例只记录不阻断。
 - 重量硬校验：单件/单箱重量超范围阻断。
 - 价格解析：从标题和文本解析价格、pack qty、unit price。
 - 价格兜底：搜索无样本时 fallback 到清单价或 LLM 估算。
@@ -342,7 +342,7 @@ class PriceEvidence:
 以 `CMDUCHN3357475` 为固定回归样例：
 
 - 输出行大部分来自客户清单 HS group。
-- 替换表行数不超过阈值。
+- 替换表只补清单候选不足的行数，并记录替换比例。
 - 发夹和钥匙扣数量不能无依据放大。
 - 单件重量和单箱重量全部通过硬校验。
 - 总货值不能低到原始货值的 3%。
@@ -373,10 +373,10 @@ class PriceEvidence:
 - 用 HS group 替代当前跳过的 manifest candidate 流程。
 - 增加单元测试。
 
-### 阶段 2：清单优先选品与替换比例限制
+### 阶段 2：清单优先选品与替换补足审计
 
 - 实现 manifest-first selection。
-- 实现 replacement ratio hard validation。
+- 实现 replacement usage audit。
 - 让 `CMDUCHN3357475` 至少大部分输出来自清单。
 
 ### 阶段 3：重量与数量硬约束

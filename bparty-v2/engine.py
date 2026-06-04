@@ -37,7 +37,6 @@ TAX_FINAL_TOLERANCE_USD = 20.0
 MIN_ROW_TAX_AMOUNT_USD = 30.0
 MAX_ZERO_TAX_ROWS = 2
 TAX_UNDER_TARGET_ALLOWANCE_USD = 100.0
-MAX_REPLACEMENT_RATIO = 0.3
 DECLARED_RETAIL_PRICE_RATIO = 0.3
 MIN_TOTAL_VALUE_RATIO = 0.1
 DEFAULT_KG_PER_CTN_MIN = 0.5
@@ -624,7 +623,6 @@ async def build_clearance(
             selected.append(qualified[0])
             selected_keys.add(candidate_identity(qualified[0]))
             replacement_used += 1
-            validate_replacement_ratio(selected, options.target_item_count)
         flow.append(
             {
                 "stage": "replacement_products",
@@ -640,7 +638,6 @@ async def build_clearance(
             f"合格品名不足，目标 {options.target_item_count} 行，当前仅 {len(selected)} 行；"
             "请补充常用替换清单或放宽规则"
         )
-    validate_replacement_ratio(selected, options.target_item_count)
 
     await emit_progress(
         progress_callback,
@@ -1910,16 +1907,6 @@ def adjust_plausibility_with_price_evidence(
         qty_per_ctn_max=plausibility.qty_per_ctn_max,
         source=f"{plausibility.source}; price evidence: {clean_text(evidence.get('basis'))}",
     )
-
-
-def validate_replacement_ratio(selected: list[ProductCandidate], target_item_count: int) -> None:
-    replacements = sum(1 for candidate in selected if candidate.source == "replacement")
-    ratio = replacements / max(1, target_item_count)
-    if ratio - MAX_REPLACEMENT_RATIO > 0.0001:
-        raise RuntimeError(
-            f"替换表补充比例过高: {replacements}/{target_item_count}={round(ratio * 100, 1)}%，"
-            f"上限 {round(MAX_REPLACEMENT_RATIO * 100)}%；请补充客户清单合格候选或降低输出行数"
-        )
 
 
 def validate_price_and_value_floor(
