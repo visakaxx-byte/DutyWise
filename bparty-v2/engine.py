@@ -37,6 +37,8 @@ TAX_FINAL_TOLERANCE_USD = 20.0
 MIN_ROW_TAX_AMOUNT_USD = 30.0
 MAX_ZERO_TAX_ROWS = 2
 MAX_TAX_OVER_TARGET_RATIO = 0.1
+LLM_DRAFT_TIMEOUT_SECONDS = 180.0
+LLM_TRANSLATION_TIMEOUT_SECONDS = 60.0
 DECLARED_RETAIL_PRICE_RATIO = 0.3
 DEFAULT_KG_PER_CTN_MIN = 0.5
 DEFAULT_KG_PER_CTN_MAX = 80.0
@@ -657,15 +659,40 @@ async def build_clearance(
         query_cache,
     )
     selected = attach_price_evidence_to_candidates(selected, query_cache=query_cache)
-    rows, draft_attempts, draft_feedback = await generate_valid_output_rows_with_llm(
-        llm_client,
-        selected,
-        manifest,
-        bill,
-        options,
-    )
-    await translate_output_chinese_names_with_llm(llm_client, rows)
-    llm_generation_used = True
+    draft_attempts = 0
+    draft_feedback: list[str] = []
+    try:
+        rows, draft_attempts, draft_feedback = await asyncio.wait_for(
+            generate_valid_output_rows_with_llm(
+                llm_client,
+                selected,
+                manifest,
+                bill,
+                options,
+            ),
+            timeout=LLM_DRAFT_TIMEOUT_SECONDS,
+        )
+        llm_generation_used = True
+    except Exception as exc:
+        draft_feedback = [f"LLM 草案失败，已使用规则优化兜底: {exc}"]
+        await emit_progress(
+            progress_callback,
+            {
+                "stage": "optimize_output",
+                "status": "running",
+                "progress": 92,
+                "message": "LLM 草案未及时返回，正在使用规则优化器生成草案",
+            },
+        )
+        rows = build_output_rows(selected, manifest, bill, options)
+
+    try:
+        await asyncio.wait_for(
+            translate_output_chinese_names_with_llm(llm_client, rows),
+            timeout=LLM_TRANSLATION_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        draft_feedback.append(f"中文品名 LLM 翻译跳过: {exc}")
     validate_output_rows(rows)
     estimated_tax = round(sum((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0) for row in rows), 2)
     tax_gap = round(estimated_tax - options.target_tax_amount, 2)
@@ -2515,7 +2542,7 @@ async def generate_valid_output_rows_with_llm(
             feedback_history.append(last_error)
             feedback = (
                 "上一次草案未通过代码硬校验，请只修正数值和行分配后重新输出 JSON。"
-                f"错误：{last_error}。不能放宽税率、认证、总重量、税金±20区间、行数和合理范围。"
+                f"错误：{last_error}。不能放宽税率、认证、总重量、目标税金上浮 10% 上限、行数和合理范围。"
             )
     raise RuntimeError(f"LLM 草案连续不合格: {last_error}")
 
