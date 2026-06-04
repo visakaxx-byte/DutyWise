@@ -118,7 +118,7 @@ class FakeBillParser:
         self.messages = []
         self.temperatures = []
 
-    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1) -> dict:
+    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1, **kwargs) -> dict:
         self.calls += 1
         self.messages.append(messages)
         self.temperatures.append(temperature)
@@ -152,9 +152,11 @@ class QueueFakeLLM:
     def __init__(self, payloads: list[dict | BaseException]):
         self.payloads = list(payloads)
         self.calls = 0
+        self.kwargs = []
 
-    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1) -> dict:
+    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1, **kwargs) -> dict:
         self.calls += 1
+        self.kwargs.append({"temperature": temperature, **kwargs})
         if not self.payloads:
             raise RuntimeError("no fake LLM payload left")
         payload = self.payloads.pop(0)
@@ -168,7 +170,7 @@ class DictFakeLLM:
         self.payload = payload
         self.calls = 0
 
-    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1) -> dict:
+    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1, **kwargs) -> dict:
         self.calls += 1
         return self.payload
 
@@ -178,7 +180,7 @@ class RoutedFakeParser:
         self.bill_payload = bill_payload
         self.manifest_payload = manifest_payload
 
-    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1) -> dict:
+    async def chat_json(self, messages: list[dict[str, str]], *, temperature: float = 0.1, **kwargs) -> dict:
         content = "\n".join(message.get("content", "") for message in messages)
         if "total_weight_kg" in content:
             return self.manifest_payload
@@ -1748,6 +1750,9 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(attempts, 2)
         self.assertIn("LLM 未返回 JSON object", feedback[0])
+        self.assertEqual(llm.kwargs[0]["temperature"], 0.0)
+        self.assertTrue(llm.kwargs[0]["json_mode"])
+        self.assertEqual(llm.kwargs[0]["max_tokens"], 8192)
         self.assertEqual(rows[0]["中文品名"], "品名")
 
     def test_llm_output_closes_tax_gap_within_20_usd(self) -> None:

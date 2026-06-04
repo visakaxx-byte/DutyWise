@@ -27,6 +27,7 @@ class LLMClient:
         temperature: float = 0.1,
         model: Optional[str] = None,
         max_tokens: int = 4096,
+        json_mode: bool = True,
     ) -> dict[str, Any]:
         payload = {
             "model": model or self.settings.model,
@@ -34,6 +35,8 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         return await self._post_chat_json(payload)
 
     async def chat_json_with_images(
@@ -61,6 +64,29 @@ class LLMClient:
             "Content-Type": "application/json",
         }
         timeout = httpx.Timeout(connect=20.0, read=self.settings.timeout, write=30.0, pool=20.0)
+        response = await self._post_chat_completion(payload, headers, timeout)
+        if response.status_code != 200 and should_retry_without_json_mode(response, payload):
+            fallback_payload = dict(payload)
+            fallback_payload.pop("response_format", None)
+            response = await self._post_chat_completion(fallback_payload, headers, timeout)
+
+        if response.status_code != 200:
+            raise LLMError(f"LLM HTTP {response.status_code}: {response.text[:500]}")
+
+        try:
+            body = response.json()
+            content = body["choices"][0]["message"]["content"]
+        except Exception as exc:
+            raise LLMError(f"LLM 响应结构异常: {response.text[:500]}") from exc
+
+        return parse_json_object(content)
+
+    async def _post_chat_completion(
+        self,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
         last_timeout = None
         for attempt in range(1, 3):
             try:
@@ -74,17 +100,14 @@ class LLMClient:
                 await asyncio.sleep(3)
         else:
             raise LLMError("LLM 请求超时") from last_timeout
+        return response
 
-        if response.status_code != 200:
-            raise LLMError(f"LLM HTTP {response.status_code}: {response.text[:500]}")
 
-        try:
-            body = response.json()
-            content = body["choices"][0]["message"]["content"]
-        except Exception as exc:
-            raise LLMError(f"LLM 响应结构异常: {response.text[:500]}") from exc
-
-        return parse_json_object(content)
+def should_retry_without_json_mode(response: httpx.Response, payload: dict[str, Any]) -> bool:
+    if "response_format" not in payload or response.status_code not in {400, 404, 422}:
+        return False
+    text = response.text.lower()
+    return "response_format" in text or "json_object" in text
 
 
 def parse_json_object(content: str) -> dict[str, Any]:

@@ -2532,7 +2532,9 @@ async def llm_generate_output_draft(
             "role": "system",
             "content": (
                 "你是美国清关 Commercial Invoice & Packing List 生成专家。你负责让数量、箱数、毛重、单价看起来像真实清关表。"
-                "代码会严格校验税率、认证、总重量、总税金、行数、单价/单重/每箱数量范围。只返回 JSON object。"
+                "代码会严格校验税率、认证、总重量、总税金、行数、单价/单重/每箱数量范围。"
+                "只返回一个合法 JSON object。禁止 Markdown、代码块、解释文字、前后缀。"
+                "回复的第一个字符必须是 {，最后一个字符必须是 }。"
             ),
         },
         {
@@ -2540,7 +2542,7 @@ async def llm_generate_output_draft(
             "content": build_output_draft_prompt(selected, manifest, bill, options, feedback),
         },
     ]
-    return await llm.chat_json(messages, temperature=0.1)
+    return await llm.chat_json(messages, temperature=0.0, max_tokens=8192, json_mode=True)
 
 
 def build_output_draft_prompt(
@@ -2555,6 +2557,8 @@ def build_output_draft_prompt(
         raise RuntimeError("提单未识别到有效总箱数，不能生成与提单箱数对齐的输出")
     return (
         "请基于给定候选生成最终清关行草案。\n"
+        "输出格式硬要求：只输出一个 JSON object，不要 ```json，不要说明文字，不要换成数组顶层。\n"
+        "JSON 顶层必须是 {\"rows\":[...]}，rows 内每一行只能包含 candidate_index、箱数、数量、单价、毛重。\n"
         "硬要求：\n"
         f"1. 输出 rows 数量必须等于 {options.target_item_count}，且每个候选必须输出一行，不得新增/删除/改名/改 HS。\n"
         f"2. 毛重请按品类合理分配；代码会按 Excel 总重量 {manifest.total_real_weight} kg 等比例倒推并强制闭合。\n"
@@ -2564,7 +2568,7 @@ def build_output_draft_prompt(
         "6. 不要让所有行数量相同，不要让所有行单件重量相同，不要给电器/机器类低到不合理的单价。\n"
         "7. 单价、数量、毛重、箱数要像真实装箱清单，优先使用候选原始参数或合理范围中位数；毛重最终以 Excel 总重量倒推为准。\n"
         f"{'修正反馈：' + feedback if feedback else ''}\n"
-        "JSON格式：{\"rows\":[{\"candidate_index\":0,\"箱数\":1,\"数量\":1,\"单价\":1.0,\"毛重\":1.0}]}\n"
+        "JSON格式示例：{\"rows\":[{\"candidate_index\":0,\"箱数\":1,\"数量\":1,\"单价\":1.0,\"毛重\":1.0}]}\n"
         f"提单品类：{json.dumps(bill.products, ensure_ascii=False, separators=(',', ':'))}\n"
         f"候选：{json.dumps(candidates, ensure_ascii=False, separators=(',', ':'))}"
     )
