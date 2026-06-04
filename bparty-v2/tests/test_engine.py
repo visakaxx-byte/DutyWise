@@ -1996,6 +1996,128 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(rows[0]["商品编码"]), "3926400090")
         self.assertEqual(rows[0]["税金"], 950.0)
 
+    def test_bill_product_weight_range_is_advisory_after_bill_closure(self) -> None:
+        candidates = [
+            ProductCandidate(
+                source="bill",
+                source_label="bill.pdf",
+                zh="PLASTIC HAIRPIN",
+                en="Plastic Hairpin",
+                hs="9615115000",
+                material="Plastic",
+                usage="HOME",
+                ctns=1,
+                qty=100,
+                unit_price=5,
+                gross_weight=3.57,
+                base_tax_rate=0.1,
+                effective_tax_rate=0.1,
+                tax_match_source="bill_product",
+                plausibility_range=PlausibilityRange(
+                    kg_per_ctn_min=0.1,
+                    kg_per_ctn_max=50,
+                    kg_per_pc_min=0.005,
+                    kg_per_pc_max=0.03,
+                    unit_price_min=1,
+                    unit_price_max=10,
+                    qty_per_ctn_min=1,
+                    qty_per_ctn_max=200,
+                    source="test range",
+                ),
+            )
+        ]
+        rows = [
+            {
+                "中文品名": "PLASTIC HAIRPIN",
+                "英文品名": "Plastic Hairpin",
+                "商品编码": "9615115000",
+                "材质": "Plastic",
+                "用途": "Home use",
+                "箱数": 1,
+                "数量": 100,
+                "单位": "PCS",
+                "币制": "USD",
+                "单价": 5,
+                "总价": 500,
+                "净重": 3.28,
+                "毛重": 3.57,
+                "原产国": "CN",
+                "综合税率": 0.1,
+                "candidate_index": 0,
+            }
+        ]
+
+        validate_llm_output_rows(
+            rows,
+            candidates,
+            ManifestSummary("input.xlsx", 1, 1, 3.57, 1000, []),
+            BillInfo("bill.pdf", "", ["PLASTIC HAIRPIN"], cartons=1),
+            ProcessingOptions(target_tax_amount=50, target_item_count=1),
+        )
+
+        self.assertEqual(rows[0]["单件重量"], 0.0357)
+        self.assertIn("单件重量高于合理上限 0.0357 > 0.03", rows[0]["约束提示"])
+
+    def test_non_bill_product_weight_range_still_rejects_outlier(self) -> None:
+        candidates = [
+            ProductCandidate(
+                source="replacement",
+                source_label="test",
+                zh="PLASTIC HAIRPIN",
+                en="Plastic Hairpin",
+                hs="9615115000",
+                material="Plastic",
+                usage="HOME",
+                ctns=1,
+                qty=100,
+                unit_price=5,
+                gross_weight=3.57,
+                base_tax_rate=0.1,
+                effective_tax_rate=0.1,
+                tax_match_source="product",
+                plausibility_range=PlausibilityRange(
+                    kg_per_ctn_min=0.1,
+                    kg_per_ctn_max=50,
+                    kg_per_pc_min=0.005,
+                    kg_per_pc_max=0.03,
+                    unit_price_min=1,
+                    unit_price_max=10,
+                    qty_per_ctn_min=1,
+                    qty_per_ctn_max=200,
+                    source="test range",
+                ),
+            )
+        ]
+        rows = [
+            {
+                "中文品名": "PLASTIC HAIRPIN",
+                "英文品名": "Plastic Hairpin",
+                "商品编码": "9615115000",
+                "材质": "Plastic",
+                "用途": "Home use",
+                "箱数": 1,
+                "数量": 100,
+                "单位": "PCS",
+                "币制": "USD",
+                "单价": 5,
+                "总价": 500,
+                "净重": 3.28,
+                "毛重": 3.57,
+                "原产国": "CN",
+                "综合税率": 0.1,
+                "candidate_index": 0,
+            }
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "单件重量高于合理上限 0.0357 > 0.03"):
+            validate_llm_output_rows(
+                rows,
+                candidates,
+                ManifestSummary("input.xlsx", 1, 1, 3.57, 1000, []),
+                BillInfo("bill.pdf", "", [], cartons=1),
+                ProcessingOptions(target_tax_amount=50, target_item_count=1),
+            )
+
     def test_qty_must_not_be_less_than_ctns_and_must_be_multiple(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "数量不能小于箱数"):
             validate_qty_ctn_relationship([{"箱数": 50, "数量": 25}])

@@ -2698,7 +2698,7 @@ def validate_llm_output_rows(
             f"可行税金区间约 {feasible[0]}-{feasible[1]}"
         )
     validate_minimum_row_tax(rows)
-    validate_row_plausibility(rows, selected)
+    validate_row_plausibility(rows, selected, bill.products)
     validate_distribution_realism(rows)
     normalize_output_language_fields(rows)
     for row in rows:
@@ -2817,7 +2817,11 @@ def close_llm_rows_tax_gap(rows: list[dict[str, Any]], selected: list[ProductCan
         update_row_tax_display(row)
 
 
-def validate_row_plausibility(rows: list[dict[str, Any]], selected: list[ProductCandidate]) -> None:
+def validate_row_plausibility(
+    rows: list[dict[str, Any]],
+    selected: list[ProductCandidate],
+    bill_products: Optional[list[str]] = None,
+) -> None:
     for idx, (row, candidate) in enumerate(zip(rows, selected), start=1):
         if normalize_hs(row.get("商品编码")) != normalize_hs(candidate.hs):
             raise RuntimeError(f"第 {idx} 行 HS 被 LLM 改写，禁止: {row.get('商品编码')} != {candidate.hs}")
@@ -2832,11 +2836,12 @@ def validate_row_plausibility(rows: list[dict[str, Any]], selected: list[Product
         unit_price = to_float(row.get("单价")) or 0
         qty_per_ctn_min = max(1.0, plausibility.qty_per_ctn_min or 1.0)
         qty_per_ctn_max = max(qty_per_ctn_min, plausibility.qty_per_ctn_max or qty_per_ctn_min)
+        weight_hard_limit = not row_has_bill_weight_basis(row, candidate, bill_products or [])
         checks = [
             ("单价", unit_price, plausibility.unit_price_min, plausibility.unit_price_max, True),
-            ("单件重量", gross / qty if qty else 0, plausibility.kg_per_pc_min, plausibility.kg_per_pc_max, True),
+            ("单件重量", gross / qty if qty else 0, plausibility.kg_per_pc_min, plausibility.kg_per_pc_max, weight_hard_limit),
             ("每箱数量", qty / ctns if ctns else 0, qty_per_ctn_min, qty_per_ctn_max, True),
-            ("单箱重量", gross / ctns if ctns else 0, plausibility.kg_per_ctn_min, plausibility.kg_per_ctn_max, True),
+            ("单箱重量", gross / ctns if ctns else 0, plausibility.kg_per_ctn_min, plausibility.kg_per_ctn_max, weight_hard_limit),
         ]
         warnings: list[str] = []
         for label, value, low, high, hard_limit in checks:
@@ -2857,6 +2862,14 @@ def validate_row_plausibility(rows: list[dict[str, Any]], selected: list[Product
         if abs(to_float(row.get("毛重闭合调整")) or 0) > 0.01:
             warnings.append(f"毛重按Excel总重量倒推调整 {row.get('毛重闭合调整')}kg")
         row["约束提示"] = "; ".join(warnings)
+
+
+def row_has_bill_weight_basis(row: dict[str, Any], candidate: ProductCandidate, bill_products: list[str]) -> bool:
+    if bill_products and row_matches_bill_product(row, bill_products):
+        return True
+    if candidate.source in {"bill", "bill_product", "llm_query"}:
+        return True
+    return candidate.tax_match_source in {"bill_hs", "bill_product", "llm_query"}
 
 
 def validate_distribution_realism(rows: list[dict[str, Any]]) -> None:
