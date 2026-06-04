@@ -2504,8 +2504,8 @@ async def generate_valid_output_rows_with_llm(
     feedback_history: list[str] = []
     last_error = ""
     for attempt in range(1, 4):
-        payload = await llm_generate_output_draft(llm, selected, manifest, bill, options, feedback)
         try:
+            payload = await llm_generate_output_draft(llm, selected, manifest, bill, options, feedback)
             rows = normalize_llm_output_draft(payload, selected)
             validate_llm_output_rows(rows, selected, manifest, bill, options)
             return rows, attempt, feedback_history

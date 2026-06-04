@@ -149,7 +149,7 @@ class FakeVisionBillParser(FakeBillParser):
 
 
 class QueueFakeLLM:
-    def __init__(self, payloads: list[dict]):
+    def __init__(self, payloads: list[dict | BaseException]):
         self.payloads = list(payloads)
         self.calls = 0
 
@@ -157,7 +157,10 @@ class QueueFakeLLM:
         self.calls += 1
         if not self.payloads:
             raise RuntimeError("no fake LLM payload left")
-        return self.payloads.pop(0)
+        payload = self.payloads.pop(0)
+        if isinstance(payload, BaseException):
+            raise payload
+        return payload
 
 
 class DictFakeLLM:
@@ -1697,6 +1700,55 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 8)
         self.assertLessEqual(abs(sum(row["总价"] * row["综合税率"] for row in rows) - 350), 20)
         self.assertTrue(all(row["税金"] >= 30 for row in rows))
+
+    async def test_llm_output_retries_when_llm_draft_is_not_json(self) -> None:
+        candidates = [
+            ProductCandidate(
+                source="replacement",
+                source_label="test",
+                zh="品名",
+                en="Item",
+                hs="3926909985",
+                material="Plastic",
+                usage="HOME",
+                ctns=10,
+                qty=100,
+                unit_price=5,
+                gross_weight=100,
+                base_tax_rate=0.1,
+                effective_tax_rate=0.1,
+                tax_match_source="product",
+                plausibility_range=PlausibilityRange(
+                    kg_per_ctn_min=5,
+                    kg_per_ctn_max=20,
+                    kg_per_pc_min=0.5,
+                    kg_per_pc_max=2,
+                    unit_price_min=1,
+                    unit_price_max=10,
+                    qty_per_ctn_min=5,
+                    qty_per_ctn_max=20,
+                    source="test range",
+                ),
+            )
+        ]
+        llm = QueueFakeLLM(
+            [
+                RuntimeError("LLM 未返回 JSON object"),
+                {"rows": [{"candidate_index": 0, "箱数": 10, "数量": 100, "单价": 5.0, "毛重": 100}]},
+            ]
+        )
+
+        rows, attempts, feedback = await generate_valid_output_rows_with_llm(
+            llm,
+            candidates,
+            ManifestSummary("input.xlsx", 1, 10, 100, 1000, []),
+            BillInfo("bill.pdf", "", [], cartons=10),
+            ProcessingOptions(target_tax_amount=50, target_item_count=1),
+        )
+
+        self.assertEqual(attempts, 2)
+        self.assertIn("LLM 未返回 JSON object", feedback[0])
+        self.assertEqual(rows[0]["中文品名"], "品名")
 
     def test_llm_output_closes_tax_gap_within_20_usd(self) -> None:
         candidates = [
