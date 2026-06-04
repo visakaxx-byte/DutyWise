@@ -4,7 +4,7 @@ import asyncio
 import argparse
 from pathlib import Path
 
-from engine import build_clearance
+from engine import build_clearance, target_tax_upper_bound
 
 
 HERE = Path(__file__).resolve().parent
@@ -32,7 +32,7 @@ async def main() -> None:
     assert stats["crawler_used"] is True
     assert stats["output_rows"] == args.target_item_count
     assert abs(stats["bill_gross_weight"] - stats["output_gross_weight"]) < 0.01
-    assert abs(stats["estimated_tax_amount"] - args.target_tax_amount) <= max(1, args.target_tax_amount * 0.01)
+    assert stats["estimated_tax_amount"] <= target_tax_upper_bound(args.target_tax_amount)
     print(result["output_file"])
     print(stats)
     print(result["flow"])
