@@ -1106,6 +1106,80 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("返回 HS 与替换清单原始 HS 不一致", result.filter_reason)
         self.assertEqual(result.hs, "8467210010")
 
+    async def test_manifest_candidate_accepts_product_query_when_original_hs_has_no_result(self) -> None:
+        candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx/HS归并",
+            zh="塑料收纳盒",
+            en="Plastic storage box",
+            hs="3922100000",
+            material="Plastic",
+            usage="HOME",
+            ctns=10,
+            qty=300,
+            unit_price=1,
+            gross_weight=100,
+            original_hs="3922100000",
+        )
+        crawler = RoutedFakeCrawler(
+            product_results={
+                "塑料收纳盒": tax_result("5.3%", hs="3926909985"),
+            },
+            hs_results={
+                "3922100000": {},
+            },
+        )
+
+        result = await qualify_single_candidate(
+            crawler,
+            candidate,
+            SelectionRules(allowed_certifications=["Lacey Act", "TSCA"]),
+            query_cache={},
+            enforce_tax_limit=False,
+        )
+
+        self.assertFalse(result.filter_reason)
+        self.assertEqual(result.hs, "3926909985")
+        self.assertEqual(result.original_hs, "3922100000")
+        self.assertEqual(result.tax_match_source, "product")
+
+    async def test_manifest_candidate_accepts_actual_tax_over_twenty_percent(self) -> None:
+        candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx/HS归并",
+            zh="电极片",
+            en="Electrode pads",
+            hs="9033000090",
+            material="Mixed",
+            usage="HOME",
+            ctns=50,
+            qty=20000,
+            unit_price=0.7,
+            gross_weight=400,
+            original_hs="9033000090",
+        )
+        crawler = RoutedFakeCrawler(
+            product_results={
+                "电极片": tax_result("25%", hs="9033000090"),
+            },
+            hs_results={
+                "9033000090": tax_result("25%", hs="9033000090"),
+            },
+        )
+
+        result = await qualify_single_candidate(
+            crawler,
+            candidate,
+            SelectionRules(allowed_certifications=["Lacey Act", "TSCA"]),
+            query_cache={},
+            enforce_tax_limit=False,
+        )
+
+        self.assertFalse(result.filter_reason)
+        self.assertEqual(result.hs, "9033000090")
+        self.assertAlmostEqual(result.effective_tax_rate, 0.25)
+        self.assertEqual(result.tax_match_source, "manifest_group_hs")
+
     async def test_bill_product_from_manifest_is_selected_before_other_items(self) -> None:
         bill = BillInfo(
             filename="bill.pdf",

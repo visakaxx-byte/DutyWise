@@ -512,12 +512,13 @@ async def build_clearance(
     manifest_candidates = build_manifest_candidates(manifest)
     qualified_manifest: list[ProductCandidate] = []
     manifest_filtered: list[ProductCandidate] = []
-    manifest_query_limit = min(len(manifest_candidates), max(options.target_item_count * 4, options.target_item_count))
+    manifest_query_limit = len(manifest_candidates)
     qualified_manifest, manifest_filtered = await qualify_candidates(
         crawler,
         manifest_candidates[:manifest_query_limit],
         rules,
         query_cache=query_cache,
+        enforce_tax_limit=False,
         progress_callback=progress_callback,
         progress_stage="crawler_manifest_products",
         progress_start=8,
@@ -531,7 +532,7 @@ async def build_clearance(
             "candidate_groups": len(manifest_candidates),
             "qualified": len(qualified_manifest),
             "filtered": len(manifest_filtered),
-            "message": "已按客户清单 HS 归并池优先查询税率",
+            "message": "已按客户清单 HS 归并池全量优先查询税率",
         }
     )
 
@@ -1193,6 +1194,7 @@ def build_manifest_candidates(manifest: ManifestSummary) -> list[ProductCandidat
                 real_weight=group.total_real_weight,
                 gross_weight=gross_weight,
                 source_rows=group.source_rows,
+                original_hs=group.hs,
                 llm_reason="; ".join(group.warnings),
             )
         )
@@ -1277,6 +1279,7 @@ async def qualify_candidates(
     candidates: list[ProductCandidate],
     rules: SelectionRules,
     query_cache: Optional[QueryCache] = None,
+    enforce_tax_limit: bool = True,
     progress_callback: Optional[ProgressCallback] = None,
     progress_stage: str = "",
     progress_start: float = 0,
@@ -1287,7 +1290,13 @@ async def qualify_candidates(
     for index, candidate in enumerate(candidates):
         if index > 0:
             await asyncio.sleep(crawler.settings.delay)
-        result = await qualify_single_candidate(crawler, candidate, rules, query_cache=query_cache)
+        result = await qualify_single_candidate(
+            crawler,
+            candidate,
+            rules,
+            query_cache=query_cache,
+            enforce_tax_limit=enforce_tax_limit,
+        )
         if result.filter_reason:
             filtered.append(result)
         else:
@@ -1341,10 +1350,11 @@ async def qualify_single_candidate(
 
     try:
         product_results = await cached_search_product(crawler, candidate.zh or candidate.en, candidate.material, query_cache)
+        required_hs = candidate.hs if candidate.source == "replacement" else ""
         selected = select_qualified_tax_data(
             product_results,
             rules,
-            required_hs=(candidate.hs if candidate.source in {"replacement", "manifest_group"} else ""),
+            required_hs=required_hs,
             enforce_tax_limit=enforce_tax_limit,
         )
         if selected:
