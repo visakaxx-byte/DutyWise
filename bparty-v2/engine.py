@@ -1955,13 +1955,26 @@ def validate_price_evidence(rows: list[dict[str, Any]], selected: list[ProductCa
             low = declared * 0.67
             high = declared * 1.5
             if unit_price < low - 0.0001 or unit_price > high + 0.0001:
-                raise RuntimeError(
-                    f"第 {idx} 行单价超出价格证据范围: {row.get('中文品名')} "
-                    f"{unit_price} not in {round(low, 4)}-{round(high, 4)}"
+                message = (
+                    f"单价超出价格证据范围 {unit_price} not in "
+                    f"{round(low, 4)}-{round(high, 4)}"
                 )
+                append_row_warning(row, message)
+                row["价格提示"] = message
         row["价格依据"] = evidence.get("basis", "")
         row["价格置信度"] = evidence.get("confidence", "")
         row["零售参考单价"] = evidence.get("retail_unit_price", "")
+
+
+def append_row_warning(row: dict[str, Any], message: str) -> None:
+    existing = clean_text(row.get("约束提示"))
+    if not existing:
+        row["约束提示"] = message
+        return
+    parts = [part.strip() for part in existing.split(";") if part.strip()]
+    if message not in parts:
+        parts.append(message)
+    row["约束提示"] = "; ".join(parts)
 
 
 def build_audit_summary(
@@ -2592,7 +2605,7 @@ def build_output_draft_prompt(
         f"2. 毛重请按品类合理分配；代码会按 Excel 总重量 {manifest.total_real_weight} kg 等比例倒推并强制闭合。\n"
         f"3. 总税金尽量贴近目标 {options.target_tax_amount} USD，最终不得高于 {target_tax_upper_bound(options.target_tax_amount)} USD（目标上浮 10%）；税金=总价*综合税率；每行税金只能等于 0 或不低于 {MIN_ROW_TAX_AMOUNT_USD} USD，且税金为 0 的行数最多 {MAX_ZERO_TAX_ROWS} 行。\n"
         f"4. 总箱数必须等于提单总箱数 {bill.cartons}，不得使用清单箱数替代。\n"
-        "5. 每行数量必须大于等于箱数，且数量必须是箱数的整数倍；每行单价和每箱数量必须落入 candidate.plausibility_range；毛重可服务于总重量闭合。\n"
+        "5. 每行数量必须大于等于箱数，且数量必须是箱数的整数倍；每箱数量必须落入 candidate.plausibility_range；单价优先参考价格证据/合理范围，但不得导致总税金超过上限。\n"
         "6. 不要让所有行数量相同，不要让所有行单件重量相同，不要给电器/机器类低到不合理的单价。\n"
         "7. 单价、数量、毛重、箱数要像真实装箱清单，优先使用候选原始参数或合理范围中位数；毛重最终以 Excel 总重量倒推为准。\n"
         f"{'修正反馈：' + feedback if feedback else ''}\n"
@@ -2841,6 +2854,15 @@ def close_llm_rows_tax_gap(rows: list[dict[str, Any]], selected: list[ProductCan
 
     enforce_minimum_row_tax(unit_prices, mins, maxes, selected, quantities, MIN_ROW_TAX_AMOUNT_USD)
     adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount, MIN_ROW_TAX_AMOUNT_USD)
+    relax_price_floors_if_tax_requires(
+        unit_prices,
+        mins,
+        maxes,
+        selected,
+        quantities,
+        target_tax_amount,
+        MIN_ROW_TAX_AMOUNT_USD,
+    )
 
     for row, unit_price, qty in zip(rows, unit_prices, quantities):
         row["单价"] = round(unit_price, 4)
@@ -2869,7 +2891,7 @@ def validate_row_plausibility(
         qty_per_ctn_max = max(qty_per_ctn_min, plausibility.qty_per_ctn_max or qty_per_ctn_min)
         weight_hard_limit = not row_has_bill_weight_basis(row, candidate, bill_products or [])
         checks = [
-            ("单价", unit_price, plausibility.unit_price_min, plausibility.unit_price_max, True),
+            ("单价", unit_price, plausibility.unit_price_min, plausibility.unit_price_max, False),
             ("单件重量", gross / qty if qty else 0, plausibility.kg_per_pc_min, plausibility.kg_per_pc_max, weight_hard_limit),
             ("每箱数量", qty / ctns if ctns else 0, qty_per_ctn_min, qty_per_ctn_max, True),
             ("单箱重量", gross / ctns if ctns else 0, plausibility.kg_per_ctn_min, plausibility.kg_per_ctn_max, weight_hard_limit),
@@ -3176,6 +3198,15 @@ def allocate_plausible_prices(
 
     enforce_minimum_row_tax(unit_prices, mins, maxes, selected, quantities, MIN_ROW_TAX_AMOUNT_USD)
     adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount, MIN_ROW_TAX_AMOUNT_USD)
+    relax_price_floors_if_tax_requires(
+        unit_prices,
+        mins,
+        maxes,
+        selected,
+        quantities,
+        target_tax_amount,
+        MIN_ROW_TAX_AMOUNT_USD,
+    )
     prices: list[tuple[float, float]] = []
     for unit_price, qty in zip(unit_prices, quantities):
         rounded_unit = round(unit_price, 4)
@@ -3190,6 +3221,56 @@ def allocate_plausible_prices(
             f"目标 {target_tax_amount}，最高 {tax_upper_bound}，可行预计 {estimated_tax}"
         )
     return prices
+
+
+def relax_price_floors_if_tax_requires(
+    unit_prices: list[float],
+    mins: list[float],
+    maxes: list[float],
+    selected: list[ProductCandidate],
+    quantities: list[int],
+    target_tax_amount: float,
+    min_row_tax_amount: float,
+) -> None:
+    tax_upper_bound = target_tax_upper_bound(target_tax_amount)
+    current_tax = estimate_tax_for_unit_prices(unit_prices, selected, quantities)
+    if current_tax <= tax_upper_bound + 0.01:
+        return
+    relaxed_mins = relaxed_price_mins_for_tax_floor(selected, quantities, mins, min_row_tax_amount)
+    minimum_tax = estimate_tax_for_unit_prices(relaxed_mins, selected, quantities)
+    if minimum_tax > tax_upper_bound + 0.01:
+        raise RuntimeError(
+            "优化无解：最低行税金约束已超过目标税金上浮 10% 上限；"
+            f"目标 {target_tax_amount}，最高 {tax_upper_bound}，最低可行 {minimum_tax}"
+        )
+    adjust_price_gap(unit_prices, relaxed_mins, maxes, selected, quantities, target_tax_amount, min_row_tax_amount)
+
+
+def relaxed_price_mins_for_tax_floor(
+    selected: list[ProductCandidate],
+    quantities: list[int],
+    mins: list[float],
+    min_row_tax_amount: float,
+) -> list[float]:
+    relaxed: list[float] = []
+    for candidate, qty, min_price in zip(selected, quantities, mins):
+        rate = candidate_tax_rate(candidate)
+        if rate <= 0 or qty <= 0 or min_row_tax_amount <= 0:
+            relaxed.append(min_price)
+            continue
+        relaxed.append(max(0.0001, min_row_tax_amount / (qty * rate)))
+    return relaxed
+
+
+def estimate_tax_for_unit_prices(
+    unit_prices: list[float],
+    selected: list[ProductCandidate],
+    quantities: list[int],
+) -> float:
+    return round(
+        sum(price * qty * candidate_tax_rate(candidate) for price, qty, candidate in zip(unit_prices, quantities, selected)),
+        2,
+    )
 
 
 def adjust_price_gap(
@@ -3282,7 +3363,11 @@ def build_constraint_warnings(
         warnings.append(f"单箱重量接近边界 {round(kg_per_ctn, 3)}kg/ctn")
     if near_bound(kg_per_pc, plausibility.kg_per_pc_min, plausibility.kg_per_pc_max):
         warnings.append(f"单件重量接近边界 {round(kg_per_pc, 3)}kg/pc")
-    if near_bound(unit_price, plausibility.unit_price_min, plausibility.unit_price_max):
+    if plausibility.unit_price_min is not None and unit_price < plausibility.unit_price_min - 0.0001:
+        warnings.append(f"单价低于合理下限 {round(unit_price, 4)} < {round(plausibility.unit_price_min, 4)}")
+    elif plausibility.unit_price_max is not None and unit_price > plausibility.unit_price_max + 0.0001:
+        warnings.append(f"单价高于合理上限 {round(unit_price, 4)} > {round(plausibility.unit_price_max, 4)}")
+    elif near_bound(unit_price, plausibility.unit_price_min, plausibility.unit_price_max):
         warnings.append(f"单价接近边界 {round(unit_price, 4)}")
     return warnings
 

@@ -321,6 +321,34 @@ class PriceSearchTests(unittest.TestCase):
         self.assertEqual(rows[0]["价格依据"], "test")
         self.assertEqual(rows[0]["零售参考单价"], 0.33)
 
+    def test_validate_price_evidence_warns_when_tax_price_is_below_reference(self) -> None:
+        candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input",
+            zh="塑料发夹",
+            en="Plastic hair clip",
+            hs="9615900000",
+            material="Plastic",
+            usage="HOME",
+            price_evidence={"declared_unit_price": 1.0, "confidence": 0.5, "basis": "test", "retail_unit_price": 3.33},
+        )
+        rows = [
+            {
+                "中文品名": "塑料发夹",
+                "英文品名": "Plastic hair clip",
+                "商品编码": "9615900000",
+                "单价": 0.05,
+                "数量": 10,
+                "总价": 0.5,
+            }
+        ]
+
+        validate_price_evidence(rows, [candidate])
+
+        self.assertEqual(rows[0]["价格依据"], "test")
+        self.assertIn("单价超出价格证据范围", rows[0]["价格提示"])
+        self.assertIn("单价超出价格证据范围", rows[0]["约束提示"])
+
 
 class CertificationRuleTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1036,6 +1064,48 @@ class OutputOptimizationTests(unittest.TestCase):
         total_tax = sum(plan.total_value * (plan.candidate.effective_tax_rate or plan.candidate.base_tax_rate) for plan in plans)
         self.assertLess(total_tax, 1000)
         self.assertLessEqual(total_tax, 1100)
+
+    def test_plausible_row_plans_relax_price_floor_to_meet_tax_upper_bound(self) -> None:
+        candidates = [
+            ProductCandidate(
+                source="manifest_group",
+                source_label="input.xlsx",
+                zh="品名",
+                en="Item",
+                hs="3926909985",
+                material="Plastic",
+                usage="HOME",
+                ctns=10,
+                qty=100,
+                unit_price=90.0,
+                real_weight=100,
+                gross_weight=100,
+                base_tax_rate=0.1,
+                effective_tax_rate=0.1,
+                plausibility_range=PlausibilityRange(
+                    kg_per_ctn_min=5,
+                    kg_per_ctn_max=20,
+                    kg_per_pc_min=0.5,
+                    kg_per_pc_max=2,
+                    unit_price_min=90,
+                    unit_price_max=91,
+                    qty_per_ctn_min=5,
+                    qty_per_ctn_max=20,
+                    source="test range",
+                ),
+            )
+        ]
+        plans = build_plausible_row_plans(
+            selected=candidates,
+            manifest=ManifestSummary("input.xlsx", 1, 10, 100, 1000, []),
+            bill=BillInfo("bill.pdf", "", [], cartons=10),
+            options=ProcessingOptions(target_tax_amount=800, target_item_count=1),
+            plausibility_ranges={},
+        )
+
+        self.assertLess(plans[0].unit_price, plans[0].plausibility.unit_price_min)
+        self.assertLessEqual(plans[0].total_value * 0.1, 880)
+        self.assertIn("单价低于合理下限", plans[0].warnings[0])
 
 
 class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
@@ -2514,7 +2584,7 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
                 ProcessingOptions(target_tax_amount=30, target_item_count=1),
             )
 
-    def test_llm_output_rejects_tax_above_target(self) -> None:
+    def test_llm_output_relaxes_price_floor_to_keep_tax_under_upper_bound(self) -> None:
         candidates = [
             ProductCandidate(
                 source="replacement",
@@ -2564,14 +2634,17 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
                 "candidate_index": 0,
             }
         ]
-        with self.assertRaisesRegex(RuntimeError, "税金超过目标上浮 10% 上限"):
-            validate_llm_output_rows(
-                rows,
-                candidates,
-                ManifestSummary("input.xlsx", 1, 10, 100, 1000, []),
-                BillInfo("bill.pdf", "", [], cartons=10),
-                ProcessingOptions(target_tax_amount=800, target_item_count=1),
-            )
+        validate_llm_output_rows(
+            rows,
+            candidates,
+            ManifestSummary("input.xlsx", 1, 10, 100, 1000, []),
+            BillInfo("bill.pdf", "", [], cartons=10),
+            ProcessingOptions(target_tax_amount=800, target_item_count=1),
+        )
+
+        self.assertLess(rows[0]["单价"], 90)
+        self.assertLessEqual(rows[0]["税金"], 880)
+        self.assertIn("单价低于合理下限", rows[0]["约束提示"])
 
 
 if __name__ == "__main__":
