@@ -647,7 +647,7 @@ async def build_clearance(
             "stage": "optimize_output",
             "status": "running",
             "progress": 90,
-            "message": "正在让 LLM 生成合理草案并执行代码校验",
+            "message": "正在使用规则优化器生成最终草案",
         },
     )
     selected, llm_plausibility_used = await ensure_candidate_plausibility_ranges(
@@ -660,31 +660,8 @@ async def build_clearance(
     )
     selected = attach_price_evidence_to_candidates(selected, query_cache=query_cache)
     draft_attempts = 0
-    draft_feedback: list[str] = []
-    try:
-        rows, draft_attempts, draft_feedback = await asyncio.wait_for(
-            generate_valid_output_rows_with_llm(
-                llm_client,
-                selected,
-                manifest,
-                bill,
-                options,
-            ),
-            timeout=LLM_DRAFT_TIMEOUT_SECONDS,
-        )
-        llm_generation_used = True
-    except Exception as exc:
-        draft_feedback = [f"LLM 草案失败，已使用规则优化兜底: {exc}"]
-        await emit_progress(
-            progress_callback,
-            {
-                "stage": "optimize_output",
-                "status": "running",
-                "progress": 92,
-                "message": "LLM 草案未及时返回，正在使用规则优化器生成草案",
-            },
-        )
-        rows = build_output_rows(selected, manifest, bill, options)
+    draft_feedback: list[str] = ["最终草案默认由规则优化器生成，LLM 不参与数值草案生成"]
+    rows = build_output_rows(selected, manifest, bill, options)
 
     try:
         await asyncio.wait_for(
@@ -704,6 +681,7 @@ async def build_clearance(
             "rows": len(rows),
             "estimated_tax": estimated_tax,
             "tax_gap": tax_gap,
+            "final_draft_generator": "rules",
             "llm_draft_attempts": draft_attempts,
             "draft_feedback": draft_feedback[-1] if draft_feedback else "",
         }
@@ -772,6 +750,7 @@ async def build_clearance(
         "llm_plausibility_used": llm_plausibility_used,
         "llm_generation_used": llm_generation_used,
         "llm_draft_attempts": draft_attempts,
+        "final_draft_generator": "rules",
         "crawler_used": True,
     }
 
