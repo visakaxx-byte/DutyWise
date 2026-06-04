@@ -1,0 +1,2 @@
+# Add manually approved product names here.
+# Product rules do not override tax-rate or certification requirements.

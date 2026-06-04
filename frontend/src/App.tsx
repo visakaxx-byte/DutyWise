@@ -1,10 +1,11 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route, Link } from 'react-router-dom';
 import { Layout, Menu } from 'antd';
-import { HomeOutlined, HistoryOutlined, SettingOutlined } from '@ant-design/icons';
+import { HomeOutlined, HistoryOutlined, SettingOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import { Home } from './pages/Home';
 import { History } from './pages/History';
 import { Settings } from './pages/Settings';
+import { BPipeline } from './pages/BPipeline';
 import './App.css';
 
 const { Header, Sider, Content } = Layout;
@@ -17,6 +18,11 @@ const App: React.FC = () => {
       key: '/',
       icon: <HomeOutlined />,
       label: <Link to="/">首页</Link>,
+    },
+    {
+      key: '/bpipeline',
+      icon: <ThunderboltOutlined />,
+      label: <Link to="/bpipeline">乙方流水线</Link>,
     },
     {
       key: '/history',
@@ -75,6 +81,7 @@ const App: React.FC = () => {
           }}>
             <Routes>
               <Route path="/" element={<Home />} />
+              <Route path="/bpipeline" element={<BPipeline />} />
               <Route path="/history" element={<History />} />
               <Route path="/settings" element={<Settings />} />
             </Routes>

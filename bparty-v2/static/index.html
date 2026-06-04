@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BParty V2</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css?v=modal-scroll-lock-20260522" />
+  </head>
+  <body class="auth-loading">
+    <section id="loginOverlay" class="login-overlay" aria-labelledby="login-title">
+      <form id="loginForm" class="login-panel" novalidate>
+        <p class="eyebrow">BParty V2</p>
+        <h1 id="login-title">登录清关处理台</h1>
+        <label class="field" for="loginUsername">
+          <span>账号</span>
+          <input id="loginUsername" name="username" type="text" autocomplete="username" required />
+        </label>
+        <label class="field" for="loginPassword">
+          <span>密码</span>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" required />
+        </label>
+        <button id="loginButton" type="submit">登录</button>
+        <p id="loginMessage" class="login-message" role="status"></p>
+      </form>
+    </section>
+
+    <main id="appShell" class="shell">
+      <section class="workspace" aria-labelledby="page-title">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">BParty V2</p>
+            <h1 id="page-title">清关处理台</h1>
+          </div>
+          <div class="topbar-actions">
+            <button id="permissionButton" type="button" class="secondary compact hidden">权限管理</button>
+            <div id="userBadge" class="user-badge">未登录</div>
+            <button id="logoutButton" type="button" class="secondary compact">退出</button>
+            <div class="status-pill" id="statusPill">待上传</div>
+          </div>
+        </header>
+
+        <form id="processForm" class="panel" novalidate>
+          <div class="form-grid">
+            <label class="upload-card" for="manifestInput">
+              <span class="upload-icon">XLS</span>
+              <span class="upload-title">上传清单 Excel</span>
+              <span class="upload-hint">支持 .xlsx / .xls</span>
+              <input id="manifestInput" name="manifest" type="file" accept=".xlsx,.xls,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required />
+              <span class="file-name" id="manifestName">未选择文件</span>
+            </label>
+
+            <label class="upload-card" for="billInput">
+              <span class="upload-icon pdf">PDF</span>
+              <span class="upload-title">上传运输提单 PDF</span>
+              <span class="upload-hint">支持 .pdf</span>
+              <input id="billInput" name="bill" type="file" accept=".pdf,application/pdf" required />
+              <span class="file-name" id="billName">未选择文件</span>
+            </label>
+          </div>
+
+          <div class="target-grid">
+            <label class="field field-wide" for="taskNoInput">
+              <span>任务编号</span>
+              <input id="taskNoInput" name="display_task_no" type="text" maxlength="120" placeholder="例如 PO-2026/05-A1" required />
+            </label>
+            <label class="field" for="targetTaxInput">
+              <span>期望税金金额</span>
+              <input id="targetTaxInput" name="target_tax_amount" type="number" min="0.01" step="0.01" placeholder="例如 700" required />
+            </label>
+            <label class="field" for="targetCountInput">
+              <span>目标输出行数</span>
+              <input id="targetCountInput" name="target_item_count" type="number" min="1" max="30" step="1" placeholder="例如 10" required />
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="submitButton" type="submit">开始执行</button>
+            <button id="resetButton" type="button" class="secondary">重置</button>
+          </div>
+        </form>
+
+        <section class="queue-panel panel" aria-labelledby="queue-title">
+          <div class="section-head queue-head">
+            <div>
+              <h2 id="queue-title">任务队列</h2>
+              <p id="queueSummary" class="muted">队列空闲</p>
+            </div>
+            <button id="refreshButton" type="button" class="secondary compact">刷新队列</button>
+          </div>
+          <div id="queueList" class="queue-list empty" aria-live="polite">暂无排队或运行任务</div>
+        </section>
+
+        <section class="result-layout panel" aria-live="polite" aria-labelledby="result-title">
+          <div class="section-head">
+            <div>
+              <h2 id="result-title">任务结果</h2>
+              <p id="resultSummary" class="muted">暂无完成或失败任务</p>
+            </div>
+          </div>
+          <div id="resultList" class="result-list empty">暂无完成或失败任务</div>
+        </section>
+      </section>
+    </main>
+
+    <div id="permissionModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="permission-title">
+      <section class="permission-dialog">
+        <div class="modal-head">
+          <div>
+            <p class="eyebrow">Admin</p>
+            <h2 id="permission-title">权限管理</h2>
+          </div>
+          <button id="closePermissionButton" type="button" class="secondary compact">关闭</button>
+        </div>
+        <p id="permissionMessage" class="muted">正在读取权限...</p>
+        <div class="account-create-panel">
+          <label class="account-password-field" for="newAccountPassword">
+            <span>新增账号密码</span>
+            <input id="newAccountPassword" type="password" placeholder="留空默认 user123" autocomplete="new-password" />
+          </label>
+          <button type="button" class="secondary compact" data-action="create-account">新增账号</button>
+        </div>
+        <div id="permissionList" class="permission-list"></div>
+      </section>
+    </div>
+
+    <script src="./app.js?v=modal-scroll-lock-20260522" defer></script>
+  </body>
+</html>

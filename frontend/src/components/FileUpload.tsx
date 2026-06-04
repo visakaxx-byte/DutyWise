@@ -5,15 +5,32 @@ import type { UploadProps } from 'antd';
 
 const { Dragger } = Upload;
 
-interface FileUploadProps {
-  onFilesSelected: (files: File[]) => void;
+interface FileTypeConfig {
+  extensions: string[];
+  mimeTypes: string[];
+  mimeLabel: string;   // 用于错误提示，如 "Excel" / "PDF"
 }
 
-export const FileUpload: React.FC<FileUploadProps> = ({ onFilesSelected }) => {
+interface FileUploadProps {
+  onFilesSelected: (files: File[]) => void;
+  accept: FileTypeConfig;
+  title?: string;
+  hint?: string;
+  maxSizeMB?: number;
+  multiple?: boolean;
+}
+
+export const FileUpload: React.FC<FileUploadProps> = ({
+  onFilesSelected,
+  accept,
+  title = '点击或拖拽文件到此区域上传',
+  hint,
+  maxSizeMB = 10,
+  multiple = false,
+}) => {
   const handleChange: UploadProps['onChange'] = useCallback((info: any) => {
     const { fileList } = info;
 
-    // 过滤出有效的文件
     const validFiles = fileList
       .filter((file: any) => file.originFileObj)
       .map((file: any) => file.originFileObj as File);
@@ -22,19 +39,21 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onFilesSelected }) => {
   }, [onFilesSelected]);
 
   const beforeUpload = (file: File) => {
-    const isExcel = file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
-                    file.type === 'application/vnd.ms-excel' ||
-                    file.name.endsWith('.xlsx') ||
-                    file.name.endsWith('.xls');
+    const fileName = file.name.toLowerCase();
 
-    if (!isExcel) {
-      message.error('只能上传 Excel 文件（.xlsx 或 .xls）');
+    const isValidType =
+      accept.mimeTypes.includes(file.type) ||
+      accept.extensions.some((ext) => fileName.endsWith(ext));
+
+    if (!isValidType) {
+      const extList = accept.extensions.join(', ');
+      message.error(`只能上传 ${accept.mimeLabel} 文件（${extList}）`);
       return Upload.LIST_IGNORE;
     }
 
-    const isLt10M = file.size / 1024 / 1024 < 10;
-    if (!isLt10M) {
-      message.error('文件大小不能超过 10MB');
+    const isLtLimit = file.size / 1024 / 1024 < maxSizeMB;
+    if (!isLtLimit) {
+      message.error(`文件大小不能超过 ${maxSizeMB}MB`);
       return Upload.LIST_IGNORE;
     }
 
@@ -45,18 +64,17 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onFilesSelected }) => {
     <Card>
       <Dragger
         name="files"
-        multiple
+        multiple={multiple}
         beforeUpload={beforeUpload}
         onChange={handleChange}
-        accept=".xlsx,.xls"
         showUploadList={false}
       >
         <p className="ant-upload-drag-icon">
           <InboxOutlined />
         </p>
-        <p className="ant-upload-text">点击或拖拽文件到此区域上传</p>
+        <p className="ant-upload-text">{title}</p>
         <p className="ant-upload-hint">
-          支持单个或批量上传 Excel 文件（.xlsx, .xls）
+          {hint || `支持上传 ${accept.mimeLabel} 文件（${accept.extensions.join(', ')}）`}
         </p>
       </Dragger>
     </Card>

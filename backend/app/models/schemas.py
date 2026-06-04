@@ -32,7 +32,7 @@ class UploadFileInfo(BaseModel):
 class ProcessOptions(BaseModel):
     """处理选项"""
     exclude_anti_dumping: bool = False
-    min_similarity: float = 0.6
+    min_similarity: float = 0.15
 
 
 class TaskProgress(BaseModel):

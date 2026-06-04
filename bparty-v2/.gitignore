@@ -1,0 +1,9 @@
+uploads/
+outputs/
+runtime/
+__pycache__/
+*.pyc
+.env
+.venv/
+.DS_Store
+.playwright-mcp/

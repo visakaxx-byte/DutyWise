@@ -1,0 +1,4 @@
+# Add customer-provided must-exclude certification or regulatory phrases here.
+# Examples:
+# FDA
+# FCC

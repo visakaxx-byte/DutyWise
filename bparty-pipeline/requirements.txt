@@ -1,0 +1,10 @@
+# bparty-pipeline 子项目 - Python 依赖
+# 复用 backend/ 核心库，额外需要 PyYAML 读取配置
+
+PyYAML>=6.0
+aiofiles>=23.0
+python-multipart>=0.0.9
+
+# 后端核心依赖（通过 sys.path 注入复用，此处仅作为文档记录）
+# 实际安装请以 backend/requirements.txt 为准:
+#   fastapi, uvicorn, pandas, openpyxl, httpx, pydantic-settings, pycryptodome

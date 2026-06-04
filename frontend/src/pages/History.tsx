@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Table, Card, Tag, Button, Space, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
-import { getShipments } from '../services/api';
+import { getShipments, getShipmentResult } from '../services/api';
 import type { Shipment } from '../types';
 import dayjs from 'dayjs';
 
@@ -118,9 +118,29 @@ export const History: React.FC = () => {
               type="link"
               size="small"
               icon={<span>⬇</span>}
-              onClick={() => {
-                // 这里需要从后端获取文件ID
-                message.info('下载功能待实现');
+              onClick={async () => {
+                try {
+                  const result = await getShipmentResult(record.id);
+                  const outputFile = result.files?.output_file;
+                  const logFile = result.files?.log_file;
+                  if (outputFile) {
+                    const filename = outputFile.split('/').pop() || 'output.xlsx';
+                    window.open(
+                      `http://localhost:8000/api/v1/files/download?path=${encodeURIComponent(outputFile)}&name=${encodeURIComponent(filename)}`,
+                      '_blank'
+                    );
+                  } else if (logFile) {
+                    const filename = logFile.split('/').pop() || 'log.xlsx';
+                    window.open(
+                      `http://localhost:8000/api/v1/files/download?path=${encodeURIComponent(logFile)}&name=${encodeURIComponent(filename)}`,
+                      '_blank'
+                    );
+                  } else {
+                    message.warning('没有可下载的文件');
+                  }
+                } catch {
+                  message.error('获取文件信息失败');
+                }
               }}
             >
               下载

@@ -1,51 +1,92 @@
 """
 税率爬虫模块 - codeflagai.com
+认证: AES-128-ECB加密登录 → CusAuthorization JWT → classification/search
 """
 import asyncio
+import base64
 import json
 import logging
 from typing import Dict, Optional
+
 import httpx
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# AES-128 密钥（与前端 CryptoJS 一致）
+_AES_KEY = b"imageBatchCompon"  # 16 bytes
+
+
+def _aes_encrypt(plaintext: str) -> str:
+    """AES-128-ECB 加密，PKCS7填充，输出 base64"""
+    cipher = AES.new(_AES_KEY, AES.MODE_ECB)
+    padded = pad(plaintext.encode("utf-8"), 16)
+    return base64.b64encode(cipher.encrypt(padded)).decode("utf-8")
+
 
 class TaxRateCrawler:
-    """税率爬虫"""
+    """税率爬虫 — codeflagai.com 智能归类API"""
+
+    BASE_HOST = "https://www.codeflagai.com"
 
     def __init__(self):
-        self.base_url = settings.CRAWLER_BASE_URL.rstrip("/")
         self.timeout = settings.CRAWLER_TIMEOUT
         self._token: Optional[str] = None
         self._login_lock = asyncio.Lock()
 
+    # ── 登录 ──────────────────────────────────────────────────
+
     async def _do_login(self) -> bool:
-        """执行登录请求，返回是否成功"""
+        """AES加密登录，从 CusAuthorization 响应头提取JWT"""
         username = settings.CRAWLER_USERNAME
         password = settings.CRAWLER_PASSWORD
-
         if not username or not password:
             logger.warning("爬虫账号未配置，跳过登录")
             return False
 
         try:
-            login_url = f"{self.base_url}/api/user/login"
+            login_payload = json.dumps({
+                "loginname": username,
+                "pwd": password,
+                "phone": username,
+                "code": "",
+                "reqTime": "",
+                "type": "",
+            })
+            encrypted = _aes_encrypt(login_payload)
+
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(login_url, json={
-                    "username": username,
-                    "password": password
-                })
-                data = resp.json()
-                if data.get("code") == 200:
-                    self._token = data.get("data", {}).get("token", "")
-                    logger.info("爬虫登录成功")
-                    return True
-                else:
-                    logger.warning(f"爬虫登录失败: {data.get('message', '未知错误')}")
+                resp = await client.post(
+                    f"{self.BASE_HOST}/xhqUser/login",
+                    content=encrypted.encode(),
+                    headers={"Content-Type": "text/plain"},
+                )
+
+                if resp.status_code != 200:
+                    logger.warning(f"登录HTTP错误: {resp.status_code}")
                     self._token = None
                     return False
+
+                body = resp.json()
+                if body.get("code") != 200:
+                    logger.warning(f"登录失败: {body.get('message', '未知错误')}")
+                    self._token = None
+                    return False
+
+                # Token 在 CusAuthorization 响应头中
+                auth_header = resp.headers.get("CusAuthorization", "")
+                if not auth_header:
+                    logger.warning("登录响应缺少 CusAuthorization 头")
+                    self._token = None
+                    return False
+
+                self._token = auth_header
+                logger.info("爬虫登录成功")
+                return True
+
         except Exception as e:
             logger.error(f"爬虫登录异常: {e}")
             self._token = None
@@ -58,39 +99,105 @@ class TaxRateCrawler:
                 return True
             return await self._do_login()
 
-    async def _api_search(self, hs_code: str) -> Optional[Dict]:
-        """纯API查询，遇到1401会自动清除token"""
-        headers = {"Authorization": f"Bearer {self._token}"}
+    # ── API 查询 ──────────────────────────────────────────────
+
+    async def _api_search(self, hs_code: str) -> Optional[Dict[str, Dict]]:
+        """调用 classification/search 查询税率，返回 {hs_code: info} 字典"""
+        headers = {
+            "Content-Type": "application/json",
+            "CusAuthorization": self._token,
+        }
+        payload = {
+            "productNameCn": hs_code,
+            "destinationCountryCode": "US",
+            "destinationCountryName": "美国",
+            "startCountryCode": "CN",
+            "material": "",
+            "isNew": True,
+            "source": "classifySearch",
+        }
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(
-                f"{self.base_url}/api/hscode/search",
-                params={"code": hs_code},
-                headers=headers
+            resp = await client.post(
+                f"{self.BASE_HOST}/classification/search",
+                json=payload,
+                headers=headers,
             )
-            if response.status_code != 200:
+
+            if resp.status_code != 200:
+                logger.warning(f"API HTTP {resp.status_code}: {hs_code}")
                 return None
 
-            # 检查是否登录过期
             try:
-                body = json.loads(response.text)
-                if isinstance(body, dict) and body.get("code") == 1401:
-                    logger.warning("Token已过期(1401)，清除缓存")
-                    self._token = None
-                    return None
+                body = resp.json()
             except json.JSONDecodeError:
-                pass
+                logger.error(f"API响应JSON解析失败: {hs_code}")
+                return None
 
-            return self._parse_response(response.text, hs_code)
+            if body.get("code") == 1401:
+                logger.warning("Token已过期(1401)，清除缓存")
+                self._token = None
+                return None
 
-    async def search(self, hs_code: str) -> Optional[Dict]:
+            if body.get("code") != 200:
+                logger.warning(f"API业务错误 {hs_code}: {body.get('message')}")
+                return None
+
+            return self._parse_classification_results(hs_code, body.get("data", {}))
+
+    def _parse_classification_results(
+        self, hs_code: str, data: dict
+    ) -> Optional[Dict[str, Dict]]:
+        """解析 classification/search 响应，提取所有备选编码及税率"""
+        result_list = data.get("classificationResultList", [])
+        code_list = data.get("classificationCodeList", [])
+
+        if not result_list or not code_list:
+            logger.info(f"未找到税率信息: {hs_code}")
+            return None
+
+        results: Dict[str, Dict] = {}
+        for i in range(min(len(result_list), len(code_list))):
+            result_entry = result_list[i]
+            code_entry = code_list[i]
+
+            matched_hs = str(result_entry.get("hsCode", "")).strip()
+            if not matched_hs:
+                continue
+
+            tax_rate = code_entry.get("importTariffRate") or code_entry.get("columnRateOfDuty") or "N/A"
+            description = result_entry.get("gName") or result_entry.get("dataWordCn") or ""
+
+            anti_dumping_raw = code_entry.get("antiDumpingCountervailingRate")
+            anti_dumping = bool(
+                anti_dumping_raw
+                and str(anti_dumping_raw).strip()
+                and str(anti_dumping_raw).lower() not in ("none", "null", "")
+            )
+
+            results[matched_hs] = {
+                "hs_code_cn": hs_code,
+                "hs_code_us": matched_hs,
+                "description_cn": description,
+                "tax_rate": str(tax_rate),
+                "anti_dumping": anti_dumping,
+                "certification_required": False,
+            }
+
+        if not results:
+            return None
+
+        logger.info(f"HS编码 {hs_code} 找到 {len(results)} 个备选分类")
+        return results
+
+    async def search(self, hs_code: str) -> Optional[Dict[str, Dict]]:
         """
-        查询单个HS编码的税率信息
-        优先 API（遇到登录过期自动重试一次），失败时使用内置税率库
+        查询单个HS编码的税率信息，返回 {匹配HS: info} 字典
+        优先 API（遇登录过期自动重试一次），失败回退内置税率库
         """
         try:
             logger.info(f"查询HS编码: {hs_code}")
 
-            # 确保已登录
             await self._ensure_login()
             if self._token:
                 result = await self._api_search(hs_code)
@@ -105,17 +212,23 @@ class TaxRateCrawler:
                         if result:
                             return result
 
-            # 回退到内置税率库
-            return self._get_builtin_rate(hs_code)
+            builtin = self._get_builtin_rate(hs_code)
+            if builtin:
+                return {hs_code: builtin}
+            return None
 
         except Exception as e:
             logger.warning(f"API查询失败 {hs_code}: {e}，使用内置税率库")
-            return self._get_builtin_rate(hs_code)
+            builtin = self._get_builtin_rate(hs_code)
+            if builtin:
+                return {hs_code: builtin}
+            return None
+
+    # ── 内置税率库（API不可用时的回退） ───────────────────────
 
     def _get_builtin_rate(self, hs_code: str) -> Optional[Dict]:
         """内置美国进口税率参考库（按前缀长度优先匹配）"""
         RATE_DB = [
-            # (前缀, 描述, 税率, 反倾销)
             ("8517900000", "电话设备零件", "0%", False),
             ("8517120000", "蜂窝网络电话", "0%", False),
             ("8517180000", "其他电话设备", "2.5%", False),
@@ -136,7 +249,6 @@ class TaxRateCrawler:
             ("6702909000", "人造花(其他)", "8.4%", False),
             ("6702", "人造花/装饰品", "8.4%", False),
         ]
-        # 按前缀长度降序匹配（优先精确匹配）
         for prefix, desc, rate, ad in sorted(RATE_DB, key=lambda x: -len(x[0])):
             if hs_code.startswith(prefix):
                 return {
@@ -145,133 +257,67 @@ class TaxRateCrawler:
                     "description_cn": desc,
                     "tax_rate": rate,
                     "anti_dumping": ad,
-                    "certification_required": False
+                    "certification_required": False,
                 }
-        # 默认
         return {
             "hs_code_cn": hs_code,
             "hs_code_us": hs_code,
             "description_cn": "其他商品",
             "tax_rate": "3.5%",
             "anti_dumping": False,
-            "certification_required": False
+            "certification_required": False,
         }
 
-    def _parse_response(self, text: str, hs_code: str) -> Optional[Dict]:
-        """解析API响应"""
-        try:
-            data = json.loads(text)
-
-            # codeflagai API 返回格式
-            if isinstance(data, dict):
-                if data.get("code") == 1401:
-                    logger.warning(f"登录已过期: {data.get('message')}")
-                    return None
-
-                result = data.get("data") or data
-
-                # 提取税率信息
-                tax_rate = self._extract_tax_rate(result)
-                description = result.get("goodsNameCn") or result.get("descriptionCn") or result.get("name", "")
-                anti_dumping = self._check_anti_dumping(result)
-
-                return {
-                    "hs_code_cn": hs_code,
-                    "hs_code_us": result.get("usHscode", hs_code),
-                    "description_cn": description,
-                    "tax_rate": tax_rate,
-                    "anti_dumping": anti_dumping,
-                    "certification_required": False
-                }
-
-        except (json.JSONDecodeError, Exception) as e:
-            logger.error(f"解析响应失败 {hs_code}: {e}")
-
-        return None
-
-    def _extract_tax_rate(self, data: dict) -> str:
-        """从返回数据中提取税率"""
-        # 尝试多种可能的字段名
-        for key in ("taxRate", "rate", "dutyRate", "tariffRate",
-                     "generalRate", "mostFavoredNationRate",
-                     "general_rate", "mfn_rate"):
-            val = data.get(key)
-            if val is not None and val != "":
-                return str(val)
-
-        # 如果所有字段都没有，尝试嵌套结构
-        tariff = data.get("tariff", {})
-        if isinstance(tariff, dict):
-            for key in ("general", "mfn", "rate"):
-                val = tariff.get(key)
-                if val is not None and val != "":
-                    return str(val)
-
-        return "N/A"
-
-    def _check_anti_dumping(self, data: dict) -> bool:
-        """检查是否有反倾销标记"""
-        for key in ("antiDumping", "anti_dumping", "isAntiDumping"):
-            val = data.get(key)
-            if val is True or str(val).lower() in ("true", "yes", "1"):
-                return True
-
-        # 检查描述中是否包含反倾销关键词
-        desc = str(data.get("descriptionCn", "")) + str(data.get("remark", ""))
-        if "反倾销" in desc or "anti-dumping" in desc.lower():
-            return True
-
-        return False
+    # ── 批量查询 ──────────────────────────────────────────────
 
     async def batch_search(self, items: list) -> Dict[str, Dict]:
         """
         批量查询税率（每次调用前强制重新登录，确保token有效）
         """
-        results = {}
-
-        # 提取所有HS编码
         hs_codes = set()
         for item in items:
-            hs_code = item.get("商品编码")
-            if hs_code:
-                hs_codes.add(str(hs_code))
+            code = item.get("商品编码")
+            if code:
+                hs_codes.add(str(code))
 
         if not hs_codes:
             logger.info("没有需要查询的HS编码")
-            return results
+            return {}
 
         logger.info(f"开始批量查询，共 {len(hs_codes)} 个HS编码")
 
-        # 每次批量查询前强制重新登录，确保session有效
+        # 每次批量查询前强制重新登录
         self._token = None
         await self._ensure_login(force=True)
 
-        # 并发查询（限制并发数）
-        semaphore = asyncio.Semaphore(3)
+        # 并发查询（限制并发数，避免频控）
+        semaphore = asyncio.Semaphore(1)
 
-        async def search_with_semaphore(code):
+        async def search_one(code: str):
             async with semaphore:
                 result = await self.search(code)
                 await asyncio.sleep(settings.CRAWLER_DELAY)
                 return code, result
 
-        tasks = [search_with_semaphore(code) for code in hs_codes]
+        tasks = [search_one(code) for code in hs_codes]
         search_results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        results: Dict[str, Dict] = {}
         for item in search_results:
             if isinstance(item, Exception):
                 logger.error(f"查询异常: {item}")
                 continue
-            code, result = item
-            if result:
-                results[code] = result
+            code, result_dict = item
+            if result_dict:
+                results.update(result_dict)  # 合并所有备选编码
 
-        logger.info(f"批量查询完成，成功 {len(results)}/{len(hs_codes)} 个")
+        logger.info(f"批量查询完成，共获得 {len(results)} 个编码")
 
-        # 补充同前缀候选编码供优化器对比
         return self._enrich_with_candidates(results, hs_codes)
 
-    def _enrich_with_candidates(self, results: Dict[str, Dict], hs_codes: set) -> Dict[str, Dict]:
+    def _enrich_with_candidates(
+        self, results: Dict[str, Dict], hs_codes: set
+    ) -> Dict[str, Dict]:
         """补充同前缀候选编码供优化器查找更优税率"""
         enriched = dict(results)
         CANDIDATE_DB = {

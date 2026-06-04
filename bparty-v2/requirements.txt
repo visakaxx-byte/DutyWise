@@ -1,0 +1,10 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+python-multipart==0.0.20
+openpyxl==3.1.5
+pypdf==5.4.0
+pypdfium2==5.8.0
+Pillow==11.2.1
+httpx==0.28.1
+python-dotenv==1.1.0
+pycryptodome==3.22.0

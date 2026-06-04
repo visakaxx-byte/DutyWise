@@ -1,13 +1,14 @@
 """
 API 路由
 """
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from typing import List
 import shutil
 import asyncio
 from pathlib import Path
 import logging
+from datetime import datetime
 
 from app.models.schemas import (
     APIResponse, ProcessOptions, TaskProgress,
@@ -75,7 +76,7 @@ async def upload_files(files: List[UploadFile] = File(...)):
             "status": "uploaded",
             "files": saved_files,
             "file_paths": file_paths,
-            "created_at": None
+            "created_at": datetime.now().isoformat()
         }
 
         task_id = generate_task_id()
@@ -99,8 +100,7 @@ async def upload_files(files: List[UploadFile] = File(...)):
 @router.post("/shipments/{shipment_id}/process")
 async def process_shipment(
     shipment_id: int,
-    options: ProcessOptions,
-    background_tasks: BackgroundTasks
+    options: ProcessOptions
 ):
     """开始处理票据"""
     try:
@@ -118,16 +118,11 @@ async def process_shipment(
             "status": TaskStatus.PENDING,
             "progress": 0,
             "current_step": "等待开始",
-            "error_message": None
+            "errorMessage": None
         }
 
-        # 后台处理
-        background_tasks.add_task(
-            process_shipment_task,
-            task_id,
-            shipment_id,
-            options.dict()
-        )
+        # 后台处理（用asyncio.create_task在主event loop中运行）
+        asyncio.create_task(process_shipment_task_async(task_id, shipment_id, options.dict()))
 
         return APIResponse(
             code=200,
@@ -191,8 +186,39 @@ async def download_file(path: str, name: str = "output.xlsx"):
     )
 
 
-def process_shipment_task(task_id: str, shipment_id: int, options: dict):
-    """处理票据任务（后台任务）"""
+@router.get("/shipments")
+async def list_shipments(page: int = 1, page_size: int = 20):
+    """列出所有票据（历史记录）"""
+    all_shipments = []
+    for sid, s in shipments_db.items():
+        result_data = s.get("result", {}) or {}
+        item = {
+            "id": s["shipment_id"],
+            "shipmentNo": s["shipment_no"],
+            "status": s.get("status", "unknown"),
+            "totalItems": result_data.get("statistics", {}).get("total_items", 0),
+            "optimizedItems": result_data.get("statistics", {}).get("optimized_items", 0),
+            "createdAt": s.get("created_at"),
+            "completedAt": None,
+        }
+        if s.get("status") == "completed":
+            item["completedAt"] = result_data.get("completed_at")
+        all_shipments.append(item)
+
+    all_shipments.sort(key=lambda x: x["id"], reverse=True)
+    total = len(all_shipments)
+    start = (page - 1) * page_size
+    paged = all_shipments[start:start + page_size]
+
+    return APIResponse(
+        code=200,
+        message="查询成功",
+        data={"items": paged, "total": total}
+    )
+
+
+async def process_shipment_task_async(task_id: str, shipment_id: int, options: dict):
+    """处理票据任务（异步，运行在主event loop中）"""
     try:
         shipment = shipments_db[shipment_id]
         file_paths = shipment["file_paths"]
@@ -210,16 +236,58 @@ def process_shipment_task(task_id: str, shipment_id: int, options: dict):
         parser = DocumentParser()
         parsed_data = parser.parse_files(file_paths)
 
+        # 检查是否包含产品报关信息
+        has_product_data = False
+        for file_data in parsed_data["files"]:
+            for sheet in file_data["sheets"]:
+                if sheet.get("has_product_fields", True):
+                    has_product_data = True
+                    break
+            if has_product_data:
+                break
+
+        if not has_product_data:
+            # 所有sheet都不包含产品报关字段（品名/HS编码/申报价值等）
+            error_msg = (
+                "上传的文件不包含产品报关信息（品名、HS编码、申报价值等字段）。"
+                "请确认上传的是产品报关明细表，而非物流装箱清单。"
+            )
+            logger.warning(f"任务 {task_id}: {error_msg}")
+            tasks_db[task_id].update({
+                "status": TaskStatus.FAILED,
+                "errorMessage": error_msg,
+                "progress": 100,
+                "current_step": "文件格式不支持"
+            })
+            shipments_db[shipment_id]["status"] = "failed"
+            return
+
         # 2. 字段映射
         update_progress(30, "字段映射")
         mapper = FieldMapper()
         mapped_result = mapper.map_fields(parsed_data)
         mapped_data = mapped_result["items"]
 
-        # 3. 查询税率
+        if not mapped_data:
+            error_msg = (
+                "未能从文件中识别出任何商品信息。"
+                "请确认文件包含中文品名、HS编码等必要字段，"
+                "且数据格式与系统模板一致。"
+            )
+            logger.warning(f"任务 {task_id}: {error_msg}")
+            tasks_db[task_id].update({
+                "status": TaskStatus.FAILED,
+                "errorMessage": error_msg,
+                "progress": 100,
+                "current_step": "字段映射失败"
+            })
+            shipments_db[shipment_id]["status"] = "failed"
+            return
+
+        # 3. 查询税率（直接await，运行在主event loop中）
         update_progress(50, "查询税率")
         crawler = TaxRateCrawler()
-        tax_data = asyncio.run(crawler.batch_search(mapped_data))
+        tax_data = await crawler.batch_search(mapped_data)
 
         # 4. 优化HS编码
         update_progress(70, "优化HS编码")
@@ -256,7 +324,8 @@ def process_shipment_task(task_id: str, shipment_id: int, options: dict):
                 output_file = generator.generate(
                     optimized_result["items"],
                     template_path,
-                    str(output_dir)
+                    str(output_dir),
+                    optimization_logs=optimized_result.get("optimization_logs", [])
                 )
             except Exception as e:
                 logger.warning(f"生成清关文件失败: {e}")
@@ -294,7 +363,7 @@ def process_shipment_task(task_id: str, shipment_id: int, options: dict):
 
         tasks_db[task_id].update({
             "status": TaskStatus.FAILED,
-            "error_message": str(e)
+            "errorMessage": str(e)
         })
 
         shipments_db[shipment_id]["status"] = "failed"
