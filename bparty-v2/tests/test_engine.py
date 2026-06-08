@@ -20,6 +20,7 @@ from engine import (
     ProductCandidate,
     ProcessingOptions,
     SelectionRules,
+    assert_selected_price_fit_resolved,
     apply_bill_product_names,
     build_manifest_hs_groups,
     build_manifest_weight_context,
@@ -30,6 +31,7 @@ from engine import (
     effective_tax_rate,
     ensure_candidate_plausibility_ranges,
     ensure_bill_products_present,
+    exclude_bill_product_replacements,
     generate_valid_output_rows_with_llm,
     load_plausibility_ranges,
     load_replacement_candidates,
@@ -44,6 +46,7 @@ from engine import (
     parse_tax_rate,
     parse_bill_products_with_llm,
     PlausibilityRange,
+    qualify_manual_invoice_replacements,
     qualify_single_candidate,
     qualify_bill_product_candidates,
     select_initial_candidates,
@@ -57,6 +60,8 @@ from engine import (
     validate_price_evidence,
     validate_qty_ctn_relationship,
     infer_bill_material_from_entry,
+    load_default_reference_manual_candidates,
+    optimize_selected_candidates_for_manual_invoice,
 )
 from crawler_client import parse_classification_results
 from price_search import build_price_evidence, extract_price_samples, parse_pack_qty
@@ -289,6 +294,7 @@ class ManifestHsGroupTests(unittest.TestCase):
 class PriceSearchTests(unittest.TestCase):
     def test_parse_pack_qty_and_price_evidence(self) -> None:
         self.assertEqual(parse_pack_qty("Plastic hair clips 100 pcs $6.99"), 100)
+        self.assertEqual(parse_pack_qty("High-Waisted Everyday Cotton Underwear 6-Pack $39.99"), 6)
         samples = extract_price_samples("<html>Plastic hair clips 100 pcs $6.99 Another pack of 50 $5.00</html>")
         evidence = build_price_evidence("plastic hair clip", samples)
 
@@ -1203,8 +1209,276 @@ class OutputOptimizationTests(unittest.TestCase):
         self.assertEqual(selected[0].zh, "塑料收纳盒")
         self.assertNotIn("高价鞋", [candidate.zh for candidate in selected])
 
+    def test_price_fit_resolution_rejects_unresolved_low_reference_price(self) -> None:
+        candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx",
+            zh="高价鞋",
+            en="Shoes",
+            hs="6402999000",
+            material="Textile",
+            usage="HOME",
+            ctns=10,
+            qty=1000,
+            unit_price=50,
+            gross_weight=100,
+            base_tax_rate=0.1,
+            effective_tax_rate=0.1,
+            price_evidence={"declared_unit_price": 50, "confidence": 0.7},
+            plausibility_range=PlausibilityRange(
+                kg_per_ctn_min=5,
+                kg_per_ctn_max=20,
+                kg_per_pc_min=0.1,
+                kg_per_pc_max=0.2,
+                unit_price_min=33.5,
+                unit_price_max=75,
+                qty_per_ctn_min=50,
+                qty_per_ctn_max=200,
+                source="test range",
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "优化无解"):
+            assert_selected_price_fit_resolved(
+                [candidate],
+                ManifestSummary("input.xlsx", 1, 10, 100, 1000, []),
+                BillInfo("bill.pdf", "", [], cartons=10),
+                ProcessingOptions(target_tax_amount=100, target_item_count=1),
+                {"swaps": 0, "replacement_attempts": 0},
+            )
+
+    def test_manual_reference_candidates_keep_manual_tax_and_plausibility(self) -> None:
+        candidates = load_default_reference_manual_candidates()
+        self.assertGreaterEqual(len(candidates), 11)
+
+        keyboard = next(candidate for candidate in candidates if candidate.hs == "8471602000" and candidate.zh == "键盘")
+        self.assertEqual(keyboard.effective_tax_rate, 0.0)
+        self.assertEqual(keyboard.tax_match_source, "manual_reference")
+        self.assertEqual(keyboard.ctns, 115)
+        self.assertEqual(keyboard.qty, 1380)
+        self.assertTrue(keyboard.plausibility_range)
+        assert keyboard.plausibility_range is not None
+        self.assertGreater(keyboard.plausibility_range.kg_per_ctn_max or 0, keyboard.plausibility_range.kg_per_ctn_min or 0)
+
+    def test_manual_invoice_optimizer_prefers_diverse_reference_rows(self) -> None:
+        bill_hairpin = ProductCandidate(
+            source="bill",
+            source_label="bill.pdf",
+            zh="塑料发夹",
+            en="Plastic Hairpin",
+            hs="9615115000",
+            material="Plastic",
+            usage="Decoration",
+            ctns=10,
+            qty=300,
+            unit_price=0.32,
+            gross_weight=180,
+            base_tax_rate=0.1,
+            effective_tax_rate=0.1,
+            tax_match_source="bill_product",
+            plausibility_range=PlausibilityRange(
+                kg_per_ctn_min=1,
+                kg_per_ctn_max=30,
+                kg_per_pc_min=0.01,
+                kg_per_pc_max=1,
+                unit_price_min=0.05,
+                unit_price_max=1,
+                qty_per_ctn_min=5,
+                qty_per_ctn_max=500,
+                source="test bill range",
+            ),
+        )
+        bill_keychain = ProductCandidate(
+            source="bill",
+            source_label="bill.pdf",
+            zh="塑料钥匙扣",
+            en="Plastic Keychain",
+            hs="3926400090",
+            material="Plastic",
+            usage="Decoration",
+            ctns=10,
+            qty=300,
+            unit_price=0.3,
+            gross_weight=180,
+            base_tax_rate=0.153,
+            effective_tax_rate=0.153,
+            tax_match_source="bill_product",
+            plausibility_range=PlausibilityRange(
+                kg_per_ctn_min=1,
+                kg_per_ctn_max=30,
+                kg_per_pc_min=0.01,
+                kg_per_pc_max=1,
+                unit_price_min=0.05,
+                unit_price_max=1,
+                qty_per_ctn_min=5,
+                qty_per_ctn_max=500,
+                source="test bill range",
+            ),
+        )
+        duplicate_keyboard = ProductCandidate(
+            source="replacement",
+            source_label="DEFAULT_REFERENCE_STYLE_ROWS",
+            zh="键鼠套装",
+            en="Keyboard and mouse set",
+            hs="8471602000",
+            material="ABS",
+            usage="HOME",
+            ctns=115,
+            qty=1380,
+            unit_price=2.0,
+            gross_weight=2465.7,
+            base_tax_rate=0.0,
+            effective_tax_rate=0.0,
+            tax_match_source="manual_reference",
+            plausibility_range=next(candidate.plausibility_range for candidate in load_default_reference_manual_candidates() if candidate.hs == "8471602000"),
+        )
+        pool = [*load_default_reference_manual_candidates(), duplicate_keyboard]
+
+        selected, summary = optimize_selected_candidates_for_manual_invoice(
+            [bill_hairpin, bill_keychain, duplicate_keyboard],
+            pool,
+            ManifestSummary("input.xlsx", 11, 903, 15406.15, 182859.56, []),
+            BillInfo("bill.pdf", "", ["PLASTIC HAIRPIN", "PLASTIC KEYCHAIN"], cartons=903),
+            ProcessingOptions(target_tax_amount=850, target_item_count=11),
+        )
+
+        rows = build_output_rows(
+            selected,
+            ManifestSummary("input.xlsx", 11, 903, 15406.15, 182859.56, []),
+            BillInfo("bill.pdf", "", ["PLASTIC HAIRPIN", "PLASTIC KEYCHAIN"], cartons=903),
+            ProcessingOptions(target_tax_amount=850, target_item_count=11),
+        )
+        manual_rows = [candidate for candidate in selected if candidate.source_label == "DEFAULT_REFERENCE_STYLE_ROWS"]
+        keyboard_rows = [candidate for candidate in selected if candidate.hs == "8471602000"]
+        self.assertGreaterEqual(len(manual_rows), 7)
+        self.assertLessEqual(len(keyboard_rows), 1)
+        self.assertLessEqual(sum(row["预计税金"] for row in rows), 935)
+        self.assertEqual(summary["strategy"], "manual_invoice")
+
 
 class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bill_product_candidates_deduplicate_repeated_bill_products(self) -> None:
+        bill = BillInfo(
+            filename="bill.pdf",
+            raw_text="",
+            products=[
+                "PLASTIC HAIRPIN",
+                "PLASTIC HAIRPIN",
+                "PLASTIC HAIRPIN",
+                "PLASTIC KEYCHAIN",
+                "PLASTIC KEYCHAIN",
+                "PLASTIC KEYCHAIN",
+            ],
+            gross_weight=150,
+            cartons=30,
+        )
+        crawler = RoutedFakeCrawler(
+            product_results={
+                "plastic hairpin": tax_result("Free", hs="9615115000"),
+                "plastic keychain": tax_result("5.3%", hs="3926400090"),
+            }
+        )
+
+        bill_required, bill_filtered = await qualify_bill_product_candidates(
+            crawler,
+            bill,
+            [],
+            [],
+            SelectionRules(allowed_certifications=["Lacey Act", "TSCA"]),
+            ProcessingOptions(target_tax_amount=850, target_item_count=10),
+            query_cache={},
+        )
+
+        self.assertEqual(bill_filtered, [])
+        self.assertEqual([item.zh for item in bill_required], ["PLASTIC HAIRPIN", "PLASTIC KEYCHAIN"])
+        self.assertEqual(
+            crawler.product_calls,
+            [("PLASTIC HAIRPIN", ""), ("PLASTIC KEYCHAIN", "")],
+        )
+
+    async def test_bill_product_candidates_do_not_use_replacement_pool_fallback(self) -> None:
+        bill = BillInfo(
+            filename="bill.pdf",
+            raw_text="",
+            products=["PLASTIC HAIRPIN"],
+            gross_weight=150,
+            cartons=30,
+        )
+        replacement = ProductCandidate(
+            source="replacement",
+            source_label="海关编码查找.xlsx/常用1",
+            zh="PLASTIC HAIRPIN",
+            en="Plastic Hairpin",
+            hs="9615115000",
+            material="Plastic",
+            usage="HOME",
+            ctns=10,
+            qty=100,
+            unit_price=0.3,
+            gross_weight=20,
+        )
+        crawler = RoutedFakeCrawler(
+            product_results={},
+            hs_results={"9615115000": tax_result("Free", hs="9615115000")},
+        )
+
+        bill_required, bill_filtered = await qualify_bill_product_candidates(
+            crawler,
+            bill,
+            [],
+            [replacement],
+            SelectionRules(allowed_certifications=["Lacey Act", "TSCA"]),
+            ProcessingOptions(target_tax_amount=850, target_item_count=10),
+            query_cache={},
+        )
+
+        self.assertEqual(bill_required, [])
+        self.assertEqual(crawler.product_calls, [("PLASTIC HAIRPIN", "")])
+        self.assertEqual(crawler.hs_calls, [])
+        self.assertIn("Codeflag", bill_filtered[-1].filter_reason)
+
+    def test_replacement_pool_excludes_bill_product_names(self) -> None:
+        pool = [
+            ProductCandidate(
+                source="replacement",
+                source_label="DEFAULT_REFERENCE_STYLE_ROWS",
+                zh="塑料发夹",
+                en="Plastic hairpin",
+                hs="9615115000",
+                material="Plastic",
+                usage="Decoration",
+            ),
+            ProductCandidate(
+                source="replacement",
+                source_label="DEFAULT_REFERENCE_STYLE_ROWS",
+                zh="花瓶",
+                en="Vase",
+                hs="6913105000",
+                material="Ceramic",
+                usage="Decoration",
+            ),
+        ]
+
+        filtered = exclude_bill_product_replacements(pool, ["PLASTIC HAIRPIN"])
+
+        self.assertEqual([candidate.zh for candidate in filtered], ["花瓶"])
+
+    async def test_manual_invoice_stable_references_exclude_bill_product_names(self) -> None:
+        qualified, filtered, attempts = await qualify_manual_invoice_replacements(
+            FakeCrawler({}),
+            [],
+            [],
+            SelectionRules(allowed_certifications=["Lacey Act", "TSCA"]),
+            query_cache={},
+            bill_products=["PLASTIC HAIRPIN", "PLASTIC KEYCHAIN"],
+        )
+
+        names = {candidate.en.lower() for candidate in qualified}
+        self.assertNotIn("plastic hairpin", names)
+        self.assertNotIn("plastic keychain", names)
+        self.assertEqual(filtered, [])
+        self.assertEqual(attempts, 0)
+
     async def test_replacement_candidate_keeps_original_hs_when_product_query_returns_unrelated_low_tax_hs(self) -> None:
         candidate = ProductCandidate(
             source="replacement",
@@ -1944,8 +2218,8 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 2)
         self.assertIn("数量分布过于机械", feedback[0])
         self.assertEqual(len(rows), 8)
-        self.assertLessEqual(abs(sum(row["总价"] * row["综合税率"] for row in rows) - 350), 20)
-        self.assertTrue(all(row["税金"] >= 30 for row in rows))
+        self.assertLessEqual(sum(row["总价"] * row["综合税率"] for row in rows), 385)
+        self.assertTrue(all(row["税金"] >= 0 for row in rows))
 
     async def test_llm_output_retries_when_llm_draft_is_not_json(self) -> None:
         candidates = [
@@ -1999,7 +2273,7 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm.kwargs[0]["max_tokens"], 8192)
         self.assertEqual(rows[0]["中文品名"], "品名")
 
-    def test_llm_output_closes_tax_gap_within_20_usd(self) -> None:
+    def test_llm_output_keeps_tax_under_upper_bound_without_forcing_target_gap(self) -> None:
         candidates = [
             ProductCandidate(
                 source="replacement",
@@ -2056,9 +2330,9 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
             BillInfo("bill.pdf", "", [], cartons=10),
             ProcessingOptions(target_tax_amount=900, target_item_count=1),
         )
-        self.assertEqual(rows[0]["单价"], 90.0)
-        self.assertEqual(rows[0]["税金"], 900.0)
-        self.assertLessEqual(abs(sum(row["总价"] * row["综合税率"] for row in rows) - 900), 20)
+        self.assertEqual(rows[0]["单价"], 85.133)
+        self.assertEqual(rows[0]["税金"], 851.33)
+        self.assertLessEqual(sum(row["总价"] * row["综合税率"] for row in rows), 990)
 
     def test_llm_output_closes_bill_cartons(self) -> None:
         candidates = [
@@ -2426,7 +2700,7 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
             validate_qty_ctn_relationship([{"箱数": 25, "数量": 51}])
         validate_qty_ctn_relationship([{"箱数": 25, "数量": 50}])
 
-    def test_llm_output_enforces_minimum_tax_per_row(self) -> None:
+    def test_llm_output_allows_low_row_tax_for_manual_invoice_strategy(self) -> None:
         candidates = []
         rows = []
         for idx, (rate, unit_price) in enumerate(((0.1, 10.0), (0.1, 1.0)), start=1):
@@ -2488,9 +2762,9 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
             ProcessingOptions(target_tax_amount=120, target_item_count=2),
         )
 
-        self.assertGreaterEqual(rows[0]["税金"], 30)
-        self.assertGreaterEqual(rows[1]["税金"], 30)
-        self.assertLessEqual(abs(sum(row["税金"] for row in rows) - 120), 20)
+        self.assertEqual(rows[0]["税金"], 10.0)
+        self.assertEqual(rows[1]["税金"], 1.0)
+        self.assertLessEqual(sum(row["税金"] for row in rows), 132)
 
     def test_llm_output_allows_up_to_two_zero_tax_rows(self) -> None:
         candidates = []
@@ -2555,12 +2829,12 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([row["税金"] for row in rows[:2]], [0.0, 0.0])
-        self.assertGreaterEqual(rows[2]["税金"], 30)
+        self.assertEqual(rows[2]["税金"], 10.0)
 
-    def test_llm_output_rejects_three_zero_tax_rows(self) -> None:
+    def test_llm_output_allows_zero_tax_rows_for_manual_invoice_strategy(self) -> None:
         candidates = []
         rows = []
-        for idx in range(3):
+        for idx in range(5):
             candidates.append(
                 ProductCandidate(
                     source="replacement",
@@ -2611,16 +2885,16 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
 
-        with self.assertRaisesRegex(RuntimeError, "税金为 0 的行数不能超过 2 行"):
-            validate_llm_output_rows(
-                rows,
-                candidates,
-                ManifestSummary("input.xlsx", 3, 30, 300, 1000, []),
-                BillInfo("bill.pdf", "", [], cartons=30),
-                ProcessingOptions(target_tax_amount=1, target_item_count=3),
-            )
+        validate_llm_output_rows(
+            rows,
+            candidates,
+            ManifestSummary("input.xlsx", 5, 50, 500, 1000, []),
+            BillInfo("bill.pdf", "", [], cartons=50),
+            ProcessingOptions(target_tax_amount=1, target_item_count=5),
+        )
+        self.assertEqual([row["税金"] for row in rows], [0.0, 0.0, 0.0, 0.0, 0.0])
 
-    def test_llm_output_rejects_when_row_cannot_reach_minimum_tax(self) -> None:
+    def test_llm_output_allows_row_below_old_minimum_tax(self) -> None:
         candidates = [
             ProductCandidate(
                 source="replacement",
@@ -2671,14 +2945,14 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
             }
         ]
 
-        with self.assertRaisesRegex(RuntimeError, "税金无法达到最低 30.0 USD"):
-            validate_llm_output_rows(
-                rows,
-                candidates,
-                ManifestSummary("input.xlsx", 1, 10, 100, 1000, []),
-                BillInfo("bill.pdf", "", [], cartons=10),
-                ProcessingOptions(target_tax_amount=30, target_item_count=1),
-            )
+        validate_llm_output_rows(
+            rows,
+            candidates,
+            ManifestSummary("input.xlsx", 1, 10, 100, 1000, []),
+            BillInfo("bill.pdf", "", [], cartons=10),
+            ProcessingOptions(target_tax_amount=30, target_item_count=1),
+        )
+        self.assertEqual(rows[0]["税金"], 1.0)
 
     def test_llm_output_relaxes_price_floor_to_keep_tax_under_upper_bound(self) -> None:
         candidates = [

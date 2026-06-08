@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import base64
 import io
+import itertools
 from copy import copy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -35,19 +36,32 @@ BASE_TAX_LIMIT = 0.2
 TAX_TOLERANCE_USD = 1.0
 TAX_FINAL_TOLERANCE_USD = 20.0
 MIN_ROW_TAX_AMOUNT_USD = 30.0
-MAX_ZERO_TAX_ROWS = 2
+MAX_ZERO_TAX_ROWS = 4
 MAX_TAX_OVER_TARGET_RATIO = 0.1
 UNDETAILED_BILL_TAX_SHARE = 0.20
 UNDETAILED_BILL_CARTON_SHARE = 0.06
-PRICE_FIT_MIN_REFERENCE_RATIO = 0.25
+PRICE_FIT_MIN_REFERENCE_RATIO = 0.67
 PRICE_REPAIR_POOL_SIZE = 24
-PRICE_REPAIR_MAX_PASSES = 8
-PRICE_REPAIR_MAX_WEB_LOOKUPS = 12
+PRICE_REPAIR_MAX_PASSES = 12
+PRICE_REPAIR_MAX_WEB_LOOKUPS = 24
 PRICE_REPAIR_MIN_SCORE_GAIN = 5.0
 PRICE_REPAIR_SEARCH_TIMEOUT_SECONDS = 3.0
 PRICE_REPAIR_SEARCH_MAX_PAGES = 2
+PRICE_REPAIR_REPLACEMENT_QUERY_LIMIT = 120
+PRICE_REPAIR_REPLACEMENT_POOL_SIZE = 48
 PRICE_SEARCH_TIMEOUT_SECONDS = 3.0
 PRICE_SEARCH_MAX_PAGES = 2
+MANUAL_INVOICE_REPLACEMENT_QUERY_LIMIT = 24
+MANUAL_INVOICE_REPLACEMENT_POOL_SIZE = 28
+MANUAL_INVOICE_ANCHOR_HS = {
+    "8471602000",
+    "8306290000",
+    "3924104000",
+    "6912004810",
+    "6913105000",
+    "7013992000",
+    "6303922010",
+}
 LLM_DRAFT_TIMEOUT_SECONDS = 180.0
 LLM_TRANSLATION_TIMEOUT_SECONDS = 60.0
 DECLARED_RETAIL_PRICE_RATIO = 0.3
@@ -63,6 +77,17 @@ BILL_VISION_MAX_SIDE = 1800
 BILL_VISION_JPEG_QUALITY = 80
 
 DEFAULT_REFERENCE_STYLE_ROWS = [
+    {"中文品名": "铁制昆虫饰品", "英文品名": "Iron insect ornaments", "商品编码": "8306290000", "材质": "Iron", "用途": "Decoration", "单价": 0.69, "综合税率": 0.10, "箱数": 70, "数量": 910, "毛重": 1648},
+    {"中文品名": "天鹅摆件", "英文品名": "Swan figurines", "商品编码": "3926400090", "材质": "Plastic", "用途": "Decoration", "单价": 0.52, "综合税率": 0.153, "箱数": 138, "数量": 1656, "毛重": 2044.21},
+    {"中文品名": "花瓶", "英文品名": "Vase", "商品编码": "6913105000", "材质": "Ceramic", "用途": "Decoration", "单价": 0.73, "综合税率": 0.175, "箱数": 70, "数量": 630, "毛重": 1353.15},
+    {"中文品名": "厨具收纳架", "英文品名": "Kitchen utensil storage rack", "商品编码": "3924104000", "材质": "ABS", "用途": "Kitchenware", "单价": 1.05, "综合税率": 0.134, "箱数": 157, "数量": 942, "毛重": 2665.9},
+    {"中文品名": "陶瓷杯", "英文品名": "Ceramic cup", "商品编码": "6912004810", "材质": "Ceramic", "用途": "HOME", "单价": 0.35, "综合税率": 0.198, "箱数": 55, "数量": 825, "毛重": 763.21},
+    {"中文品名": "笔筒", "英文品名": "Pen holder", "商品编码": "3926100000", "材质": "Plastic", "用途": "Office", "单价": 0.33, "综合税率": 0.153, "箱数": 93, "数量": 1209, "毛重": 1044.23},
+    {"中文品名": "塑料发夹", "英文品名": "Plastic hairpin", "商品编码": "9615115000", "材质": "Plastic", "用途": "Decoration", "单价": 0.32, "综合税率": 0.10, "箱数": 48, "数量": 1440, "毛重": 913.45},
+    {"中文品名": "塑料钥匙扣", "英文品名": "Plastic keychain", "商品编码": "3926909989", "材质": "Acrylic", "用途": "Decoration", "单价": 0.30, "综合税率": 0.153, "箱数": 45, "数量": 1350, "毛重": 1056.8},
+    {"中文品名": "玻璃杯", "英文品名": "Glass cup", "商品编码": "7013992000", "材质": "Glass", "用途": "HOME", "单价": 0.35, "综合税率": 0.225, "箱数": 55, "数量": 1100, "毛重": 1066.85},
+    {"中文品名": "窗帘", "英文品名": "Curtain", "商品编码": "6303922010", "材质": "Polyester", "用途": "HOME", "单价": 1.20, "综合税率": 0.288, "箱数": 57, "数量": 228, "毛重": 384.65},
+    {"中文品名": "键盘", "英文品名": "Keyboard", "商品编码": "8471602000", "材质": "ABS", "用途": "HOME", "单价": 2.90, "综合税率": 0.0, "箱数": 115, "数量": 1380, "毛重": 2465.7},
     {"中文品名": "花园围栏", "英文品名": "Garden fence", "商品编码": "3926400090", "材质": "Plastic", "用途": "HOME", "单价": 1.3},
     {"中文品名": "塑料罩", "英文品名": "Plastic cover", "商品编码": "3924901050", "材质": "Plastic", "用途": "HOME", "单价": 1},
     {"中文品名": "键鼠套装", "英文品名": "Keyboard and mouse set", "商品编码": "8471602000", "材质": "Plastic", "用途": "HOME", "单价": 2},
@@ -75,7 +100,6 @@ DEFAULT_REFERENCE_STYLE_ROWS = [
     {"中文品名": "花架", "英文品名": "Flower stand", "商品编码": "8306290000", "材质": "Iron", "用途": "HOME", "单价": 2},
     {"中文品名": "手机支架", "英文品名": "Phone holder", "商品编码": "3926100000", "材质": "Plastic", "用途": "HOME", "单价": 0.6},
     {"中文品名": "充气泵", "英文品名": "Inflatable pump", "商品编码": "8414904190", "材质": "Plastic/Iron", "用途": "HOME", "单价": 3},
-    {"中文品名": "键盘", "英文品名": "Keyboard", "商品编码": "8471602000", "材质": "Plastic", "用途": "HOME", "单价": 2},
     {"中文品名": "花园装饰", "英文品名": "Garden decoration", "商品编码": "8306290000", "材质": "Iron", "用途": "HOME", "单价": 1},
     {"中文品名": "戒尺", "英文品名": "Ruler", "商品编码": "9017800000", "材质": "Iron", "用途": "HOME", "单价": 0.7},
     {"中文品名": "卡扣", "英文品名": "Buckle", "商品编码": "8302426000", "材质": "Iron", "用途": "HOME", "单价": 0.5},
@@ -548,7 +572,7 @@ async def build_clearance(
             "candidate_groups": len(manifest_candidates),
             "qualified": len(qualified_manifest),
             "filtered": len(manifest_filtered),
-            "message": "已按客户清单 HS 归并池全量优先查询税率",
+            "message": "已按客户清单 HS 归并池全量优先查询税率；人工发票策略下单品税率不作 20% 硬过滤",
         }
     )
 
@@ -582,29 +606,31 @@ async def build_clearance(
             llm=llm_client,
         )
         manifest_filtered.extend(bill_filtered)
+        unique_bill_count = len(unique_bill_products(bill.products))
         flow.append(
             {
                 "stage": "bill_products",
-                "status": "ok" if len(bill_required) == len(bill.products) else "insufficient",
-                "bill_products": len(bill.products),
+                "status": "ok" if len(bill_required) == unique_bill_count else "insufficient",
+                "bill_products": unique_bill_count,
                 "qualified": len(bill_required),
                 "filtered": len(bill_filtered),
                 "message": "提单品类按 codeflagai 实际税率保留，不受 20% 税率上限限制；认证仍需校验",
             }
         )
-        if len(bill_required) < len(bill.products):
-            missing = [item.zh for item in bill_filtered if item.source == "bill"] or bill.products
+        if len(bill_required) < unique_bill_count:
+            missing = unique_bill_products([item.zh for item in bill_filtered if item.source == "bill"] or bill.products)
             raise RuntimeError(
-                "提单品类缺少合格税率候选，不能套用无关品名；"
-                f"请补充 HS 或调整品类: {', '.join(missing)}"
+                "提单品类 Codeflag 查询缺少合格归类结果，不能套用替换表品名；"
+                f"请补充提单 HS 或调整品名/材质: {', '.join(missing)}"
             )
 
+    bill_clean_replacement_pool = exclude_bill_product_replacements(replacement_pool, bill.products)
     selected = select_initial_candidates(qualified_manifest, bill_required, rules, options.target_item_count)
     replacement_filtered: list[ProductCandidate] = []
     replacement_used = 0
     if len(selected) < options.target_item_count:
         needed = options.target_item_count - len(selected)
-        replacements = sorted(replacement_pool, key=lambda item: selection_score(item, rules), reverse=True)
+        replacements = sorted(bill_clean_replacement_pool, key=lambda item: selection_score(item, rules), reverse=True)
         selected_keys = {candidate_identity(candidate) for candidate in selected}
         replacement_attempts = 0
         for replacement in replacements:
@@ -632,6 +658,7 @@ async def build_clearance(
                 [replacement],
                 rules,
                 query_cache=query_cache,
+                enforce_tax_limit=False,
             )
             replacement_filtered.extend(filtered)
             if not qualified:
@@ -674,13 +701,34 @@ async def build_clearance(
         query_cache,
     )
     selected = attach_price_evidence_to_candidates(selected, query_cache=query_cache)
+    replacement_repair_attempts = 0
+    await emit_progress(
+        progress_callback,
+        {
+            "stage": "manual_invoice_replacement_pool",
+            "status": "running",
+            "progress": 91,
+            "message": "正在按人工发票策略查询低税/免税替换候选",
+        },
+    )
+    replacement_repair_candidates, replacement_repair_filtered, replacement_repair_attempts = await qualify_manual_invoice_replacements(
+        crawler,
+        bill_clean_replacement_pool,
+        selected,
+        rules,
+        query_cache=query_cache,
+        progress_callback=progress_callback,
+        bill_products=bill.products,
+    )
+    replacement_filtered.extend(replacement_repair_filtered)
+    manual_invoice_pool = dedupe_candidates([*qualified_manifest, *replacement_repair_candidates])
     if price_repair_pool:
         await emit_progress(
             progress_callback,
             {
                 "stage": "price_fit_repair",
                 "status": "running",
-                "progress": 91,
+                "progress": 92,
                 "message": "正在准备客户清单备用候选，必要时按需搜索参考价",
                 "candidates": len(price_repair_pool),
             },
@@ -690,19 +738,19 @@ async def build_clearance(
             plausibility_ranges,
             query_cache=query_cache,
         )
-    selected, price_repair_summary = optimize_selected_candidates_for_price_fit(
+    selected, price_repair_summary = optimize_selected_candidates_for_manual_invoice(
         selected,
-        price_repair_pool,
+        manual_invoice_pool,
         manifest,
         bill,
         options,
-        query_cache=query_cache,
     )
+    price_repair_summary["replacement_attempts"] = replacement_repair_attempts
     draft_attempts = 0
     draft_feedback: list[str] = ["最终草案默认由规则优化器生成，LLM 不参与数值草案生成"]
     if price_repair_summary.get("swaps"):
         draft_feedback.append(
-            "已按参考价可行性从客户清单备用候选重排 "
+            "已按人工发票策略从低税/免税候选重排 "
             f"{price_repair_summary['swaps']} 行"
         )
     rows = build_output_rows(selected, manifest, bill, options)
@@ -756,6 +804,7 @@ async def build_clearance(
     )
 
     total_value = round(sum(to_float(row.get("总价")) or 0 for row in rows), 2)
+    final_replacement_rows = sum(1 for candidate in selected if candidate.source == "replacement")
     stats = {
         "profile_hint": options.requested_profile or "auto",
         "constraint_status": "passed",
@@ -780,11 +829,13 @@ async def build_clearance(
         "input_declared_value": manifest.total_declared_value,
         "total_value_usd": total_value,
         "plausibility_warnings": sum(1 for row in rows if clean_text(row.get("约束提示"))),
-        "bill_products": len(bill.products),
+        "bill_products": len(unique_bill_products(bill.products)),
         "qualified_manifest_candidates": len(qualified_manifest),
-        "replacement_candidates_used": replacement_used,
+        "replacement_candidates_used": final_replacement_rows,
+        "replacement_initial_fill_used": replacement_used,
+        "replacement_price_repair_attempts": replacement_repair_attempts,
         "manifest_origin_rows": sum(1 for row in rows if clean_text(row.get("来源")) == "manifest_group"),
-        "replacement_ratio": round(replacement_used / max(1, len(rows)), 4),
+        "replacement_ratio": round(final_replacement_rows / max(1, len(rows)), 4),
         "price_evidence_count": sum(1 for candidate in selected if candidate.price_evidence),
         "filtered_candidates": len(manifest_filtered) + len(replacement_filtered),
         "realism_status": "passed",
@@ -845,10 +896,11 @@ async def qualify_bill_product_candidates(
     query_cache: Optional[QueryCache] = None,
     llm: Optional[LLMClient] = None,
 ) -> tuple[list[ProductCandidate], list[ProductCandidate]]:
+    _ = replacement_candidates
     required: list[ProductCandidate] = []
     filtered: list[ProductCandidate] = []
     seen: set[tuple[str, str, str]] = set()
-    for product in bill.products:
+    for product in unique_bill_products(bill.products):
         bill_entry = bill_product_entry_for(bill, product)
         bill_material = infer_bill_material_from_entry(bill_entry) if bill_entry else ""
         rejected_matches = [
@@ -902,34 +954,6 @@ async def qualify_bill_product_candidates(
                 filtered.append(result)
             else:
                 match = result
-        if not match:
-            attempts = 0
-            for replacement in replacement_candidates:
-                if not candidate_matches_single_bill_product(replacement, product):
-                    continue
-                if attempts > 0:
-                    await asyncio.sleep(crawler.settings.delay)
-                attempts += 1
-                result = await qualify_single_candidate(
-                    crawler,
-                    replacement,
-                    rules,
-                    query_cache=query_cache,
-                    enforce_tax_limit=False,
-                )
-                if result.filter_reason:
-                    filtered.append(result)
-                    continue
-                if not candidate_has_product_tax_match(result):
-                    filtered.append(
-                        replace(
-                            result,
-                            filter_reason=f"提单品类候选未通过品名+材质查询确认，不能用于提单品类: {product}",
-                        )
-                    )
-                    continue
-                match = result
-                break
         if not match and llm is not None:
             terms = await generate_bill_product_query_terms(
                 llm,
@@ -970,7 +994,7 @@ async def qualify_bill_product_candidates(
                     hs="",
                     material="",
                     usage="",
-                    filter_reason=f"提单品类未在合格客户清单或常用替换清单中找到可匹配项: {product}",
+                    filter_reason=f"提单品类 Codeflag 查询未返回合格归类结果: {product}",
                 )
             )
             continue
@@ -981,6 +1005,18 @@ async def qualify_bill_product_candidates(
     if len(required) > options.target_item_count:
         raise RuntimeError(f"提单品类 {len(required)} 个超过目标输出行数 {options.target_item_count}")
     return required, filtered
+
+
+def unique_bill_products(products: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for product in products:
+        normalized = normalize_text(product)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(product)
+    return result
 
 
 async def qualify_bill_product_query_candidate(
@@ -1167,6 +1203,247 @@ def prepare_price_repair_candidates(
     return prepared
 
 
+def selected_price_fit_needs_repair(
+    selected: list[ProductCandidate],
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    options: ProcessingOptions,
+) -> bool:
+    try:
+        plans = build_plausible_row_plans(
+            selected=selected,
+            manifest=manifest,
+            bill=bill,
+            options=options,
+            plausibility_ranges={},
+        )
+    except RuntimeError:
+        return True
+    return any(plan_price_fit_is_bad(plan) for plan in plans)
+
+
+def plan_price_fit_is_bad(plan: RowPlan) -> bool:
+    if is_undetailed_bill_candidate(plan.candidate):
+        return False
+    ratio = row_plan_price_fit_ratio(plan)
+    if ratio is not None and ratio < PRICE_FIT_MIN_REFERENCE_RATIO:
+        return True
+    min_price = plan.plausibility.unit_price_min
+    return bool(min_price and min_price > 0 and plan.unit_price < min_price - 0.0001)
+
+
+def assert_selected_price_fit_resolved(
+    selected: list[ProductCandidate],
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    options: ProcessingOptions,
+    repair_summary: Optional[dict[str, Any]] = None,
+) -> None:
+    try:
+        plans = build_plausible_row_plans(
+            selected=selected,
+            manifest=manifest,
+            bill=bill,
+            options=options,
+            plausibility_ranges={},
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"价格可行性校验失败：无法生成合理重量/价格草案；{exc}") from exc
+
+    unresolved = [plan for plan in plans if plan_price_fit_is_bad(plan)]
+    if not unresolved:
+        return
+
+    floor_tax = estimate_price_floor_tax(plans)
+    tax_upper = target_tax_upper_bound(options.target_tax_amount)
+    details = "; ".join(price_fit_unresolved_detail(plan) for plan in unresolved[:5])
+    suffix = ""
+    if len(unresolved) > 5:
+        suffix = f"; 另有 {len(unresolved) - 5} 行未列出"
+    swaps = repair_summary.get("swaps") if repair_summary else 0
+    attempts = repair_summary.get("replacement_attempts") if repair_summary else None
+    attempt_text = f"，替换表已查询 {attempts} 个候选" if attempts is not None else ""
+    raise RuntimeError(
+        "优化无解：按公开电商零售价 * 30% 的申报参考范围，仍有 "
+        f"{len(unresolved)} 行必须压低单价才能满足目标税金。"
+        f"若按价格下限估算，最低税金约 {floor_tax} USD，目标上限 {tax_upper} USD；"
+        f"已替换 {swaps} 行{attempt_text}。冲突行：{details}{suffix}"
+    )
+
+
+def price_fit_unresolved_detail(plan: RowPlan) -> str:
+    floor = row_plan_price_floor(plan) or 0.0
+    ratio = row_plan_price_fit_ratio(plan)
+    ratio_text = f", ratio={round(ratio, 3)}" if ratio is not None else ""
+    return (
+        f"{plan.candidate.zh or plan.candidate.en}"
+        f" 单价 {round(plan.unit_price, 4)} < 下限 {round(floor, 4)}"
+        f"{ratio_text}"
+    )
+
+
+def estimate_price_floor_tax(plans: list[RowPlan]) -> float:
+    total = 0.0
+    for plan in plans:
+        rate = candidate_tax_rate(plan.candidate)
+        if rate <= 0:
+            continue
+        floor = row_plan_price_floor(plan)
+        unit_price = max(plan.unit_price, floor or 0.0)
+        total += unit_price * plan.qty * rate
+    return round(total, 2)
+
+
+def row_plan_price_floor(plan: RowPlan) -> Optional[float]:
+    if is_undetailed_bill_candidate(plan.candidate):
+        return None
+    floors: list[float] = []
+    min_price = plan.plausibility.unit_price_min
+    if min_price and min_price > 0:
+        floors.append(min_price)
+    if plan.price_reference and plan.price_reference > 0:
+        floors.append(plan.price_reference * PRICE_FIT_MIN_REFERENCE_RATIO)
+    if not floors:
+        return None
+    return max(floors)
+
+
+async def qualify_price_repair_replacements(
+    crawler: StrictTaxCrawler,
+    replacement_pool: list[ProductCandidate],
+    selected: list[ProductCandidate],
+    rules: SelectionRules,
+    *,
+    query_cache: Optional[QueryCache] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> tuple[list[ProductCandidate], list[ProductCandidate], int]:
+    selected_keys = {candidate_identity(candidate) for candidate in selected}
+    seeds = [
+        candidate
+        for candidate in sorted(replacement_pool, key=replacement_price_repair_seed_order)
+        if candidate_identity(candidate) not in selected_keys
+    ]
+    qualified: list[ProductCandidate] = []
+    filtered: list[ProductCandidate] = []
+    attempts = 0
+    for seed in seeds:
+        if attempts >= PRICE_REPAIR_REPLACEMENT_QUERY_LIMIT:
+            break
+        if len(qualified) >= PRICE_REPAIR_REPLACEMENT_POOL_SIZE:
+            break
+        if attempts > 0:
+            await asyncio.sleep(crawler.settings.delay)
+        attempts += 1
+        result, rejected = await qualify_candidates(
+            crawler,
+            [seed],
+            rules,
+            query_cache=query_cache,
+        )
+        filtered.extend(rejected)
+        for candidate in result:
+            key = candidate_identity(candidate)
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
+            qualified.append(candidate)
+        await emit_progress(
+            progress_callback,
+            {
+                "stage": "replacement_price_repair",
+                "status": "running",
+                "progress": round(91 + min(1.0, attempts / PRICE_REPAIR_REPLACEMENT_QUERY_LIMIT), 2),
+                "message": f"已查询替换表价格修复候选 {attempts}/{PRICE_REPAIR_REPLACEMENT_QUERY_LIMIT}",
+                "current": attempts,
+                "qualified": len(qualified),
+                "filtered": len(filtered),
+            },
+        )
+    return qualified, filtered, attempts
+
+
+def replacement_price_repair_seed_order(candidate: ProductCandidate) -> tuple[float, float, float]:
+    unit_price = candidate.unit_price if candidate.unit_price and candidate.unit_price > 0 else DEFAULT_UNIT_PRICE_MAX
+    weight = max(candidate.gross_weight or 0.0, candidate.real_weight or 0.0, 0.1)
+    qty = candidate.qty if candidate.qty and candidate.qty > 0 else 1.0
+    value_density = unit_price / max(weight / qty, DEFAULT_KG_PER_PC_MIN)
+    return (value_density, unit_price, -weight)
+
+
+async def qualify_manual_invoice_replacements(
+    crawler: StrictTaxCrawler,
+    replacement_pool: list[ProductCandidate],
+    selected: list[ProductCandidate],
+    rules: SelectionRules,
+    *,
+    query_cache: Optional[QueryCache] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+    bill_products: Optional[list[str]] = None,
+) -> tuple[list[ProductCandidate], list[ProductCandidate], int]:
+    selected_keys = {candidate_identity(candidate) for candidate in selected}
+    eligible_replacement_pool = exclude_bill_product_replacements(replacement_pool, bill_products or [])
+    stable_reference_candidates = [
+        candidate
+        for candidate in exclude_bill_product_replacements(load_default_reference_manual_candidates(), bill_products or [])
+        if candidate_identity(candidate) not in selected_keys
+    ]
+    for candidate in stable_reference_candidates:
+        selected_keys.add(candidate_identity(candidate))
+    seeds = [
+        candidate
+        for candidate in sorted(eligible_replacement_pool, key=manual_invoice_replacement_seed_order)
+        if candidate_identity(candidate) not in selected_keys
+    ]
+    qualified: list[ProductCandidate] = list(stable_reference_candidates)
+    filtered: list[ProductCandidate] = []
+    attempts = 0
+    for seed in seeds:
+        if attempts >= MANUAL_INVOICE_REPLACEMENT_QUERY_LIMIT:
+            break
+        if len(qualified) >= MANUAL_INVOICE_REPLACEMENT_POOL_SIZE:
+            break
+        if attempts > 0:
+            await asyncio.sleep(crawler.settings.delay)
+        attempts += 1
+        result, rejected = await qualify_candidates(
+            crawler,
+            [seed],
+            rules,
+            query_cache=query_cache,
+            enforce_tax_limit=False,
+        )
+        filtered.extend(rejected)
+        for candidate in result:
+            key = candidate_identity(candidate)
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
+            qualified.append(candidate)
+        await emit_progress(
+            progress_callback,
+            {
+                "stage": "manual_invoice_replacement_pool",
+                "status": "running",
+                "progress": round(91 + min(1.0, attempts / MANUAL_INVOICE_REPLACEMENT_QUERY_LIMIT), 2),
+                "message": f"已查询人工发票替换候选 {attempts}/{MANUAL_INVOICE_REPLACEMENT_QUERY_LIMIT}",
+                "current": attempts,
+                "qualified": len(qualified),
+                "filtered": len(filtered),
+            },
+        )
+    return qualified, filtered, attempts
+
+
+def manual_invoice_replacement_seed_order(candidate: ProductCandidate) -> tuple[float, float, float]:
+    unit_price = candidate.unit_price if candidate.unit_price and candidate.unit_price > 0 else DEFAULT_UNIT_PRICE_MAX
+    weight = max(candidate.gross_weight or 0.0, candidate.real_weight or 0.0, 0.1)
+    ctns = max(candidate.ctns or 0.0, 1.0)
+    kg_per_ctn = weight / ctns
+    anchor_rank = 0 if normalize_hs(candidate.hs) in MANUAL_INVOICE_ANCHOR_HS else 1
+    default_rank = 0 if candidate.source_label == "DEFAULT_REFERENCE_STYLE_ROWS" else 1
+    return (anchor_rank, default_rank, unit_price, -kg_per_ctn, -weight)
+
+
 def attach_deterministic_plausibility_range(
     candidate: ProductCandidate,
     known_ranges: dict[tuple[str, str, str], PlausibilityRange],
@@ -1182,6 +1459,20 @@ def attach_deterministic_plausibility_range(
 
 def candidate_matches_single_bill_product(candidate: ProductCandidate, product: str) -> bool:
     return row_matches_single_bill_product({"中文品名": candidate.zh, "英文品名": candidate.en}, product)
+
+
+def exclude_bill_product_replacements(
+    replacement_candidates: list[ProductCandidate],
+    bill_products: list[str],
+) -> list[ProductCandidate]:
+    products = unique_bill_products(bill_products)
+    if not products:
+        return list(replacement_candidates)
+    return [
+        candidate
+        for candidate in replacement_candidates
+        if not any(candidate_matches_single_bill_product(candidate, product) for product in products)
+    ]
 
 
 def candidate_has_product_tax_match(candidate: ProductCandidate) -> bool:
@@ -2309,6 +2600,7 @@ def load_replacement_candidates(path: Path = REPLACEMENT_WORKBOOK_PATH) -> list[
         candidates.extend(load_common_sheet_candidates(workbook["常用1"]))
     if "20260330" in workbook.sheetnames:
         candidates.extend(load_20260330_candidates(workbook["20260330"]))
+    candidates.extend(load_default_reference_replacement_candidates())
     return dedupe_candidates(candidates)
 
 
@@ -2516,6 +2808,98 @@ def load_20260330_candidates(sheet) -> list[ProductCandidate]:
     return candidates
 
 
+def load_default_reference_replacement_candidates() -> list[ProductCandidate]:
+    candidates: list[ProductCandidate] = []
+    for row in DEFAULT_REFERENCE_STYLE_ROWS:
+        zh = clean_text(row.get("中文品名"))
+        en = clean_text(row.get("英文品名")) or zh
+        hs = normalize_hs(row.get("商品编码"))
+        if not zh or not hs:
+            continue
+        unit_price = to_float(row.get("单价")) or 1.0
+        ctns = to_float(row.get("箱数")) or 80.0
+        qty = to_float(row.get("数量")) or max(1.0, ctns * 10.0)
+        gross_weight = to_float(row.get("毛重")) or max(1.0, ctns * 15.0)
+        tax_rate = to_float(row.get("综合税率"))
+        plausibility = derive_reference_style_plausibility_range(
+            unit_price=unit_price,
+            ctns=ctns,
+            qty=qty,
+            gross_weight=gross_weight,
+            source="DEFAULT_REFERENCE_STYLE_ROWS 人工发票参考范围",
+        )
+        candidates.append(
+            ProductCandidate(
+                source="replacement",
+                source_label="DEFAULT_REFERENCE_STYLE_ROWS",
+                zh=zh,
+                en=en,
+                hs=hs,
+                material=clean_text(row.get("材质")) or "Plastic",
+                usage=clean_text(row.get("用途")) or "HOME",
+                ctns=ctns,
+                qty=qty,
+                unit_price=unit_price,
+                declared_value=round(unit_price * qty, 2),
+                real_weight=gross_weight,
+                gross_weight=gross_weight,
+                tax_data=reference_tax_data(hs, tax_rate) if tax_rate is not None else {},
+                base_tax_rate=max(0.0, tax_rate or 0.0) if tax_rate is not None else 0.0,
+                effective_tax_rate=max(0.0, tax_rate or 0.0) if tax_rate is not None else 0.0,
+                tax_match_source="manual_reference" if tax_rate is not None else "",
+                plausibility_range=plausibility,
+                plausibility_confidence=0.85,
+                plausibility_basis=plausibility.source,
+            )
+        )
+    return candidates
+
+
+def load_default_reference_manual_candidates() -> list[ProductCandidate]:
+    return [
+        candidate
+        for candidate in load_default_reference_replacement_candidates()
+        if candidate.tax_match_source == "manual_reference"
+    ]
+
+
+def derive_reference_style_plausibility_range(
+    *,
+    unit_price: float,
+    ctns: float,
+    qty: float,
+    gross_weight: float,
+    source: str,
+) -> PlausibilityRange:
+    kg_per_ctn = gross_weight / ctns if gross_weight and ctns else DEFAULT_KG_PER_CTN_MAX / 2
+    kg_per_pc = gross_weight / qty if gross_weight and qty else DEFAULT_KG_PER_PC_MAX / 2
+    qty_per_ctn = qty / ctns if qty and ctns else 10.0
+    return PlausibilityRange(
+        kg_per_ctn_min=round(max(DEFAULT_KG_PER_CTN_MIN, kg_per_ctn * 0.55), 4),
+        kg_per_ctn_max=round(max(DEFAULT_KG_PER_CTN_MIN, kg_per_ctn * 1.8), 4),
+        kg_per_pc_min=round(max(DEFAULT_KG_PER_PC_MIN, kg_per_pc * 0.35), 6),
+        kg_per_pc_max=round(max(DEFAULT_KG_PER_PC_MIN, kg_per_pc * 2.8), 6),
+        unit_price_min=round(max(DEFAULT_UNIT_PRICE_MIN, unit_price * 0.35), 4),
+        unit_price_max=round(max(DEFAULT_UNIT_PRICE_MIN, unit_price * 1.8), 4),
+        qty_per_ctn_min=round(max(1.0, qty_per_ctn * 0.35), 4),
+        qty_per_ctn_max=round(max(1.0, qty_per_ctn * 2.4), 4),
+        source=source,
+    )
+
+
+def reference_tax_data(hs: str, tax_rate: Optional[float]) -> dict[str, Any]:
+    normalized = normalize_hs(hs)
+    rate = max(0.0, tax_rate or 0.0)
+    return {
+        "hs_code_us": normalized,
+        "tax_rate": "Free" if rate <= 0 else format_rate(rate),
+        "additional_tax_rate": "",
+        "description_cn": "人工发票参考行税率",
+        "certification_texts": [],
+        "anti_dumping": False,
+    }
+
+
 def parse_range_mid(value: Any) -> Optional[float]:
     direct = to_float(value)
     if direct is not None:
@@ -2603,7 +2987,7 @@ def build_output_rows(
             "币制": "USD",
             "单价": plan.unit_price,
             "总价": plan.total_value,
-            "净重": round(max(0.01, plan.gross_weight * 0.92), 2),
+            "净重": round(max(0.01, plan.gross_weight - plan.ctns), 2),
             "毛重": plan.gross_weight,
             "原产国": "CN",
             "来源": candidate.source,
@@ -2776,7 +3160,7 @@ def normalize_llm_output_draft(payload: dict[str, Any], selected: list[ProductCa
             "币制": "USD",
             "单价": unit_price,
             "总价": total_value,
-            "净重": round(max(0.01, gross_weight * 0.92), 2),
+            "净重": round(max(0.01, gross_weight - ctns_int), 2),
             "毛重": gross_weight,
             "原产国": "CN",
             "来源": candidate.source,
@@ -2827,7 +3211,6 @@ def validate_llm_output_rows(
     reconcile_row_quantities_to_cartons(rows, selected)
     close_llm_rows_gross_weight(rows, manifest.total_real_weight)
     close_llm_rows_tax_gap(rows, selected, options.target_tax_amount)
-    validate_candidate_tax_rates(selected)
     validate_qty_ctn_relationship(rows)
     validate_row_counts(rows, bill.cartons)
     tax_total = round(sum((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0) for row in rows), 2)
@@ -2839,7 +3222,6 @@ def validate_llm_output_rows(
             f"目标 {options.target_tax_amount}, 最高 {tax_upper_bound}, 当前 {tax_total}, "
             f"可行税金区间约 {feasible[0]}-{feasible[1]}"
         )
-    validate_minimum_row_tax(rows)
     validate_row_plausibility(rows, selected, bill.products)
     validate_distribution_realism(rows)
     normalize_output_language_fields(rows)
@@ -2925,7 +3307,7 @@ def close_llm_rows_gross_weight(rows: list[dict[str, Any]], target_gross: float)
         ctns = to_float(row.get("箱数")) or 1
         row["LLM草案毛重"] = row.get("LLM草案毛重", old_gross)
         row["毛重"] = gross
-        row["净重"] = round(max(0.01, gross * 0.92), 2)
+        row["净重"] = round(max(0.01, gross - ctns), 2)
         row["单件重量"] = round(gross / qty, 6) if qty else 0
         row["单箱重量"] = round(gross / ctns, 6) if ctns else 0
         row["毛重闭合调整"] = round(gross - old_gross, 2)
@@ -2935,6 +3317,11 @@ def close_llm_rows_gross_weight(rows: list[dict[str, Any]], target_gross: float)
 
 
 def close_llm_rows_tax_gap(rows: list[dict[str, Any]], selected: list[ProductCandidate], target_tax_amount: float) -> None:
+    current_tax = round(sum((to_float(row.get("总价")) or 0.0) * candidate_tax_rate(candidate) for row, candidate in zip(rows, selected)), 2)
+    if current_tax <= target_tax_upper_bound(target_tax_amount) + 0.01:
+        for row in rows:
+            update_row_tax_display(row)
+        return
     unit_prices: list[float] = []
     quantities: list[int] = []
     mins: list[float] = []
@@ -2950,8 +3337,7 @@ def close_llm_rows_tax_gap(rows: list[dict[str, Any]], selected: list[ProductCan
         mins.append(max(0.0001, min_price))
         maxes.append(max(mins[-1], max_price))
 
-    enforce_minimum_row_tax(unit_prices, mins, maxes, selected, quantities, MIN_ROW_TAX_AMOUNT_USD)
-    adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount, MIN_ROW_TAX_AMOUNT_USD)
+    adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount, 0.0)
     relax_price_floors_if_tax_requires(
         unit_prices,
         mins,
@@ -2959,7 +3345,7 @@ def close_llm_rows_tax_gap(rows: list[dict[str, Any]], selected: list[ProductCan
         selected,
         quantities,
         target_tax_amount,
-        MIN_ROW_TAX_AMOUNT_USD,
+        0.0,
     )
 
     for row, unit_price, qty in zip(rows, unit_prices, quantities):
@@ -3256,6 +3642,142 @@ def optimize_selected_candidates_for_price_fit(
     }
 
 
+def optimize_selected_candidates_for_manual_invoice(
+    selected: list[ProductCandidate],
+    candidate_pool: list[ProductCandidate],
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    options: ProcessingOptions,
+) -> tuple[list[ProductCandidate], dict[str, Any]]:
+    required = [candidate for candidate in selected if is_undetailed_bill_candidate(candidate)]
+    required_keys = {candidate_identity(candidate) for candidate in required}
+    pool = dedupe_candidates([*required, *candidate_pool, *selected])
+    optional = [candidate for candidate in pool if candidate_identity(candidate) not in required_keys]
+    ranked_optional = sorted(optional, key=manual_invoice_candidate_order)
+    if len(required) > options.target_item_count:
+        return selected, {"swaps": 0, "message": "required bill candidates exceed target"}
+
+    target_optional_count = options.target_item_count - len(required)
+    best_selected = list(selected)
+    best_score = float("inf")
+    best_plans: list[RowPlan] = []
+    evaluated = 0
+    search_pool = manual_invoice_search_pool(ranked_optional, target_optional_count)
+
+    for optional_group in itertools.combinations(search_pool, target_optional_count):
+        if evaluated >= 5000:
+            break
+        trial = [*required, *optional_group]
+        if not manual_invoice_trial_allowed(trial):
+            continue
+        try:
+            plans = build_plausible_row_plans(
+                selected=trial,
+                manifest=manifest,
+                bill=bill,
+                options=options,
+                plausibility_ranges={},
+            )
+        except RuntimeError:
+            continue
+        evaluated += 1
+        score = manual_invoice_plan_score(plans, options)
+        if score < best_score:
+            best_score = score
+            best_selected = trial
+            best_plans = plans
+
+    initial_keys = {candidate_identity(candidate) for candidate in selected}
+    final_keys = {candidate_identity(candidate) for candidate in best_selected}
+    swaps = len([key for key in final_keys if key not in initial_keys])
+    estimated_tax = round(sum(plan.total_value * candidate_tax_rate(plan.candidate) for plan in best_plans), 2) if best_plans else None
+    zero_tax_rows = sum(1 for candidate in best_selected if candidate_tax_rate(candidate) <= 0)
+    return best_selected, {
+        "swaps": swaps,
+        "strategy": "manual_invoice",
+        "evaluated": evaluated,
+        "score": round(best_score, 2) if best_score != float("inf") else None,
+        "estimated_tax": estimated_tax,
+        "zero_tax_rows": zero_tax_rows,
+        "pool_size": len(candidate_pool),
+        "search_pool_size": len(search_pool),
+    }
+
+
+def manual_invoice_search_pool(candidates: list[ProductCandidate], target_optional_count: int) -> list[ProductCandidate]:
+    manual_refs = [candidate for candidate in candidates if candidate.source_label == "DEFAULT_REFERENCE_STYLE_ROWS"]
+    anchors = [candidate for candidate in candidates if normalize_hs(candidate.hs) in MANUAL_INVOICE_ANCHOR_HS]
+    low_tax = [candidate for candidate in candidates if candidate_tax_rate(candidate) <= 0.153]
+    high_score = candidates[: max(target_optional_count * 2, 18)]
+    return dedupe_candidates([*manual_refs[:18], *anchors[:14], *low_tax[:18], *high_score])[:32]
+
+
+def manual_invoice_trial_allowed(candidates: list[ProductCandidate]) -> bool:
+    names = [normalize_text(candidate.zh or candidate.en) for candidate in candidates]
+    if duplicate_count(names):
+        return False
+    anchor_hs_counts: dict[str, int] = {}
+    for candidate in candidates:
+        hs = normalize_hs(candidate.hs)
+        if hs not in MANUAL_INVOICE_ANCHOR_HS:
+            continue
+        anchor_hs_counts[hs] = anchor_hs_counts.get(hs, 0) + 1
+    return all(count <= 1 for count in anchor_hs_counts.values())
+
+
+def manual_invoice_candidate_order(candidate: ProductCandidate) -> tuple[int, float, float, float, float]:
+    rate = candidate_tax_rate(candidate)
+    source_rank = 0 if candidate.source == "manifest_group" else 1
+    if candidate.source_label == "DEFAULT_REFERENCE_STYLE_ROWS":
+        source_rank -= 3
+    if normalize_hs(candidate.hs) in MANUAL_INVOICE_ANCHOR_HS:
+        source_rank -= 2
+    if rate <= 0:
+        source_rank -= 2
+    weight = max(candidate.gross_weight or candidate.real_weight or 0.0, 0.1)
+    ctns = max(candidate.ctns or 0.0, 1.0)
+    kg_per_ctn = weight / ctns
+    return (source_rank, rate, -(candidate.declared_value or 0.0), -kg_per_ctn, -candidate.score)
+
+
+def manual_invoice_plan_score(plans: list[RowPlan], options: ProcessingOptions) -> float:
+    tax_total = sum(plan.total_value * candidate_tax_rate(plan.candidate) for plan in plans)
+    tax_upper = target_tax_upper_bound(options.target_tax_amount)
+    score = 0.0
+    if tax_total > tax_upper:
+        score += (tax_total - tax_upper) * 10000.0
+    else:
+        score += max(0.0, options.target_tax_amount - tax_total) * 0.5
+    zero_value = sum(plan.total_value for plan in plans if candidate_tax_rate(plan.candidate) <= 0)
+    total_value = sum(plan.total_value for plan in plans) or 1.0
+    zero_tax_rows = sum(1 for plan in plans if candidate_tax_rate(plan.candidate) <= 0)
+    anchor_rows = sum(1 for plan in plans if normalize_hs(plan.candidate.hs) in MANUAL_INVOICE_ANCHOR_HS)
+    manual_reference_rows = sum(1 for plan in plans if plan.candidate.source_label == "DEFAULT_REFERENCE_STYLE_ROWS")
+    duplicate_hs_penalty = duplicate_count(normalize_hs(plan.candidate.hs) for plan in plans)
+    duplicate_name_penalty = duplicate_count(normalize_text(plan.candidate.zh or plan.candidate.en) for plan in plans)
+    score -= min(0.75, zero_value / total_value) * 900.0
+    score -= zero_tax_rows * 120.0
+    score -= anchor_rows * 35.0
+    score -= manual_reference_rows * 45.0
+    score += duplicate_hs_penalty * 220.0
+    score += duplicate_name_penalty * 280.0
+    replacement_count = sum(1 for plan in plans if plan.candidate.source == "replacement")
+    score += replacement_count * 8.0
+    warning_count = sum(len(plan.warnings) for plan in plans)
+    score += warning_count * 1.5
+    return round(score, 4)
+
+
+def duplicate_count(values: Any) -> int:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = clean_text(value)
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return sum(max(0, count - 1) for count in counts.values())
+
+
 def price_repair_candidate_order(candidate: ProductCandidate) -> tuple[float, float, float]:
     rate = candidate_tax_rate(candidate)
     reference_price = candidate_reference_unit_price(candidate)
@@ -3276,7 +3798,9 @@ def price_fit_score_for_plans(plans: list[RowPlan]) -> float:
             score += ((PRICE_FIT_MIN_REFERENCE_RATIO / ratio) - 1.0) * max(1.0, row_tax)
         min_price = plan.plausibility.unit_price_min
         if min_price and min_price > 0 and plan.unit_price < min_price:
-            score += ((min_price - plan.unit_price) / min_price) * 250.0
+            row_tax = plan.total_value * candidate_tax_rate(plan.candidate)
+            severity = (min_price / max(plan.unit_price, 0.0001)) - 1.0
+            score += severity * max(1000.0, row_tax * 10.0)
     return round(score, 4)
 
 
@@ -3638,8 +4162,7 @@ def allocate_plausible_prices(
             desired = candidate.unit_price or min_price
         unit_prices.append(min(max(desired, 0.0001), max_price))
 
-    enforce_minimum_row_tax(unit_prices, mins, maxes, selected, quantities, MIN_ROW_TAX_AMOUNT_USD)
-    adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount, MIN_ROW_TAX_AMOUNT_USD)
+    adjust_price_gap(unit_prices, mins, maxes, selected, quantities, target_tax_amount, 0.0)
     relax_price_floors_if_tax_requires(
         unit_prices,
         mins,
@@ -3647,7 +4170,7 @@ def allocate_plausible_prices(
         selected,
         quantities,
         target_tax_amount,
-        MIN_ROW_TAX_AMOUNT_USD,
+        0.0,
     )
     prices: list[tuple[float, float]] = []
     for unit_price, qty in zip(unit_prices, quantities):
@@ -3677,6 +4200,9 @@ def relax_price_floors_if_tax_requires(
     tax_upper_bound = target_tax_upper_bound(target_tax_amount)
     current_tax = estimate_tax_for_unit_prices(unit_prices, selected, quantities)
     if current_tax <= tax_upper_bound + 0.01:
+        return
+    if min_row_tax_amount <= 0:
+        adjust_price_gap(unit_prices, [0.0001 for _ in mins], maxes, selected, quantities, target_tax_amount, 0.0)
         return
     relaxed_mins = relaxed_price_mins_for_tax_floor(selected, quantities, mins, min_row_tax_amount)
     minimum_tax = estimate_tax_for_unit_prices(relaxed_mins, selected, quantities)
@@ -3725,9 +4251,9 @@ def adjust_price_gap(
     min_row_tax_amount: float = 0.0,
 ) -> None:
     current_tax = sum(price * qty * candidate_tax_rate(candidate) for price, qty, candidate in zip(unit_prices, quantities, selected))
-    diff = target_tax_amount - current_tax
-    if current_tax <= target_tax_upper_bound(target_tax_amount) and abs(diff) <= TAX_FINAL_TOLERANCE_USD:
+    if current_tax <= target_tax_upper_bound(target_tax_amount):
         return
+    diff = target_tax_amount - current_tax
     if diff > 0:
         order = sorted(range(len(unit_prices)), key=lambda idx: (maxes[idx] - unit_prices[idx]) * quantities[idx] * candidate_tax_rate(selected[idx]), reverse=True)
         for idx in order:

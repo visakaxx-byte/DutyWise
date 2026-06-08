@@ -12,6 +12,7 @@ from typing import Any
 
 
 DEFAULT_DECLARATION_RATIO = 0.3
+PRICE_SEARCH_CACHE_VERSION = "search-v2"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
@@ -152,6 +153,7 @@ def filter_price_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def parse_pack_qty(text: str) -> int:
     normalized = text.lower().replace(",", "")
     patterns = (
+        r"(\d{1,5})\s*[- ]\s*(?:pack|packs|pk)\b",
         r"(\d{1,5})\s*(?:pcs|pieces|piece|count|ct|pack|packs|pk)\b",
         r"(?:pack of|set of|lot of)\s*(\d{1,5})\b",
         r"(\d{1,5})\s*[- ]?(?:piece|pc)\s*(?:set|pack)",
@@ -178,6 +180,10 @@ def trim_outliers(values: list[float]) -> list[float]:
 def fetch_search_pages(query: str, *, timeout: float, max_pages: int) -> list[str]:
     encoded = urllib.parse.quote_plus(query)
     urls = [
+        f"https://search.aol.com/aol/search?q={encoded}",
+        f"https://search.brave.com/search?q={encoded}",
+        f"https://www.mojeek.com/search?q={encoded}",
+        f"https://search.yahoo.com/search?p={encoded}",
         f"https://www.google.com/search?q={encoded}",
         f"https://www.bing.com/search?q={encoded}",
         f"https://duckduckgo.com/html/?q={encoded}",
@@ -200,7 +206,8 @@ def fetch_search_pages(query: str, *, timeout: float, max_pages: int) -> list[st
 def price_cache_path(query: str, cache_dir: str | Path | None) -> Path | None:
     if cache_dir is None:
         return None
-    digest = hashlib.sha256(query.encode("utf-8", errors="ignore")).hexdigest()
+    cache_key = f"{PRICE_SEARCH_CACHE_VERSION}\n{query}"
+    digest = hashlib.sha256(cache_key.encode("utf-8", errors="ignore")).hexdigest()
     return Path(cache_dir) / f"{digest}.json"
 
 
