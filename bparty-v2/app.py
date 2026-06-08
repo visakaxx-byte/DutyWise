@@ -634,6 +634,53 @@ def update_task(task_id: str, **updates) -> dict:
     return record
 
 
+def add_task_feedback(task_id: str, payload: dict, current_user: dict) -> dict:
+    safe_task_id = Path(task_id).name
+    record = read_json(task_path(safe_task_id))
+    ensure_task_access(record, current_user)
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="反馈内容不能为空")
+    if len(content) > 2000:
+        raise HTTPException(status_code=400, detail="反馈内容不能超过 2000 字")
+    feedback_type = str(payload.get("feedback_type") or "other").strip() or "other"
+    allowed_types = {"price", "hs", "quantity_weight", "category", "result", "other"}
+    if feedback_type not in allowed_types:
+        feedback_type = "other"
+    scope = str(payload.get("scope") or "task").strip() or "task"
+    if scope not in {"task", "row"}:
+        scope = "task"
+    row_index = payload.get("row_index")
+    if row_index in ("", None):
+        row_index = None
+    else:
+        try:
+            row_index = max(1, int(row_index))
+        except (TypeError, ValueError):
+            row_index = None
+    entry = {
+        "feedback_id": uuid.uuid4().hex[:12],
+        "task_id": safe_task_id,
+        "created_at": now_iso(),
+        "user_id": current_user["user_id"],
+        "user_display_name": current_user.get("display_name") or current_user["user_id"],
+        "feedback_type": feedback_type,
+        "scope": scope,
+        "row_index": row_index,
+        "row_label": str(payload.get("row_label") or "").strip()[:200],
+        "content": content,
+    }
+    feedbacks = record.get("feedbacks")
+    if not isinstance(feedbacks, list):
+        feedbacks = []
+    feedbacks.append(entry)
+    record["feedbacks"] = feedbacks
+    record["feedback_count"] = len(feedbacks)
+    record["updated_at"] = now_iso()
+    write_json(task_path(safe_task_id), record)
+    return record
+
+
 def list_task_records(statuses: set[str] | None = None) -> list[dict]:
     records: list[dict] = []
     for path in TASK_DIR.glob("*.json"):
@@ -1159,6 +1206,16 @@ async def get_job(task_id: str, current_user: dict = Depends(get_current_user)):
     record = read_json(task_path(task_id))
     ensure_task_access(record, current_user)
     return JSONResponse({"code": 200, "message": "ok", "data": public_task_record(record)})
+
+
+@app.post("/api/jobs/{task_id}/feedback")
+async def submit_job_feedback(
+    task_id: str,
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    record = add_task_feedback(task_id, payload, current_user)
+    return JSONResponse({"code": 200, "message": "反馈已记录", "data": public_task_record(record)})
 
 
 @app.get("/api/task-files/{task_id}/{kind}")

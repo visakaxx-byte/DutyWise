@@ -41,6 +41,17 @@
   const closePermissionButton = document.querySelector("#closePermissionButton");
   const permissionMessage = document.querySelector("#permissionMessage");
   const permissionList = document.querySelector("#permissionList");
+  const feedbackModal = document.querySelector("#feedbackModal");
+  const feedbackForm = document.querySelector("#feedbackForm");
+  const closeFeedbackButton = document.querySelector("#closeFeedbackButton");
+  const feedbackTaskLabel = document.querySelector("#feedbackTaskLabel");
+  const feedbackType = document.querySelector("#feedbackType");
+  const feedbackScope = document.querySelector("#feedbackScope");
+  const feedbackRowIndex = document.querySelector("#feedbackRowIndex");
+  const feedbackRowLabel = document.querySelector("#feedbackRowLabel");
+  const feedbackContent = document.querySelector("#feedbackContent");
+  const feedbackMessage = document.querySelector("#feedbackMessage");
+  const submitFeedbackButton = document.querySelector("#submitFeedbackButton");
 
   let pollTimer = null;
   let authToken = window.localStorage ? window.localStorage.getItem(AUTH_STORAGE_KEY) || "" : "";
@@ -54,6 +65,7 @@
   let previewLoadingTaskIds = new Set();
   let previewErrorByTaskId = new Map();
   let completedJobs = new Map();
+  let feedbackTaskId = "";
   let lastQueueJobs = [];
   let queueMeta = {
     max_concurrency: 5,
@@ -402,6 +414,10 @@
     const isDeleting = Boolean(job.task_id && deletingResultTaskIds.has(job.task_id));
     const hasPreview = status === "succeeded" && Boolean(job.task_id);
     const previewOpen = Boolean(job.task_id && previewTaskIds.has(job.task_id));
+    const feedbackCount = Number(job.feedback_count || (Array.isArray(job.feedbacks) ? job.feedbacks.length : 0)) || 0;
+    const feedbackBadge = feedbackCount
+      ? `<span class="feedback-count" title="已记录 ${escapeHtml(feedbackCount)} 条反馈">${escapeHtml(feedbackCount)} 条反馈</span>`
+      : "";
     const previewButton = hasPreview
       ? `
         <button
@@ -413,6 +429,19 @@
           aria-controls="preview-${escapeHtml(job.task_id)}"
         >
           ${previewOpen ? "取消预览" : "预览结果"}
+        </button>
+      `
+      : "";
+    const feedbackButton = job.task_id
+      ? `
+        <button
+          type="button"
+          class="feedback-button"
+          data-action="open-feedback"
+          data-task-id="${escapeHtml(job.task_id)}"
+          aria-label="记录任务 ${escapeHtml(taskLabel)} 的反馈"
+        >
+          反馈
         </button>
       `
       : "";
@@ -454,6 +483,8 @@
             <p class="result-message">${escapeHtml(message || "暂无状态说明")}</p>
           </div>
           <div class="result-actions">
+            ${feedbackBadge}
+            ${feedbackButton}
             ${previewButton}
             ${download}
             ${sourceFileLinks}
@@ -622,6 +653,14 @@
     return fetchJson(`${JOB_ENDPOINT}/${encodeURIComponent(taskID)}`);
   }
 
+  async function submitTaskFeedback(taskID, payload) {
+    return fetchJson(`${JOB_ENDPOINT}/${encodeURIComponent(taskID)}/feedback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
   async function login(username, password) {
     loginButton.disabled = true;
     loginMessage.textContent = "正在登录...";
@@ -757,6 +796,70 @@
   function closePermissionModal() {
     permissionModal.classList.add("hidden");
     body.classList.remove("modal-open");
+  }
+
+  function openFeedbackModal(taskID) {
+    const job = completedJobs.get(taskID);
+    feedbackTaskId = taskID || "";
+    feedbackForm.reset();
+    feedbackType.value = "price";
+    feedbackScope.value = "task";
+    feedbackMessage.textContent = "";
+    feedbackMessage.className = "feedback-message";
+    feedbackTaskLabel.textContent = job
+      ? `任务 ${displayTaskNo(job)} · ${statusText[job.status] || job.status || "未知状态"}`
+      : `任务 ${taskID}`;
+    feedbackModal.classList.remove("hidden");
+    body.classList.add("modal-open");
+    feedbackContent.focus();
+  }
+
+  function closeFeedbackModal() {
+    feedbackTaskId = "";
+    feedbackModal.classList.add("hidden");
+    body.classList.remove("modal-open");
+    feedbackForm.reset();
+    feedbackMessage.textContent = "";
+    feedbackMessage.className = "feedback-message";
+  }
+
+  async function handleFeedbackSubmit(event) {
+    event.preventDefault();
+    if (!feedbackTaskId) return;
+    const content = String(feedbackContent.value || "").trim();
+    if (!content) {
+      feedbackMessage.textContent = "反馈内容不能为空。";
+      feedbackMessage.className = "feedback-message error";
+      feedbackContent.focus();
+      return;
+    }
+    submitFeedbackButton.disabled = true;
+    feedbackMessage.textContent = "正在记录反馈...";
+    feedbackMessage.className = "feedback-message";
+    try {
+      const updatedJob = await submitTaskFeedback(feedbackTaskId, {
+        feedback_type: feedbackType.value,
+        scope: feedbackScope.value,
+        row_index: feedbackRowIndex.value,
+        row_label: feedbackRowLabel.value,
+        content,
+      });
+      if (updatedJob && updatedJob.task_id) {
+        completedJobs.set(updatedJob.task_id, updatedJob);
+      }
+      feedbackMessage.textContent = "反馈已记录。";
+      feedbackMessage.className = "feedback-message done";
+      setStatus("反馈已记录", "done");
+      renderResults();
+      window.setTimeout(() => {
+        closeFeedbackModal();
+      }, 450);
+    } catch (error) {
+      feedbackMessage.textContent = networkErrorMessage(error, "反馈提交失败");
+      feedbackMessage.className = "feedback-message error";
+    } finally {
+      submitFeedbackButton.disabled = false;
+    }
   }
 
   async function refreshAccounts(message = "") {
@@ -1084,6 +1187,9 @@
   closePermissionButton.addEventListener("click", () => {
     closePermissionModal();
   });
+  closeFeedbackButton.addEventListener("click", () => {
+    closeFeedbackModal();
+  });
   permissionModal.addEventListener("click", (event) => {
     if (event.target === permissionModal) {
       closePermissionModal();
@@ -1110,6 +1216,18 @@
       checkbox.disabled = false;
     });
   });
+  feedbackModal.addEventListener("click", (event) => {
+    if (event.target === feedbackModal) {
+      closeFeedbackModal();
+      return;
+    }
+    const target = event.target instanceof Element ? event.target : event.target.parentElement;
+    const cancelButton = target ? target.closest("[data-action='cancel-feedback']") : null;
+    if (cancelButton) {
+      closeFeedbackModal();
+    }
+  });
+  feedbackForm.addEventListener("submit", handleFeedbackSubmit);
   manifestInput.addEventListener("change", updateFileNames);
   billInput.addEventListener("change", updateFileNames);
   form.addEventListener("submit", submitForm);
@@ -1121,6 +1239,11 @@
   });
   resultList.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : event.target.parentElement;
+    const feedbackButton = target ? target.closest("[data-action='open-feedback']") : null;
+    if (feedbackButton) {
+      openFeedbackModal(feedbackButton.dataset.taskId);
+      return;
+    }
     const previewButton = target ? target.closest("[data-action='toggle-preview']") : null;
     if (previewButton) {
       const taskId = previewButton.dataset.taskId;

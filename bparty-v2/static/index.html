@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>BParty V2</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="./styles.css?v=modal-scroll-lock-20260522" />
+    <link rel="stylesheet" href="./styles.css?v=feedback-20260608" />
   </head>
   <body class="auth-loading">
     <section id="loginOverlay" class="login-overlay" aria-labelledby="login-title">
@@ -124,6 +124,56 @@
       </section>
     </div>
 
-    <script src="./app.js?v=modal-scroll-lock-20260522" defer></script>
+    <div id="feedbackModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="feedback-title">
+      <form id="feedbackForm" class="feedback-dialog" novalidate>
+        <div class="modal-head">
+          <div>
+            <p class="eyebrow">Feedback</p>
+            <h2 id="feedback-title">记录任务反馈</h2>
+          </div>
+          <button id="closeFeedbackButton" type="button" class="secondary compact">关闭</button>
+        </div>
+        <p id="feedbackTaskLabel" class="feedback-task-label">请选择任务</p>
+        <div class="feedback-grid">
+          <label class="field" for="feedbackType">
+            <span>反馈类型</span>
+            <select id="feedbackType" name="feedback_type">
+              <option value="price">价格问题</option>
+              <option value="hs">HS 问题</option>
+              <option value="quantity_weight">数量/重量问题</option>
+              <option value="category">品类问题</option>
+              <option value="result">整票结果问题</option>
+              <option value="other">其他</option>
+            </select>
+          </label>
+          <label class="field" for="feedbackScope">
+            <span>反馈对象</span>
+            <select id="feedbackScope" name="scope">
+              <option value="task">整票任务</option>
+              <option value="row">某一行</option>
+            </select>
+          </label>
+          <label class="field" for="feedbackRowIndex">
+            <span>行号</span>
+            <input id="feedbackRowIndex" name="row_index" type="number" min="1" step="1" placeholder="可选" />
+          </label>
+          <label class="field field-wide" for="feedbackRowLabel">
+            <span>行备注</span>
+            <input id="feedbackRowLabel" name="row_label" type="text" maxlength="200" placeholder="例如 Keyboard / 第 3 行 / 某个品类" />
+          </label>
+          <label class="field field-wide" for="feedbackContent">
+            <span>反馈内容</span>
+            <textarea id="feedbackContent" name="content" maxlength="2000" placeholder="请输入业务员看到的问题或建议" required></textarea>
+          </label>
+        </div>
+        <p id="feedbackMessage" class="feedback-message" role="status"></p>
+        <div class="modal-actions">
+          <button id="submitFeedbackButton" type="submit">提交反馈</button>
+          <button type="button" class="secondary" data-action="cancel-feedback">取消</button>
+        </div>
+      </form>
+    </div>
+
+    <script src="./app.js?v=feedback-20260608" defer></script>
   </body>
 </html>

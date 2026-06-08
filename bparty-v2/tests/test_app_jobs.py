@@ -372,6 +372,80 @@ class JobQueueTests(unittest.TestCase):
         payload = app_module.public_task_record(app_module.read_json(app_module.task_path("succeeded_download")))
         self.assertNotIn("source_files", payload)
 
+    def test_task_feedback_can_be_added_to_succeeded_or_failed_task(self) -> None:
+        app_module.update_task(
+            "feedback_done",
+            status="succeeded",
+            phase="done",
+            progress=100,
+            owner_user_id="user1",
+            display_task_no="PO-FB-1",
+            created_at="2026-05-18T09:00:00",
+        )
+        app_module.update_task(
+            "feedback_failed",
+            status="failed",
+            phase="failed",
+            progress=100,
+            owner_user_id="user1",
+            display_task_no="PO-FB-2",
+            created_at="2026-05-18T09:01:00",
+            error="boom",
+        )
+
+        with TestClient(app_module.app) as client:
+            done = client.post(
+                "/api/jobs/feedback_done/feedback",
+                headers=self.auth_headers("user1"),
+                json={
+                    "feedback_type": "price",
+                    "scope": "row",
+                    "row_index": 3,
+                    "row_label": "Keyboard",
+                    "content": "键盘单价偏低，后续要调整。",
+                },
+            )
+            failed = client.post(
+                "/api/jobs/feedback_failed/feedback",
+                headers=self.auth_headers("user1"),
+                json={"feedback_type": "result", "scope": "task", "content": "失败原因需要继续优化。"},
+            )
+
+        self.assertEqual(done.status_code, 200)
+        self.assertEqual(failed.status_code, 200)
+        done_payload = done.json()["data"]
+        self.assertEqual(done_payload["feedback_count"], 1)
+        self.assertEqual(done_payload["feedbacks"][0]["feedback_type"], "price")
+        self.assertEqual(done_payload["feedbacks"][0]["row_index"], 3)
+        failed_record = app_module.read_json(app_module.task_path("feedback_failed"))
+        self.assertEqual(failed_record["feedback_count"], 1)
+        self.assertEqual(failed_record["feedbacks"][0]["content"], "失败原因需要继续优化。")
+
+    def test_task_feedback_requires_access_and_content(self) -> None:
+        app_module.update_task(
+            "feedback_owned",
+            status="succeeded",
+            owner_user_id="user1",
+            created_at="2026-05-18T09:00:00",
+        )
+
+        with TestClient(app_module.app) as client:
+            empty = client.post(
+                "/api/jobs/feedback_owned/feedback",
+                headers=self.auth_headers("user1"),
+                json={"feedback_type": "other", "content": ""},
+            )
+            other_user = client.post(
+                "/api/jobs/feedback_owned/feedback",
+                headers=self.auth_headers("user2"),
+                json={"feedback_type": "other", "content": "看不到就不能反馈"},
+            )
+
+        self.assertEqual(empty.status_code, 400)
+        self.assertEqual(other_user.status_code, 404)
+        record = app_module.read_json(app_module.task_path("feedback_owned"))
+        self.assertNotIn("feedbacks", record)
+
     def test_delete_unfinished_record_is_rejected(self) -> None:
         app_module.update_task(
             "queued_record",
