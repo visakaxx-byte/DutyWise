@@ -965,6 +965,7 @@ async def run_clearance_job(task_id: str, task_record: dict) -> None:
                     error=str(exc),
                     completed_at=now_iso(),
                     completed_at_epoch=completed_at_epoch,
+                    query_cache=query_cache,
                 )
     finally:
         if is_task_cancelled(task_id):

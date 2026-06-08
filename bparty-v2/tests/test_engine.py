@@ -1437,6 +1437,44 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(crawler.hs_calls, [])
         self.assertIn("Codeflag", bill_filtered[-1].filter_reason)
 
+    async def test_bill_product_candidates_retry_without_material_when_material_query_fails(self) -> None:
+        bill = BillInfo(
+            filename="bill.pdf",
+            raw_text="",
+            products=["SILICONE COASTER"],
+            gross_weight=150,
+            cartons=30,
+            product_entries=[BillProduct(name="SILICONE COASTER", evidence="SILICONE COASTER")],
+        )
+
+        class MaterialSensitiveCrawler(RoutedFakeCrawler):
+            async def search_product(self, product_name: str, material: str = "") -> dict[str, dict]:
+                self.product_calls.append((product_name, material))
+                if material:
+                    return tax_result("Free", hs="3924905650", certifications=["FDA"])
+                return tax_result("5.3%", hs="3926400090")
+
+        crawler = MaterialSensitiveCrawler(product_results={})
+
+        bill_required, bill_filtered = await qualify_bill_product_candidates(
+            crawler,
+            bill,
+            [],
+            [],
+            SelectionRules(allowed_certifications=["Lacey Act", "TSCA"]),
+            ProcessingOptions(target_tax_amount=850, target_item_count=10),
+            query_cache={},
+        )
+
+        self.assertEqual([item.zh for item in bill_required], ["SILICONE COASTER"])
+        self.assertEqual(bill_required[0].hs, "3926400090")
+        self.assertEqual(bill_required[0].tax_match_source, "bill_product_no_material")
+        self.assertEqual(
+            crawler.product_calls,
+            [("SILICONE COASTER", "Silicone"), ("SILICONE COASTER", "")],
+        )
+        self.assertIn("fda", bill_filtered[0].filter_reason.lower())
+
     def test_replacement_pool_excludes_bill_product_names(self) -> None:
         pool = [
             ProductCandidate(

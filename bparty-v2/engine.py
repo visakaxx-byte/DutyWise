@@ -954,6 +954,23 @@ async def qualify_bill_product_candidates(
                 filtered.append(result)
             else:
                 match = result
+        if not match and bill_material:
+            result = await qualify_bill_product_query_candidate(
+                crawler,
+                bill,
+                product,
+                product,
+                "",
+                rules,
+                options,
+                query_cache=query_cache,
+                match_source="bill_product_no_material",
+                llm_reason=f"材质查询失败后改用空材质查询: {bill_material}",
+            )
+            if result.filter_reason:
+                filtered.append(result)
+            else:
+                match = result
         if not match and llm is not None:
             terms = await generate_bill_product_query_terms(
                 llm,
@@ -985,6 +1002,14 @@ async def qualify_bill_product_candidates(
                 match = result
                 break
         if not match:
+            recent_reasons = [
+                candidate.filter_reason
+                for candidate in filtered[-8:]
+                if candidate.source == "bill"
+                and normalize_bill_product_text(candidate.zh) == normalize_bill_product_text(product)
+                and candidate.filter_reason
+            ]
+            reason_detail = "；".join(recent_reasons[-3:])
             filtered.append(
                 ProductCandidate(
                     source="bill",
@@ -994,7 +1019,10 @@ async def qualify_bill_product_candidates(
                     hs="",
                     material="",
                     usage="",
-                    filter_reason=f"提单品类 Codeflag 查询未返回合格归类结果: {product}",
+                    filter_reason=(
+                        f"提单品类 Codeflag 查询未返回合格归类结果: {product}"
+                        + (f"；最近失败原因: {reason_detail}" if reason_detail else "")
+                    ),
                 )
             )
             continue
@@ -1041,7 +1069,14 @@ async def qualify_bill_product_query_candidate(
         selected = select_qualified_tax_data(product_results, rules, enforce_tax_limit=False)
         if selected:
             return attach_tax_data(candidate, selected, match_source)
-        return replace(candidate, filter_reason=f"提单品类查询无合格税率/认证结果: {product} -> {query_name}")
+        detail = summarize_tax_candidate_rejections(product_results, rules, enforce_tax_limit=False)
+        return replace(
+            candidate,
+            filter_reason=(
+                f"提单品类查询无合格税率/认证结果: {product} -> {query_name}"
+                + (f"；{detail}" if detail else "")
+            ),
+        )
     except Exception as exc:
         return replace(candidate, filter_reason=f"提单品类查询失败: {product} -> {query_name}: {exc}")
 
@@ -1476,7 +1511,13 @@ def exclude_bill_product_replacements(
 
 
 def candidate_has_product_tax_match(candidate: ProductCandidate) -> bool:
-    return candidate.tax_match_source in {"product", "bill_hs", "bill_product", "llm_query"} and bool(normalize_hs(candidate.hs))
+    return candidate.tax_match_source in {
+        "product",
+        "bill_hs",
+        "bill_product",
+        "bill_product_no_material",
+        "llm_query",
+    } and bool(normalize_hs(candidate.hs))
 
 
 def infer_bill_material_from_entry(entry: BillProduct) -> str:
@@ -1954,6 +1995,39 @@ def select_qualified_tax_data(
     if not ranked:
         return None
     return sorted(ranked, key=lambda item: (item[0], item[1], item[2]))[0][3]
+
+
+def summarize_tax_candidate_rejections(
+    candidates: dict[str, dict[str, Any]],
+    rules: SelectionRules,
+    required_hs: str = "",
+    enforce_tax_limit: bool = True,
+    limit: int = 4,
+) -> str:
+    if not candidates:
+        return "Codeflag 未返回候选"
+    reasons: list[str] = []
+    seen: set[str] = set()
+    for data in candidates.values():
+        hs = normalize_hs(data.get("hs_code_us")) or clean_text(data.get("hs_code")) or "未知HTS"
+        if required_hs and not tax_candidate_matches_required_hs(data, required_hs):
+            reason = f"不匹配指定 HTS {normalize_hs(required_hs)}"
+        else:
+            reason = tax_filter_reason(data, rules, enforce_tax_limit=enforce_tax_limit)
+        if not reason:
+            continue
+        item = f"{hs}: {reason}"
+        if item in seen:
+            continue
+        seen.add(item)
+        reasons.append(item)
+        if len(reasons) >= limit:
+            break
+    if not reasons:
+        return "Codeflag 返回候选但未选中"
+    extra = len(candidates) - len(reasons)
+    suffix = f"；另有 {extra} 个候选未展开" if extra > 0 and len(reasons) >= limit else ""
+    return "候选被过滤: " + "；".join(reasons) + suffix
 
 
 def tax_candidate_matches_required_hs(data: dict[str, Any], required_hs: str) -> bool:
