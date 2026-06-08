@@ -1433,7 +1433,7 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(bill_required, [])
-        self.assertEqual(crawler.product_calls, [("PLASTIC HAIRPIN", "")])
+        self.assertEqual(crawler.product_calls, [("PLASTIC HAIRPIN", ""), ("PLASTIC HAIRPIN", "")])
         self.assertEqual(crawler.hs_calls, [])
         self.assertIn("Codeflag", bill_filtered[-1].filter_reason)
 
@@ -1474,6 +1474,45 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
             [("SILICONE COASTER", "Silicone"), ("SILICONE COASTER", "")],
         )
         self.assertIn("fda", bill_filtered[0].filter_reason.lower())
+
+    async def test_bill_product_query_retries_transient_failures(self) -> None:
+        bill = BillInfo(
+            filename="bill.pdf",
+            raw_text="",
+            products=["PLASTIC MOBILE PHONE STAND"],
+            gross_weight=150,
+            cartons=30,
+            product_entries=[BillProduct(name="PLASTIC MOBILE PHONE STAND", evidence="PLASTIC MOBILE PHONE STAND")],
+        )
+
+        class FlakyCrawler(RoutedFakeCrawler):
+            async def search_product(self, product_name: str, material: str = "") -> dict[str, dict]:
+                self.product_calls.append((product_name, material))
+                if len(self.product_calls) == 1:
+                    raise RuntimeError("temporary Codeflag timeout")
+                return tax_result("5.3%", hs="3926400090")
+
+        crawler = FlakyCrawler(product_results={})
+
+        bill_required, bill_filtered = await qualify_bill_product_candidates(
+            crawler,
+            bill,
+            [],
+            [],
+            SelectionRules(allowed_certifications=["Lacey Act", "TSCA"]),
+            ProcessingOptions(target_tax_amount=850, target_item_count=10),
+            query_cache=None,
+        )
+
+        self.assertEqual(bill_filtered, [])
+        self.assertEqual([item.hs for item in bill_required], ["3926400090"])
+        self.assertEqual(
+            crawler.product_calls,
+            [
+                ("PLASTIC MOBILE PHONE STAND", "Plastic"),
+                ("PLASTIC MOBILE PHONE STAND", "Plastic"),
+            ],
+        )
 
     def test_replacement_pool_excludes_bill_product_names(self) -> None:
         pool = [

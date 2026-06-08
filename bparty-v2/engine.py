@@ -38,6 +38,7 @@ TAX_FINAL_TOLERANCE_USD = 20.0
 MIN_ROW_TAX_AMOUNT_USD = 30.0
 MAX_ZERO_TAX_ROWS = 4
 MAX_TAX_OVER_TARGET_RATIO = 0.1
+BILL_PRODUCT_QUERY_RETRIES = 2
 UNDETAILED_BILL_TAX_SHARE = 0.20
 UNDETAILED_BILL_CARTON_SHARE = 0.06
 PRICE_FIT_MIN_REFERENCE_RATIO = 0.67
@@ -549,33 +550,6 @@ async def build_clearance(
 
     rules = load_selection_rules()
     crawler = StrictTaxCrawler()
-    manifest_candidates = build_manifest_candidates(manifest)
-    qualified_manifest: list[ProductCandidate] = []
-    manifest_filtered: list[ProductCandidate] = []
-    manifest_query_limit = len(manifest_candidates)
-    qualified_manifest, manifest_filtered = await qualify_candidates(
-        crawler,
-        manifest_candidates[:manifest_query_limit],
-        rules,
-        query_cache=query_cache,
-        enforce_tax_limit=False,
-        progress_callback=progress_callback,
-        progress_stage="crawler_manifest_products",
-        progress_start=8,
-        progress_end=52,
-    )
-    flow.append(
-        {
-            "stage": "crawler_manifest_products",
-            "status": "ok" if qualified_manifest else "insufficient",
-            "queried_rows": manifest_query_limit,
-            "candidate_groups": len(manifest_candidates),
-            "qualified": len(qualified_manifest),
-            "filtered": len(manifest_filtered),
-            "message": "已按客户清单 HS 归并池全量优先查询税率；人工发票策略下单品税率不作 20% 硬过滤",
-        }
-    )
-
     replacement_pool = load_replacement_candidates()
     plausibility_ranges = load_plausibility_ranges()
     if len(bill.products) > options.target_item_count:
@@ -591,21 +565,20 @@ async def build_clearance(
             {
                 "stage": "bill_products",
                 "status": "running",
-                "progress": 58,
-                "message": "正在按提单品类查询税率",
+                "progress": 8,
+                "message": "正在优先锁定提单品类税率",
             },
         )
         bill_required, bill_filtered = await qualify_bill_product_candidates(
-            crawler,
+            StrictTaxCrawler(),
             bill,
-            qualified_manifest,
+            [],
             replacement_pool,
             rules,
             options,
             query_cache=query_cache,
             llm=llm_client,
         )
-        manifest_filtered.extend(bill_filtered)
         unique_bill_count = len(unique_bill_products(bill.products))
         flow.append(
             {
@@ -618,11 +591,39 @@ async def build_clearance(
             }
         )
         if len(bill_required) < unique_bill_count:
-            missing = unique_bill_products([item.zh for item in bill_filtered if item.source == "bill"] or bill.products)
+            missing = format_missing_bill_products(bill.products, bill_filtered)
             raise RuntimeError(
                 "提单品类 Codeflag 查询缺少合格归类结果，不能套用替换表品名；"
-                f"请补充提单 HS 或调整品名/材质: {', '.join(missing)}"
+                f"请补充提单 HS 或调整品名/材质: {missing}"
             )
+
+    manifest_candidates = build_manifest_candidates(manifest)
+    qualified_manifest: list[ProductCandidate] = []
+    manifest_filtered: list[ProductCandidate] = []
+    manifest_query_limit = len(manifest_candidates)
+    qualified_manifest, manifest_filtered = await qualify_candidates(
+        crawler,
+        manifest_candidates[:manifest_query_limit],
+        rules,
+        query_cache=query_cache,
+        enforce_tax_limit=False,
+        progress_callback=progress_callback,
+        progress_stage="crawler_manifest_products",
+        progress_start=12,
+        progress_end=52,
+    )
+    flow.append(
+        {
+            "stage": "crawler_manifest_products",
+            "status": "ok" if qualified_manifest else "insufficient",
+            "queried_rows": manifest_query_limit,
+            "candidate_groups": len(manifest_candidates),
+            "qualified": len(qualified_manifest),
+            "filtered": len(manifest_filtered),
+            "message": "已按客户清单 HS 归并池全量优先查询税率；人工发票策略下单品税率不作 20% 硬过滤",
+        }
+    )
+    manifest_filtered.extend(bill_filtered)
 
     bill_clean_replacement_pool = exclude_bill_product_replacements(replacement_pool, bill.products)
     selected = select_initial_candidates(qualified_manifest, bill_required, rules, options.target_item_count)
@@ -1047,6 +1048,22 @@ def unique_bill_products(products: list[str]) -> list[str]:
     return result
 
 
+def format_missing_bill_products(products: list[str], filtered: list[ProductCandidate]) -> str:
+    parts: list[str] = []
+    for product in unique_bill_products(products):
+        product_key = normalize_bill_product_text(product)
+        reasons = [
+            candidate.filter_reason
+            for candidate in filtered
+            if candidate.filter_reason
+            and candidate.source in {"bill", "llm_query"}
+            and normalize_bill_product_text(candidate.zh) == product_key
+        ]
+        detail = "；".join(reasons[-2:])
+        parts.append(f"{product}（{detail}）" if detail else product)
+    return ", ".join(parts)
+
+
 async def qualify_bill_product_query_candidate(
     crawler: StrictTaxCrawler,
     bill: BillInfo,
@@ -1064,21 +1081,32 @@ async def qualify_bill_product_query_candidate(
     product_reason = product_rule_reason(candidate, rules)
     if product_reason:
         return replace(candidate, filter_reason=product_reason)
-    try:
-        product_results = await cached_search_product(crawler, query_name or product, material, query_cache)
-        selected = select_qualified_tax_data(product_results, rules, enforce_tax_limit=False)
-        if selected:
-            return attach_tax_data(candidate, selected, match_source)
-        detail = summarize_tax_candidate_rejections(product_results, rules, enforce_tax_limit=False)
-        return replace(
-            candidate,
-            filter_reason=(
-                f"提单品类查询无合格税率/认证结果: {product} -> {query_name}"
-                + (f"；{detail}" if detail else "")
-            ),
-        )
-    except Exception as exc:
-        return replace(candidate, filter_reason=f"提单品类查询失败: {product} -> {query_name}: {exc}")
+    errors: list[str] = []
+    for attempt in range(1, BILL_PRODUCT_QUERY_RETRIES + 1):
+        if attempt > 1:
+            await asyncio.sleep(max(1.0, crawler.settings.delay))
+        try:
+            product_results = await cached_search_product(crawler, query_name or product, material, query_cache)
+            selected = select_qualified_tax_data(product_results, rules, enforce_tax_limit=False)
+            if selected:
+                return attach_tax_data(candidate, selected, match_source)
+            detail = summarize_tax_candidate_rejections(product_results, rules, enforce_tax_limit=False)
+            return replace(
+                candidate,
+                filter_reason=(
+                    f"提单品类查询无合格税率/认证结果: {product} -> {query_name}"
+                    + (f"；{detail}" if detail else "")
+                ),
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+    return replace(
+        candidate,
+        filter_reason=(
+            f"提单品类查询失败: {product} -> {query_name}"
+            f"；已重试 {BILL_PRODUCT_QUERY_RETRIES} 次: {'；'.join(errors[-2:])}"
+        ),
+    )
 
 
 def build_bill_product_query_candidate(
