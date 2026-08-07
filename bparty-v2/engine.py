@@ -10,6 +10,7 @@ import inspect
 import base64
 import io
 import itertools
+import time
 from copy import copy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from openpyxl import load_workbook
+from openpyxl.utils.cell import get_column_letter, range_boundaries
 from pypdf import PdfReader
 import pypdfium2 as pdfium
 from PIL import Image
@@ -30,9 +32,11 @@ APP_DIR = Path(__file__).resolve().parent
 LOCAL_TEMPLATE_PATH = APP_DIR / "templates/清关模板.xlsx"
 REFERENCE_ROOT = APP_DIR / "reference"
 REPLACEMENT_WORKBOOK_PATH = APP_DIR / "docs/海关编码查找.xlsx"
+CUSTOMER_CODEBOOK_PATH = REFERENCE_ROOT / "编码库(1).xlsx"
 RULES_ROOT = APP_DIR / "rules"
 MAX_OUTPUT_ITEMS = 30
 BASE_TAX_LIMIT = 0.2
+CUSTOMER_CODEBOOK_TAX_LIMIT = 0.30
 TAX_TOLERANCE_USD = 1.0
 TAX_FINAL_TOLERANCE_USD = 20.0
 MIN_ROW_TAX_AMOUNT_USD = 30.0
@@ -73,9 +77,25 @@ DEFAULT_KG_PER_PC_MAX = 50.0
 DEFAULT_UNIT_PRICE_MIN = 0.05
 DEFAULT_UNIT_PRICE_MAX = 50.0
 BILL_TEXT_MIN_CHARS = 80
+BILL_PARSER_TEXT_CHARS = 12000
 BILL_VISION_MAX_PAGES = 2
 BILL_VISION_MAX_SIDE = 1800
 BILL_VISION_JPEG_QUALITY = 80
+BILL_PARSER_PROMPT_VERSION = "v4"
+BILL_PACKAGE_RESOLUTION_PROMPT_VERSION = "v1"
+BILL_PACKAGE_RECOGNITION_MAX_ATTEMPTS = 3
+BILL_PACKAGE_FINAL_RETRY_MAX_PAGES = 6
+BILL_PACKAGE_FINAL_RETRY_TEXT_CHARS = 24000
+MANIFEST_SCHEMA_PROMPT_VERSION = "v1"
+MANIFEST_SCHEMA_CACHE_REVISION = "net-weight-v1"
+MANIFEST_SCHEMA_MIN_CONFIDENCE = 0.80
+MANIFEST_WEIGHT_ABSOLUTE_TOLERANCE_KG = 0.5
+MANIFEST_WEIGHT_RELATIVE_TOLERANCE = 0.001
+LLM_MAX_CONCURRENCY = 2
+LLM_PLAUSIBILITY_BATCH_SIZE = 5
+LLM_PLAUSIBILITY_PROMPT_VERSION = "v2-batch"
+LLM_OUTPUT_REVIEW_PROMPT_VERSION = "v1"
+ADAPTIVE_REPLACEMENT_BATCH_SIZE = 4
 
 DEFAULT_REFERENCE_STYLE_ROWS = [
     {"中文品名": "铁制昆虫饰品", "英文品名": "Iron insect ornaments", "商品编码": "8306290000", "材质": "Iron", "用途": "Decoration", "单价": 0.69, "综合税率": 0.10, "箱数": 70, "数量": 910, "毛重": 1648},
@@ -343,9 +363,24 @@ class ManifestSummary:
     total_declared_value: float
     categories: list[str]
     items: list[ManifestItem] = field(default_factory=list)
+    total_net_weight: Optional[float] = None
     weight_source: str = ""
     weight_evidence: str = ""
     weight_confidence: float = 0.0
+    schema_sheet: str = ""
+    schema_header_row: int = 0
+    schema_data_start_row: int = 0
+    schema_data_end_row: int = 0
+    schema_summary_rows: list[int] = field(default_factory=list)
+    schema_columns: dict[str, int] = field(default_factory=dict)
+    schema_confidence: float = 0.0
+    weight_strategy: str = ""
+    weight_total_cell: str = ""
+    weight_detail_range: str = ""
+    weight_explicit_total: Optional[float] = None
+    weight_detail_sum: Optional[float] = None
+    weight_final: Optional[float] = None
+    weight_reconciled: bool = False
 
 
 @dataclass
@@ -354,6 +389,34 @@ class ManifestWeightInfo:
     source: str = ""
     evidence: str = ""
     confidence: float = 0.0
+
+
+@dataclass
+class ManifestSchema:
+    sheet_name: str
+    header_row: int
+    summary_rows: list[int]
+    data_start_row: int
+    data_end_row: int
+    columns: dict[str, int]
+    header_labels: dict[str, str]
+    weight_unit: str
+    confidence: float
+    weight_strategy: str
+    weight_total_cell: str = ""
+    weight_detail_range: str = ""
+
+
+@dataclass
+class ManifestWeightResolution:
+    strategy: str
+    total_cell: str
+    detail_range: str
+    explicit_total: Optional[float]
+    detail_sum: Optional[float]
+    final_weight: float
+    reconciled: bool
+    evidence: str
 
 
 @dataclass
@@ -396,6 +459,14 @@ class BillInfo:
     eta: str = ""
     cartons: Optional[float] = None
     carton_evidence: str = ""
+    carton_unit: str = ""
+    carton_source: str = ""
+    carton_reasoning: str = ""
+    carton_manifest_comparison: str = ""
+    carton_confidence: float = 0.0
+    carton_inferred: bool = False
+    carton_recognition_attempts: int = 1
+    carton_resolution_history: list[dict[str, Any]] = field(default_factory=list)
     gross_weight: Optional[float] = None
     cbm: Optional[float] = None
     product_entries: list[BillProduct] = field(default_factory=list)
@@ -411,6 +482,12 @@ class BillLLMFields:
     consignee: str = ""
     carton_count: Optional[float] = None
     carton_evidence: str = ""
+    carton_unit: str = ""
+    carton_source: str = ""
+    carton_reasoning: str = ""
+    carton_manifest_comparison: str = ""
+    carton_confidence: float = 0.0
+    carton_inferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -458,6 +535,11 @@ class ProductCandidate:
     plausibility_basis: str = ""
     price_evidence: dict[str, Any] = field(default_factory=dict)
     llm_reason: str = ""
+    row_warnings: list[str] = field(default_factory=list)
+    compliance_review_required: bool = False
+    compliance_review_reason: str = ""
+    bill_product_name: str = ""
+    bill_has_manifest_detail: bool = False
 
     @property
     def score(self) -> float:
@@ -498,6 +580,129 @@ QueryCache = dict[str, dict[str, Any]]
 ProgressCallback = Callable[[dict[str, Any]], Any]
 
 
+async def parse_input_documents_concurrently(
+    manifest_path: str | Path,
+    bill_path: str | Path,
+    manifest_parser: LLMClient,
+    bill_parser: LLMClient,
+    query_cache: Optional[QueryCache] = None,
+    metrics: Optional[dict[str, Any]] = None,
+) -> tuple[ManifestSummary, BillInfo]:
+    results = await asyncio.gather(
+        parse_manifest(manifest_path, manifest_parser, query_cache),
+        parse_bill(bill_path, bill_parser, query_cache, allow_missing_carton_count=True),
+        return_exceptions=True,
+    )
+    fallbacks = 0
+    manifest, bill = results
+    if isinstance(manifest, BaseException):
+        if isinstance(manifest, asyncio.CancelledError):
+            raise manifest
+        fallbacks += 1
+        manifest = await parse_manifest(manifest_path, manifest_parser, query_cache)
+    if isinstance(bill, BaseException):
+        if isinstance(bill, asyncio.CancelledError):
+            raise bill
+        fallbacks += 1
+        recognition_history: list[dict[str, Any]] = []
+        bill_attempt = 1
+        while isinstance(bill, BaseException) and bill_attempt < BILL_PACKAGE_RECOGNITION_MAX_ATTEMPTS:
+            recognition_history.append(
+                {
+                    "attempt": bill_attempt,
+                    "status": "error",
+                    "error": summarize_model_error(bill),
+                }
+            )
+            bill_attempt += 1
+            try:
+                is_final_attempt = bill_attempt >= BILL_PACKAGE_RECOGNITION_MAX_ATTEMPTS
+                bill = await parse_bill(
+                    bill_path,
+                    bill_parser,
+                    query_cache,
+                    allow_missing_carton_count=True,
+                    text_max_chars=(
+                        BILL_PACKAGE_FINAL_RETRY_TEXT_CHARS
+                        if is_final_attempt
+                        else BILL_PARSER_TEXT_CHARS
+                    ),
+                    vision_max_pages=(
+                        BILL_PACKAGE_FINAL_RETRY_MAX_PAGES
+                        if is_final_attempt
+                        else BILL_VISION_MAX_PAGES
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                bill = exc
+        if isinstance(bill, BaseException):
+            recognition_history.append(
+                {
+                    "attempt": bill_attempt,
+                    "status": "error",
+                    "error": summarize_model_error(bill),
+                }
+            )
+            save_bill_package_resolution_audit(
+                query_cache,
+                bill_path,
+                manifest,
+                recognition_history,
+                status="failed",
+            )
+            raise RuntimeError(
+                "提单解析失败，"
+                f"模型已识别 {bill_attempt} 次，任务已中断；"
+                f"最后错误：{summarize_model_error(bill)}"
+            ) from None
+        shifted_history = []
+        for entry in bill.carton_resolution_history:
+            shifted = dict(entry)
+            shifted["attempt"] = bill_attempt
+            shifted_history.append(shifted)
+        if not shifted_history:
+            shifted_history.append(
+                {
+                    "attempt": bill_attempt,
+                    "status": "recognized" if bill.cartons and bill.cartons > 0 else "missing",
+                    "package_count": bill.cartons,
+                    "package_unit": bill.carton_unit,
+                    "source": bill.carton_source or bill.parse_source,
+                    "evidence": bill.carton_evidence,
+                    "reasoning": bill.carton_reasoning,
+                }
+            )
+        bill = replace(
+            bill,
+            carton_recognition_attempts=bill_attempt,
+            carton_resolution_history=[*recognition_history, *shifted_history],
+        )
+    bill = await resolve_bill_carton_count(
+        bill_path,
+        bill,
+        manifest,
+        bill_parser,
+        query_cache,
+    )
+    if metrics is not None:
+        metrics.update(
+            {
+                "max_concurrency": 2,
+                "sequential_fallbacks": fallbacks,
+                "carton_recognition_attempts": bill.carton_recognition_attempts,
+                "carton_source": bill.carton_source,
+                "carton_inferred": bill.carton_inferred,
+            }
+        )
+    return manifest, bill
+
+
+def record_stage_timing(stage_timings: dict[str, float], stage: str, started_at: float) -> None:
+    stage_timings[stage] = round(time.perf_counter() - started_at, 3)
+
+
 async def build_clearance(
     manifest_path: str | Path,
     bill_path: str | Path,
@@ -511,13 +716,28 @@ async def build_clearance(
     llm: Optional[LLMClient] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> dict[str, Any]:
+    build_started_at = time.perf_counter()
+    stage_timings: dict[str, float] = {}
     options = validate_processing_options(target_tax_amount, target_item_count, requested_profile)
     query_cache = query_cache if query_cache is not None else {"product": {}, "hs": {}, "bill": {}}
     llm_client = llm or bill_parser or manifest_parser or LLMClient()
-    llm_parse_cache_before = bool(query_cache.get("manifest") or query_cache.get("bill"))
-    manifest = await parse_manifest(manifest_path, manifest_parser or llm_client, query_cache)
-    bill = await parse_bill(bill_path, bill_parser or llm_client, query_cache)
-    llm_parse_used = bool(query_cache.get("manifest") or query_cache.get("bill"))
+    llm_parse_cache_before = bool(
+        query_cache.get("manifest_schema") or query_cache.get("manifest") or query_cache.get("bill")
+    )
+    stage_started_at = time.perf_counter()
+    parse_metrics: dict[str, Any] = {}
+    manifest, bill = await parse_input_documents_concurrently(
+        manifest_path,
+        bill_path,
+        manifest_parser or llm_client,
+        bill_parser or llm_client,
+        query_cache,
+        metrics=parse_metrics,
+    )
+    record_stage_timing(stage_timings, "parse_documents", stage_started_at)
+    llm_parse_used = bool(
+        query_cache.get("manifest_schema") or query_cache.get("manifest") or query_cache.get("bill")
+    )
     llm_plausibility_used = False
     llm_generation_used = False
     if manifest.total_real_weight <= 0:
@@ -532,6 +752,23 @@ async def build_clearance(
             "manifest_rows": manifest.row_count,
             "bill_products": len(bill.products),
             "manifest_total_weight": manifest.total_real_weight,
+            "manifest_total_net_weight": manifest.total_net_weight,
+            "manifest_net_to_gross_ratio": manifest_net_to_gross_ratio(manifest),
+            "manifest_total_ctns": manifest.total_ctns,
+            "bill_package_count": bill.cartons,
+            "bill_package_unit": bill.carton_unit,
+            "bill_package_source": bill.carton_source,
+            "bill_package_inferred": bill.carton_inferred,
+            "bill_package_recognition_attempts": bill.carton_recognition_attempts,
+            "bill_manifest_package_comparison": bill.carton_manifest_comparison,
+            "manifest_schema_sheet": manifest.schema_sheet,
+            "manifest_schema_columns": manifest.schema_columns,
+            "weight_strategy": manifest.weight_strategy,
+            "weight_total_cell": manifest.weight_total_cell,
+            "weight_explicit_total": manifest.weight_explicit_total,
+            "weight_detail_sum": manifest.weight_detail_sum,
+            "weight_final": manifest.weight_final,
+            "weight_reconciled": manifest.weight_reconciled,
             "target_tax_amount": options.target_tax_amount,
             "target_item_count": options.target_item_count,
         }
@@ -545,6 +782,8 @@ async def build_clearance(
             "message": "文件解析完成",
             "manifest_rows": manifest.row_count,
             "manifest_total_weight": manifest.total_real_weight,
+            "manifest_total_net_weight": manifest.total_net_weight,
+            "manifest_net_to_gross_ratio": manifest_net_to_gross_ratio(manifest),
         },
     )
 
@@ -557,50 +796,14 @@ async def build_clearance(
             f"提单品类 {len(bill.products)} 个超过目标输出行数 {options.target_item_count}，"
             "请提高最终生成条目数"
         )
-    bill_required: list[ProductCandidate] = []
-    bill_filtered: list[ProductCandidate] = []
-    if bill.products:
-        await emit_progress(
-            progress_callback,
-            {
-                "stage": "bill_products",
-                "status": "running",
-                "progress": 8,
-                "message": "正在优先锁定提单品类税率",
-            },
-        )
-        bill_required, bill_filtered = await qualify_bill_product_candidates(
-            StrictTaxCrawler(),
-            bill,
-            [],
-            replacement_pool,
-            rules,
-            options,
-            query_cache=query_cache,
-            llm=llm_client,
-        )
-        unique_bill_count = len(unique_bill_products(bill.products))
-        flow.append(
-            {
-                "stage": "bill_products",
-                "status": "ok" if len(bill_required) == unique_bill_count else "insufficient",
-                "bill_products": unique_bill_count,
-                "qualified": len(bill_required),
-                "filtered": len(bill_filtered),
-                "message": "提单品类按 codeflagai 实际税率保留，不受 20% 税率上限限制；认证仍需校验",
-            }
-        )
-        if len(bill_required) < unique_bill_count:
-            missing = format_missing_bill_products(bill.products, bill_filtered)
-            raise RuntimeError(
-                "提单品类 Codeflag 查询缺少合格归类结果，不能套用替换表品名；"
-                f"请补充提单 HS 或调整品名/材质: {missing}"
-            )
-
     manifest_candidates = build_manifest_candidates(manifest)
+    ensure_manifest_codeflag_candidates(manifest, manifest_candidates)
+    manifest_hs_candidates = sum(1 for candidate in manifest_candidates if len(normalize_hs(candidate.hs)) == 10)
+    manifest_product_only_candidates = len(manifest_candidates) - manifest_hs_candidates
     qualified_manifest: list[ProductCandidate] = []
     manifest_filtered: list[ProductCandidate] = []
     manifest_query_limit = len(manifest_candidates)
+    stage_started_at = time.perf_counter()
     qualified_manifest, manifest_filtered = await qualify_candidates(
         crawler,
         manifest_candidates[:manifest_query_limit],
@@ -612,32 +815,99 @@ async def build_clearance(
         progress_start=12,
         progress_end=52,
     )
+    record_stage_timing(stage_timings, "codeflag_manifest_candidates", stage_started_at)
     flow.append(
         {
             "stage": "crawler_manifest_products",
             "status": "ok" if qualified_manifest else "insufficient",
             "queried_rows": manifest_query_limit,
             "candidate_groups": len(manifest_candidates),
+            "hs_candidates": manifest_hs_candidates,
+            "product_only_candidates": manifest_product_only_candidates,
             "qualified": len(qualified_manifest),
             "filtered": len(manifest_filtered),
             "message": "已按客户清单 HS 归并池全量优先查询税率；人工发票策略下单品税率不作 20% 硬过滤",
         }
     )
+    bill_crawler: StrictTaxCrawler | None = None
+    bill_required: list[ProductCandidate] = []
+    bill_filtered: list[ProductCandidate] = []
+    if bill.products:
+        stage_started_at = time.perf_counter()
+        await emit_progress(
+            progress_callback,
+            {
+                "stage": "bill_products",
+                "status": "running",
+                "progress": 54,
+                "message": "正在用清单候选覆盖提单品类",
+            },
+        )
+        bill_crawler = StrictTaxCrawler()
+        bill_required, bill_filtered = await qualify_bill_product_candidates(
+            bill_crawler,
+            bill,
+            qualified_manifest,
+            replacement_pool,
+            rules,
+            options,
+            query_cache=query_cache,
+            llm=llm_client,
+        )
+        unique_bill_count = len(unique_bill_products(bill.products))
+        reused_manifest_count = sum(
+            1 for candidate in bill_required if candidate.source == "manifest_group"
+        )
+        flow.append(
+            {
+                "stage": "bill_products",
+                "status": "ok" if len(bill_required) == unique_bill_count else "insufficient",
+                "bill_products": unique_bill_count,
+                "qualified": len(bill_required),
+                "manifest_reused": reused_manifest_count,
+                "queried_separately": len(bill_required) - reused_manifest_count,
+                "filtered": len(bill_filtered),
+                "message": "提单品类优先复用已通过 Codeflag 的清单候选；仅未覆盖品类单独查询",
+            }
+        )
+        if len(bill_required) < unique_bill_count:
+            missing = format_missing_bill_products(bill.products, bill_filtered)
+            raise RuntimeError(
+                "提单品类 Codeflag 查询缺少合格归类结果，不能套用替换表品名；"
+                f"请补充提单 HS 或调整品名/材质: {missing}"
+            )
+        record_stage_timing(stage_timings, "codeflag_bill_products", stage_started_at)
     manifest_filtered.extend(bill_filtered)
 
     bill_clean_replacement_pool = exclude_bill_product_replacements(replacement_pool, bill.products)
     selected = select_initial_candidates(qualified_manifest, bill_required, rules, options.target_item_count)
     replacement_filtered: list[ProductCandidate] = []
     replacement_used = 0
+    codebook_initial_fill_used = 0
+    codebook_fill_needed = max(0, options.target_item_count - len(selected))
     if len(selected) < options.target_item_count:
         needed = options.target_item_count - len(selected)
         replacements = sorted(bill_clean_replacement_pool, key=lambda item: selection_score(item, rules), reverse=True)
         selected_keys = {candidate_identity(candidate) for candidate in selected}
+        selected_semantic_keys = set().union(
+            *(candidate_semantic_keys(candidate) for candidate in selected)
+        ) if selected else set()
         replacement_attempts = 0
         for replacement in replacements:
             if len(selected) >= options.target_item_count:
                 break
-            if candidate_identity(replacement) in selected_keys:
+            replacement_semantic_keys = candidate_semantic_keys(replacement)
+            if (
+                candidate_identity(replacement) in selected_keys
+                or replacement_semantic_keys & selected_semantic_keys
+            ):
+                continue
+            if is_customer_codebook_candidate(replacement):
+                selected.append(replacement)
+                selected_keys.add(candidate_identity(replacement))
+                selected_semantic_keys.update(replacement_semantic_keys)
+                replacement_used += 1
+                codebook_initial_fill_used += 1
                 continue
             if replacement_attempts > 0:
                 await asyncio.sleep(crawler.settings.delay)
@@ -666,6 +936,7 @@ async def build_clearance(
                 continue
             selected.append(qualified[0])
             selected_keys.add(candidate_identity(qualified[0]))
+            selected_semantic_keys.update(candidate_semantic_keys(qualified[0]))
             replacement_used += 1
         flow.append(
             {
@@ -673,16 +944,43 @@ async def build_clearance(
                 "status": "ok" if len(selected) >= options.target_item_count else "insufficient",
                 "needed": needed,
                 "used": replacement_used,
+                "codebook_fill_needed": codebook_fill_needed,
+                "codebook_fill_used": codebook_initial_fill_used,
                 "filtered": len(replacement_filtered),
             }
         )
 
+    shortage_notice = ""
     if len(selected) < options.target_item_count:
-        raise RuntimeError(
+        shortage_notice = (
             f"合格品名不足，目标 {options.target_item_count} 行，当前仅 {len(selected)} 行；"
-            "请补充常用替换清单或放宽规则"
+            "按客户确认规则输出合格部分，并列出缺口原因"
         )
-    price_repair_pool = select_price_repair_pool(qualified_manifest, selected, rules)
+        flow.append(
+            {
+                "stage": "candidate_shortage",
+                "status": "partial",
+                "target": options.target_item_count,
+                "selected": len(selected),
+                "missing": options.target_item_count - len(selected),
+                "message": shortage_notice,
+                "filter_summary": summarize_filter_reasons([*manifest_filtered, *replacement_filtered]),
+            }
+        )
+        await emit_progress(
+            progress_callback,
+            {
+                "stage": "candidate_shortage",
+                "status": "partial",
+                "progress": 89,
+                "message": shortage_notice,
+                "selected": len(selected),
+                "target": options.target_item_count,
+            },
+        )
+    effective_options = options
+    if selected and len(selected) != options.target_item_count:
+        effective_options = replace(options, target_item_count=len(selected))
 
     await emit_progress(
         progress_callback,
@@ -693,6 +991,8 @@ async def build_clearance(
             "message": "正在使用规则优化器生成最终草案",
         },
     )
+    plausibility_metrics: dict[str, Any] = {}
+    stage_started_at = time.perf_counter()
     selected, llm_plausibility_used = await ensure_candidate_plausibility_ranges(
         selected,
         manifest,
@@ -700,53 +1000,118 @@ async def build_clearance(
         plausibility_ranges,
         llm_client,
         query_cache,
+        metrics=plausibility_metrics,
     )
-    selected = attach_price_evidence_to_candidates(selected, query_cache=query_cache)
+    record_stage_timing(stage_timings, "llm_plausibility", stage_started_at)
+
+    stage_started_at = time.perf_counter()
     replacement_repair_attempts = 0
-    await emit_progress(
-        progress_callback,
-        {
-            "stage": "manual_invoice_replacement_pool",
-            "status": "running",
-            "progress": 91,
-            "message": "正在按人工发票策略查询低税/免税替换候选",
-        },
+    candidate_library_allowed = codebook_fill_needed > 0
+    stable_reference_candidates = (
+        load_stable_manual_invoice_candidates(selected, bill.products)
+        if candidate_library_allowed
+        else []
     )
-    replacement_repair_candidates, replacement_repair_filtered, replacement_repair_attempts = await qualify_manual_invoice_replacements(
-        crawler,
-        bill_clean_replacement_pool,
+    manual_invoice_pool = build_manual_invoice_candidate_pool(
         selected,
-        rules,
-        query_cache=query_cache,
-        progress_callback=progress_callback,
-        bill_products=bill.products,
+        qualified_manifest,
+        stable_reference_candidates,
+        allow_candidate_library=candidate_library_allowed,
     )
-    replacement_filtered.extend(replacement_repair_filtered)
-    manual_invoice_pool = dedupe_candidates([*qualified_manifest, *replacement_repair_candidates])
-    if price_repair_pool:
-        await emit_progress(
-            progress_callback,
-            {
-                "stage": "price_fit_repair",
-                "status": "running",
-                "progress": 92,
-                "message": "正在准备客户清单备用候选，必要时按需搜索参考价",
-                "candidates": len(price_repair_pool),
-            },
-        )
-        price_repair_pool = prepare_price_repair_candidates(
-            price_repair_pool,
-            plausibility_ranges,
-            query_cache=query_cache,
-        )
     selected, price_repair_summary = optimize_selected_candidates_for_manual_invoice(
         selected,
         manual_invoice_pool,
         manifest,
         bill,
-        options,
+        effective_options,
     )
+    price_repair_summary["candidate_library_allowed"] = candidate_library_allowed
+    price_repair_summary["candidate_library_reason"] = (
+        "清单和提单候选不足以达到目标行数，允许候选库补足"
+        if candidate_library_allowed
+        else "清单和提单候选已达到目标行数，候选库不参与换品"
+    )
+    adaptive_replacement_skipped = (
+        not candidate_library_allowed
+        or manual_invoice_solution_is_acceptable(price_repair_summary, effective_options)
+    )
+    if adaptive_replacement_skipped:
+        skip_reason = (
+            "清单和提单候选已满足目标行数，候选库仅用于真实行数缺口"
+            if not candidate_library_allowed
+            else "现有清单候选和补充候选已有可行解"
+        )
+        flow.append(
+            {
+                "stage": "manual_invoice_replacement_pool",
+                "status": "skipped",
+                "reason": skip_reason,
+                "attempts": 0,
+            }
+        )
+    else:
+        await emit_progress(
+            progress_callback,
+            {
+                "stage": "manual_invoice_replacement_pool",
+                "status": "running",
+                "progress": 91,
+                "message": "首轮优化无可行解，正在按需查询低税/免税替换候选",
+            },
+        )
+        replacement_seeds = build_manual_invoice_replacement_seeds(
+            bill_clean_replacement_pool, selected, bill.products
+        )
+        replacement_repair_candidates: list[ProductCandidate] = []
+        replacement_cursor = 0
+        while (
+            not manual_invoice_solution_is_acceptable(price_repair_summary, effective_options)
+            and replacement_cursor < len(replacement_seeds)
+            and replacement_repair_attempts < MANUAL_INVOICE_REPLACEMENT_QUERY_LIMIT
+        ):
+            batch, batch_filtered, replacement_cursor, batch_attempts = await qualify_manual_invoice_replacement_batch(
+                crawler,
+                replacement_seeds,
+                replacement_cursor,
+                [*selected, *replacement_repair_candidates],
+                rules,
+                prior_network_attempts=replacement_repair_attempts,
+                batch_size=ADAPTIVE_REPLACEMENT_BATCH_SIZE,
+                query_cache=query_cache,
+                progress_callback=progress_callback,
+            )
+            replacement_repair_attempts += batch_attempts
+            replacement_repair_candidates.extend(batch)
+            replacement_filtered.extend(batch_filtered)
+            if not batch and batch_attempts == 0:
+                break
+            manual_invoice_pool = dedupe_candidates(
+                [
+                    *selected,
+                    *qualified_manifest,
+                    *stable_reference_candidates,
+                    *replacement_repair_candidates,
+                ]
+            )
+            selected, price_repair_summary = optimize_selected_candidates_for_manual_invoice(
+                selected,
+                manual_invoice_pool,
+                manifest,
+                bill,
+                effective_options,
+            )
     price_repair_summary["replacement_attempts"] = replacement_repair_attempts
+    record_stage_timing(stage_timings, "adaptive_candidate_optimization", stage_started_at)
+
+    price_metrics: dict[str, Any] = {}
+    stage_started_at = time.perf_counter()
+    selected = await attach_price_evidence_to_candidates_concurrently(
+        selected,
+        query_cache=query_cache,
+        max_concurrency=LLM_MAX_CONCURRENCY,
+        metrics=price_metrics,
+    )
+    record_stage_timing(stage_timings, "price_evidence", stage_started_at)
     draft_attempts = 0
     draft_feedback: list[str] = ["最终草案默认由规则优化器生成，LLM 不参与数值草案生成"]
     if price_repair_summary.get("swaps"):
@@ -754,8 +1119,76 @@ async def build_clearance(
             "已按人工发票策略从低税/免税候选重排 "
             f"{price_repair_summary['swaps']} 行"
         )
-    rows = build_output_rows(selected, manifest, bill, options)
+    stage_started_at = time.perf_counter()
+    best_effort_reason = ""
+    try:
+        rows = build_output_rows(selected, manifest, bill, effective_options)
+    except RuntimeError as exc:
+        best_effort_reason = str(exc)
+        rows = build_output_rows_best_effort(selected, manifest, bill, effective_options, best_effort_reason)
+        draft_feedback.append(f"正式数值求解失败，当前为兜底文件: {best_effort_reason}")
+        flow.append(
+            {
+                "stage": "best_effort_output",
+                "status": "partial",
+                "message": f"规则优化无完整可行解，已输出最接近方案: {best_effort_reason}",
+            }
+        )
+    record_stage_timing(stage_timings, "build_numeric_rows", stage_started_at)
 
+    llm_review_used = False
+    llm_review_reoptimized = False
+    llm_review_constraints_applied = 0
+    llm_review: dict[str, Any] = {"pass": True, "issues": []}
+    blocking_review_issues: list[dict[str, Any]] = []
+    await emit_progress(
+        progress_callback,
+        {
+            "stage": "llm_output_review",
+            "status": "running",
+            "progress": 94,
+            "message": "正在进行最终商业合理性审查",
+        },
+    )
+    stage_started_at = time.perf_counter()
+    try:
+        llm_review = await review_output_rows_with_llm(
+            llm_client,
+            rows,
+            selected,
+            manifest,
+            bill,
+            effective_options,
+            query_cache=query_cache,
+        )
+        llm_review_used = True
+        adjusted_selected, llm_review_constraints_applied = apply_llm_review_constraints(
+            selected, rows, llm_review
+        )
+        if llm_review_constraints_applied:
+            try:
+                reviewed_rows = build_output_rows(
+                    adjusted_selected, manifest, bill, effective_options
+                )
+                selected = adjusted_selected
+                rows = reviewed_rows
+                llm_review_reoptimized = True
+                best_effort_reason = ""
+            except RuntimeError as exc:
+                llm_review_constraints_applied = 0
+                draft_feedback.append(f"LLM 审查约束无法形成可行解，保留原方案: {exc}")
+        append_llm_review_warnings(rows, llm_review)
+        blocking_review_issues = blocking_llm_review_issues(
+            llm_review,
+            constraints_applied=llm_review_constraints_applied,
+            reoptimized=llm_review_reoptimized,
+            candidates=selected,
+        )
+    except Exception as exc:
+        draft_feedback.append(f"最终 LLM 合理性审查跳过: {exc}")
+    record_stage_timing(stage_timings, "llm_output_review", stage_started_at)
+
+    stage_started_at = time.perf_counter()
     try:
         await asyncio.wait_for(
             translate_output_chinese_names_with_llm(llm_client, rows),
@@ -763,21 +1196,62 @@ async def build_clearance(
         )
     except Exception as exc:
         draft_feedback.append(f"中文品名 LLM 翻译跳过: {exc}")
+    record_stage_timing(stage_timings, "llm_translation", stage_started_at)
+    ensure_bill_products_present(rows, bill.products, selected)
     validate_output_rows(rows)
     estimated_tax = round(sum((to_float(row.get("总价")) or 0) * (to_float(row.get("综合税率")) or 0) for row in rows), 2)
     tax_gap = round(estimated_tax - options.target_tax_amount, 2)
+    tax_within_tolerance = abs(tax_gap) <= TAX_FINAL_TOLERANCE_USD
+    constraint_reasons: list[str] = []
+    if best_effort_reason:
+        constraint_reasons.append(
+            "正式数值求解失败，当前文件为兜底结果，未完成税金优化: "
+            f"{best_effort_reason}"
+        )
+    if not tax_within_tolerance:
+        constraint_reasons.append(
+            f"税金与目标相差 {tax_gap:+.2f} USD，超过允许偏差 {TAX_FINAL_TOLERANCE_USD:.2f} USD"
+        )
+    if shortage_notice:
+        constraint_reasons.append(shortage_notice)
+    if blocking_review_issues:
+        constraint_reasons.append(
+            "最终商业合理性审查高风险提示（仅供人工复核，不阻止输出）: "
+            f"{format_blocking_llm_review_issues(blocking_review_issues)}"
+        )
+    compliance_review_reasons = list(
+        dict.fromkeys(
+            candidate.compliance_review_reason
+            for candidate in selected
+            if candidate.compliance_review_required and candidate.compliance_review_reason
+        )
+    )
+    if compliance_review_reasons:
+        constraint_reasons.append("合规条件需人工复核: " + "；".join(compliance_review_reasons))
+    constraint_status = "passed" if not constraint_reasons else "needs_review"
     validate_price_evidence(rows, selected)
     flow.append(
         {
             "stage": "optimize_output",
-            "status": "ok",
+            "status": "ok" if constraint_status == "passed" else "needs_review",
             "rows": len(rows),
             "estimated_tax": estimated_tax,
             "tax_gap": tax_gap,
-            "final_draft_generator": "rules",
+            "tax_within_tolerance": tax_within_tolerance,
+            "constraint_reasons": constraint_reasons,
+            "final_draft_generator": "best_effort" if best_effort_reason else "rules",
             "llm_draft_attempts": draft_attempts,
             "draft_feedback": draft_feedback[-1] if draft_feedback else "",
             "price_fit_repair": price_repair_summary,
+            "adaptive_replacement_skipped": adaptive_replacement_skipped,
+            "plausibility_metrics": plausibility_metrics,
+            "price_evidence_metrics": price_metrics,
+            "llm_review": {
+                "used": llm_review_used,
+                "issues": len(llm_review.get("issues") or []),
+                "constraints_applied": llm_review_constraints_applied,
+                "reoptimized": llm_review_reoptimized,
+            },
         }
     )
 
@@ -793,7 +1267,9 @@ async def build_clearance(
             "message": "正在写入 Excel",
         },
     )
+    stage_started_at = time.perf_counter()
     write_workbook(bill, rows, output_path, metadata={})
+    record_stage_timing(stage_timings, "write_workbook", stage_started_at)
     await emit_progress(
         progress_callback,
         {
@@ -806,49 +1282,124 @@ async def build_clearance(
 
     total_value = round(sum(to_float(row.get("总价")) or 0 for row in rows), 2)
     final_replacement_rows = sum(1 for candidate in selected if candidate.source == "replacement")
+    crawler_auth_expired_retries = crawler.auth_expired_retry_count
+    if bill_crawler is not None:
+        crawler_auth_expired_retries += bill_crawler.auth_expired_retry_count
+    stage_timings["build_clearance_total"] = round(time.perf_counter() - build_started_at, 3)
     stats = {
         "profile_hint": options.requested_profile or "auto",
-        "constraint_status": "passed",
+        "constraint_status": constraint_status,
+        "constraint_reasons": constraint_reasons,
         "weight_source": manifest.weight_source or "manifest_total_weight",
         "weight_evidence": manifest.weight_evidence,
         "weight_confidence": manifest.weight_confidence,
+        "manifest_schema_sheet": manifest.schema_sheet,
+        "manifest_schema_header_row": manifest.schema_header_row,
+        "manifest_schema_data_start_row": manifest.schema_data_start_row,
+        "manifest_schema_data_end_row": manifest.schema_data_end_row,
+        "manifest_schema_summary_rows": manifest.schema_summary_rows,
+        "manifest_schema_columns": manifest.schema_columns,
+        "manifest_schema_confidence": manifest.schema_confidence,
+        "weight_strategy": manifest.weight_strategy,
+        "weight_total_cell": manifest.weight_total_cell,
+        "weight_detail_range": manifest.weight_detail_range,
+        "weight_explicit_total": manifest.weight_explicit_total,
+        "weight_detail_sum": manifest.weight_detail_sum,
+        "weight_final": manifest.weight_final,
+        "weight_reconciled": manifest.weight_reconciled,
         "manifest_rows": manifest.row_count,
+        "manifest_product_rows": manifest.row_count,
+        "manifest_unique_candidates": len(manifest_candidates),
+        "manifest_hs_candidates": manifest_hs_candidates,
+        "manifest_product_only_candidates": manifest_product_only_candidates,
+        "codeflag_queried": manifest_query_limit,
+        "codeflag_qualified": len(qualified_manifest),
+        "codebook_fill_needed": codebook_fill_needed,
+        "codebook_fill_used": codebook_initial_fill_used,
         "bill_parse_source": bill.parse_source,
         "bill_text_chars": bill.text_chars,
         "bill_vision_pages": bill.vision_pages,
+        "bill_package_count": bill.cartons,
+        "bill_package_unit": bill.carton_unit,
+        "bill_package_source": bill.carton_source,
+        "bill_package_inferred": bill.carton_inferred,
+        "bill_package_confidence": bill.carton_confidence,
+        "bill_package_recognition_attempts": bill.carton_recognition_attempts,
+        "bill_manifest_package_comparison": bill.carton_manifest_comparison,
         "input_categories": len(manifest.categories),
         "target_item_count": options.target_item_count,
+        "actual_item_count": len(rows),
+        "candidate_shortage": shortage_notice,
         "output_rows": len(rows),
         "target_tax_amount": options.target_tax_amount,
         "estimated_tax_amount": estimated_tax,
         "tax_gap": tax_gap,
+        "tax_within_tolerance": tax_within_tolerance,
         "input_ctns": manifest.total_ctns,
         "output_ctns": round(sum(to_float(row.get("箱数")) or 0 for row in rows), 2),
         "input_real_weight": manifest.total_real_weight,
+        "input_net_weight": manifest.total_net_weight,
+        "input_net_to_gross_ratio": manifest_net_to_gross_ratio(manifest),
+        "output_net_weight": round(sum(to_float(row.get("净重")) or 0 for row in rows), 2),
         "output_gross_weight": round(sum(to_float(row.get("毛重")) or 0 for row in rows), 2),
+        "output_net_to_gross_ratio": round(
+            sum(to_float(row.get("净重")) or 0 for row in rows)
+            / max(0.01, sum(to_float(row.get("毛重")) or 0 for row in rows)),
+            6,
+        ),
         "bill_gross_weight_ignored": bill.gross_weight,
         "input_declared_value": manifest.total_declared_value,
         "total_value_usd": total_value,
         "plausibility_warnings": sum(1 for row in rows if clean_text(row.get("约束提示"))),
         "bill_products": len(unique_bill_products(bill.products)),
+        "bill_required_locked": sum(1 for candidate in selected if candidate.bill_product_name),
+        "bill_manifest_detailed_locked": sum(
+            1
+            for candidate in selected
+            if candidate.bill_product_name and candidate.bill_has_manifest_detail
+        ),
+        "bill_synthetic_locked": sum(
+            1
+            for candidate in selected
+            if candidate.bill_product_name and not candidate.bill_has_manifest_detail
+        ),
         "qualified_manifest_candidates": len(qualified_manifest),
         "replacement_candidates_used": final_replacement_rows,
         "replacement_initial_fill_used": replacement_used,
         "replacement_price_repair_attempts": replacement_repair_attempts,
+        "adaptive_replacement_skipped": adaptive_replacement_skipped,
+        "candidate_library_allowed": candidate_library_allowed,
+        "candidate_library_reason": price_repair_summary["candidate_library_reason"],
         "manifest_origin_rows": sum(1 for row in rows if clean_text(row.get("来源")) == "manifest_group"),
         "replacement_ratio": round(final_replacement_rows / max(1, len(rows)), 4),
+        "compliance_review_rows": sum(1 for candidate in selected if candidate.compliance_review_required),
+        "compliance_review_reasons": compliance_review_reasons,
         "price_evidence_count": sum(1 for candidate in selected if candidate.price_evidence),
         "filtered_candidates": len(manifest_filtered) + len(replacement_filtered),
-        "realism_status": "passed",
+        "realism_status": "passed" if not any(clean_text(row.get("约束提示")) for row in rows) else "needs_review",
         "realism_warnings": sum(1 for row in rows if clean_text(row.get("约束提示"))),
-        "llm_used": llm_parse_used or llm_plausibility_used or llm_generation_used,
+        "llm_used": llm_parse_used or llm_plausibility_used or llm_generation_used or llm_review_used,
         "llm_parse_used": llm_parse_used,
         "llm_parse_cache_reused": llm_parse_cache_before,
+        "llm_parse_metrics": parse_metrics,
         "llm_plausibility_used": llm_plausibility_used,
+        "llm_plausibility_metrics": plausibility_metrics,
         "llm_generation_used": llm_generation_used,
+        "llm_review_used": llm_review_used,
+        "llm_review_issue_count": len(llm_review.get("issues") or []),
+        "llm_review_high_risk_warning_count": len(blocking_review_issues),
+        "llm_review_constraints_applied": llm_review_constraints_applied,
+        "llm_review_reoptimized": llm_review_reoptimized,
+        "price_evidence_metrics": price_metrics,
+        "stage_timings_seconds": stage_timings,
+        "llm_max_concurrency": LLM_MAX_CONCURRENCY,
         "llm_draft_attempts": draft_attempts,
-        "final_draft_generator": "rules",
+        "final_draft_generator": "best_effort" if best_effort_reason else "rules",
+        "solver_status": "best_effort" if best_effort_reason else "optimized",
+        "tax_optimization_applied": not bool(best_effort_reason),
+        "best_effort_reason": best_effort_reason,
         "crawler_used": True,
+        "crawler_auth_expired_retries": crawler_auth_expired_retries,
     }
 
     return {
@@ -908,7 +1459,10 @@ async def qualify_bill_product_candidates(
             candidate
             for candidate in qualified_manifest
             if candidate_matches_single_bill_product(candidate, product)
-            and not candidate_has_product_tax_match(candidate)
+            and (
+                not candidate_has_product_tax_match(candidate)
+                or not candidate_material_matches_bill(candidate, bill_material)
+            )
         ]
         filtered.extend(
             replace(
@@ -923,9 +1477,11 @@ async def qualify_bill_product_candidates(
                 for candidate in qualified_manifest
                 if candidate_matches_single_bill_product(candidate, product)
                 and candidate_has_product_tax_match(candidate)
+                and candidate_material_matches_bill(candidate, bill_material)
             ),
             None,
         )
+        matched_manifest_detail = match is not None
         if not match:
             if bill_entry and bill_entry.hs_code_hint:
                 result = await qualify_bill_hs_tax_candidate(
@@ -1027,6 +1583,11 @@ async def qualify_bill_product_candidates(
                 )
             )
             continue
+        match = replace(
+            match,
+            bill_product_name=product,
+            bill_has_manifest_detail=matched_manifest_detail,
+        )
         key = candidate_identity(match)
         if key not in seen:
             seen.add(key)
@@ -1087,10 +1648,23 @@ async def qualify_bill_product_query_candidate(
             await asyncio.sleep(max(1.0, crawler.settings.delay))
         try:
             product_results = await cached_search_product(crawler, query_name or product, material, query_cache)
-            selected = select_qualified_tax_data(product_results, rules, enforce_tax_limit=False)
+            selected = select_qualified_tax_data(
+                product_results,
+                rules,
+                enforce_tax_limit=False,
+                ignore_certifications=True,
+                semantic_name=query_name or product,
+                semantic_material=material,
+                semantic_usage=candidate.usage,
+            )
             if selected:
                 return attach_tax_data(candidate, selected, match_source)
-            detail = summarize_tax_candidate_rejections(product_results, rules, enforce_tax_limit=False)
+            detail = summarize_tax_candidate_rejections(
+                product_results,
+                rules,
+                enforce_tax_limit=False,
+                ignore_certifications=True,
+            )
             return replace(
                 candidate,
                 filter_reason=(
@@ -1217,19 +1791,24 @@ def select_initial_candidates(
 ) -> list[ProductCandidate]:
     selected: list[ProductCandidate] = []
     selected_keys: set[tuple[str, str, str]] = set()
+    selected_semantic_keys: set[str] = set()
     for candidate in bill_required:
         key = candidate_identity(candidate)
-        if key not in selected_keys:
+        semantic_keys = candidate_semantic_keys(candidate)
+        if key not in selected_keys and not (semantic_keys & selected_semantic_keys):
             selected.append(candidate)
             selected_keys.add(key)
+            selected_semantic_keys.update(semantic_keys)
     for candidate in sorted(qualified_manifest, key=lambda item: selection_score(item, rules), reverse=True):
         if len(selected) >= target_item_count:
             break
         key = candidate_identity(candidate)
-        if key in selected_keys:
+        semantic_keys = candidate_semantic_keys(candidate)
+        if key in selected_keys or semantic_keys & selected_semantic_keys:
             continue
         selected.append(candidate)
         selected_keys.add(key)
+        selected_semantic_keys.update(semantic_keys)
     return selected
 
 
@@ -1445,11 +2024,7 @@ async def qualify_manual_invoice_replacements(
 ) -> tuple[list[ProductCandidate], list[ProductCandidate], int]:
     selected_keys = {candidate_identity(candidate) for candidate in selected}
     eligible_replacement_pool = exclude_bill_product_replacements(replacement_pool, bill_products or [])
-    stable_reference_candidates = [
-        candidate
-        for candidate in exclude_bill_product_replacements(load_default_reference_manual_candidates(), bill_products or [])
-        if candidate_identity(candidate) not in selected_keys
-    ]
+    stable_reference_candidates = load_stable_manual_invoice_candidates(selected, bill_products or [])
     for candidate in stable_reference_candidates:
         selected_keys.add(candidate_identity(candidate))
     seeds = [
@@ -1461,6 +2036,14 @@ async def qualify_manual_invoice_replacements(
     filtered: list[ProductCandidate] = []
     attempts = 0
     for seed in seeds:
+        if is_customer_codebook_candidate(seed):
+            key = candidate_identity(seed)
+            if key not in selected_keys:
+                selected_keys.add(key)
+                qualified.append(seed)
+            if len(qualified) >= MANUAL_INVOICE_REPLACEMENT_POOL_SIZE:
+                break
+            continue
         if attempts >= MANUAL_INVOICE_REPLACEMENT_QUERY_LIMIT:
             break
         if len(qualified) >= MANUAL_INVOICE_REPLACEMENT_POOL_SIZE:
@@ -1495,6 +2078,117 @@ async def qualify_manual_invoice_replacements(
             },
         )
     return qualified, filtered, attempts
+
+
+def load_stable_manual_invoice_candidates(
+    selected: list[ProductCandidate],
+    bill_products: list[str],
+) -> list[ProductCandidate]:
+    selected_keys = {candidate_identity(candidate) for candidate in selected}
+    return [
+        candidate
+        for candidate in exclude_bill_product_replacements(
+            load_default_reference_manual_candidates(), bill_products
+        )
+        if candidate_identity(candidate) not in selected_keys
+    ]
+
+
+def build_manual_invoice_replacement_seeds(
+    replacement_pool: list[ProductCandidate],
+    selected: list[ProductCandidate],
+    bill_products: list[str],
+) -> list[ProductCandidate]:
+    selected_keys = {candidate_identity(candidate) for candidate in selected}
+    return [
+        candidate
+        for candidate in sorted(
+            exclude_bill_product_replacements(replacement_pool, bill_products),
+            key=manual_invoice_replacement_seed_order,
+        )
+        if candidate_identity(candidate) not in selected_keys
+    ]
+
+
+async def qualify_manual_invoice_replacement_batch(
+    crawler: StrictTaxCrawler,
+    seeds: list[ProductCandidate],
+    start_index: int,
+    selected: list[ProductCandidate],
+    rules: SelectionRules,
+    *,
+    prior_network_attempts: int = 0,
+    batch_size: int = ADAPTIVE_REPLACEMENT_BATCH_SIZE,
+    query_cache: Optional[QueryCache] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> tuple[list[ProductCandidate], list[ProductCandidate], int, int]:
+    selected_keys = {candidate_identity(candidate) for candidate in selected}
+    qualified: list[ProductCandidate] = []
+    filtered: list[ProductCandidate] = []
+    network_attempts = 0
+    cursor = max(0, start_index)
+    while cursor < len(seeds) and len(qualified) < batch_size:
+        seed = seeds[cursor]
+        if candidate_identity(seed) in selected_keys:
+            cursor += 1
+            continue
+        if is_customer_codebook_candidate(seed):
+            qualified.append(seed)
+            selected_keys.add(candidate_identity(seed))
+            cursor += 1
+            continue
+        if network_attempts >= batch_size:
+            break
+        if prior_network_attempts + network_attempts > 0:
+            await asyncio.sleep(crawler.settings.delay)
+        network_attempts += 1
+        cursor += 1
+        result, rejected = await qualify_candidates(
+            crawler,
+            [seed],
+            rules,
+            query_cache=query_cache,
+            enforce_tax_limit=False,
+        )
+        filtered.extend(rejected)
+        for candidate in result:
+            key = candidate_identity(candidate)
+            if key in selected_keys:
+                continue
+            selected_keys.add(key)
+            qualified.append(candidate)
+        await emit_progress(
+            progress_callback,
+            {
+                "stage": "manual_invoice_replacement_pool",
+                "status": "running",
+                "progress": round(
+                    91 + min(1.0, (prior_network_attempts + network_attempts) / MANUAL_INVOICE_REPLACEMENT_QUERY_LIMIT),
+                    2,
+                ),
+                "message": (
+                    "首轮无解，已按需查询替换候选 "
+                    f"{prior_network_attempts + network_attempts}/{MANUAL_INVOICE_REPLACEMENT_QUERY_LIMIT}"
+                ),
+                "current": prior_network_attempts + network_attempts,
+                "qualified": len(qualified),
+                "filtered": len(filtered),
+            },
+        )
+    return qualified, filtered, cursor, network_attempts
+
+
+def manual_invoice_solution_is_acceptable(
+    summary: dict[str, Any],
+    options: ProcessingOptions,
+) -> bool:
+    estimated_tax = to_float(summary.get("estimated_tax"))
+    score = to_float(summary.get("score"))
+    if estimated_tax is None or score is None:
+        return False
+    if estimated_tax > target_tax_upper_bound(options.target_tax_amount) + 0.01:
+        return False
+    return abs(estimated_tax - options.target_tax_amount) <= TAX_FINAL_TOLERANCE_USD
 
 
 def manual_invoice_replacement_seed_order(candidate: ProductCandidate) -> tuple[float, float, float]:
@@ -1541,6 +2235,7 @@ def exclude_bill_product_replacements(
 def candidate_has_product_tax_match(candidate: ProductCandidate) -> bool:
     return candidate.tax_match_source in {
         "product",
+        "manifest_group_hs",
         "bill_hs",
         "bill_product",
         "bill_product_no_material",
@@ -1550,6 +2245,12 @@ def candidate_has_product_tax_match(candidate: ProductCandidate) -> bool:
 
 def infer_bill_material_from_entry(entry: BillProduct) -> str:
     text = normalize_text(entry.name)
+    if "polyester" in text or "涤纶" in text or "化纤" in text or "合纤" in text:
+        return "Polyester"
+    if "cotton" in text or "棉" in text:
+        return "Cotton"
+    if "wool" in text or "羊毛" in text:
+        return "Wool"
     if "plastic" in text or "塑料" in text or "塑胶" in text or "pvc" in text or "polypropylene" in text or "polyethylene" in text:
         return "Plastic"
     if "iron" in text or "steel" in text or "metal" in text or "metallic" in text or "铁" in text or "金属" in text:
@@ -1569,6 +2270,132 @@ def infer_bill_material_from_entry(entry: BillProduct) -> str:
     if "silicone" in text or "硅胶" in text:
         return "Silicone"
     return ""
+
+
+def material_family(value: Any) -> str:
+    text = normalize_text(value)
+    families = (
+        ("polyester", ("polyester", "涤纶")),
+        ("cotton", ("cotton", "棉")),
+        ("wool", ("wool", "羊毛")),
+        ("plastic", ("plastic", "塑料", "塑胶", "pvc", "polyethylene", "polypropylene", "聚乙烯", "聚丙烯")),
+        ("metal", ("iron", "steel", "metal", "铁", "钢", "金属")),
+        ("wood", ("wood", "木")),
+        ("glass", ("glass", "玻璃")),
+        ("paper", ("paper", "纸")),
+        ("rubber", ("rubber", "橡胶")),
+        ("ceramic", ("ceramic", "陶瓷")),
+        ("silicone", ("silicone", "硅胶")),
+        ("fabric", ("fabric", "cloth", "textile", "布", "纺织")),
+    )
+    for family, terms in families:
+        if any(term in text for term in terms):
+            return family
+    return ""
+
+
+def candidate_material_matches_bill(candidate: ProductCandidate, bill_material: str) -> bool:
+    expected = material_family(bill_material)
+    actual = material_family(candidate.material)
+    return not expected or not actual or expected == actual
+
+
+def product_family(value: Any) -> str:
+    text = normalize_text(value)
+    families = (
+        ("pillowcase", ("pillowcase", "pillow case", "枕套")),
+        ("curtain", ("curtain", "drape", "窗帘", "帘")),
+        ("scarf", ("scarf", "shawl", "headscarf", "围巾", "披巾", "头巾")),
+        ("keychain", ("keychain", "key chain", "keyring", "key ring", "钥匙扣", "钥匙圈")),
+        ("wall_hanging", ("wall hanging", "wall tapestry", "挂画", "壁挂")),
+        ("bag", ("bag", "bags", "pouch", "sack", "包", "袋", "箱包", "衣箱", "容器")),
+        ("jewelry", ("jewelry", "jewellery", "首饰", "饰品")),
+        ("bracket", ("bracket", "holder", "stand", "support", "支架", "托架")),
+        ("top", ("women s top", "womens top", "blouse", "shirt", "上衣", "女衬衫", "衬衫")),
+        ("cup", ("cup", "tumbler", "杯")),
+        ("christmas", ("christmas", "圣诞")),
+        ("ornament", ("ornament", "statuette", "sculpture", "装饰品", "雕塑")),
+    )
+    for family, terms in families:
+        if any(term in text for term in terms):
+            return family
+    return ""
+
+
+def tax_candidate_semantic_mismatch_reason(
+    data: dict[str, Any],
+    product_name: str,
+    material: str,
+) -> str:
+    description = clean_text(data.get("description_cn"))
+    expected_product = product_family(product_name)
+    actual_product = product_family(description)
+    if expected_product and actual_product and expected_product != actual_product:
+        return f"Codeflag 品类 {actual_product} 与申报品类 {expected_product} 不一致"
+    if material_semantic_score(description, material) <= -100:
+        return f"Codeflag 描述材质与申报材质 {material_family(material) or clean_text(material)} 不一致"
+    return ""
+
+
+def material_semantic_score(description: str, material: str) -> int:
+    expected = material_family(material)
+    if not expected:
+        return 0
+    text = normalize_text(description)
+    if expected == "polyester":
+        if any(term in text for term in ("cotton", "棉", "wool", "羊毛", "polyethylene", "polypropylene", "聚乙烯", "聚丙烯")):
+            return -100
+        if "polyester" in text or "涤纶" in text:
+            return 6
+        if any(
+            term in text
+            for term in (
+                "synthetic fiber",
+                "chemical fiber",
+                "man made textile",
+                "化纤",
+                "化学纤维",
+                "合纤",
+                "人造纤维",
+                "人造纺织",
+            )
+        ):
+            return 5
+        if any(term in text for term in ("textile", "fabric", "纺织", "布")):
+            return 2
+        actual = material_family(description)
+        return -100 if actual and actual != "fabric" else 0
+    actual = material_family(description)
+    if actual == expected:
+        return 4
+    if actual:
+        return -100
+    return 0
+
+
+def tax_candidate_semantic_score(
+    data: dict[str, Any],
+    product_name: str,
+    material: str,
+    usage: str,
+) -> int:
+    description = clean_text(data.get("description_cn"))
+    expected_product = product_family(product_name)
+    actual_product = product_family(description)
+    score = 0
+    if expected_product:
+        score += 4 if expected_product == actual_product else -2
+    score += material_semantic_score(description, material)
+    usage_text = normalize_text(usage)
+    description_text = normalize_text(description)
+    if any(term in usage_text for term in ("storage", "packaging", "收纳", "储存", "包装")):
+        if any(term in description_text for term in ("包装", "储运", "容器", "袋", "包")):
+            score += 1
+    if any(term in description_text for term in ("bulk", "散货", "散装")) and not any(
+        term in normalize_text(product_name) for term in ("bulk", "散货", "散装")
+    ):
+        score -= 3
+    return score
 
 
 def should_infer_material_from_hs(material: str) -> bool:
@@ -1638,7 +2465,7 @@ def build_manifest_candidates(manifest: ManifestSummary) -> list[ProductCandidat
         candidates.append(
             ProductCandidate(
                 source="manifest_group",
-                source_label=f"{manifest.filename}/HS归并",
+                source_label=f"{manifest.filename}/{'HS归并' if group.hs else '品名归并'}",
                 zh=group.canonical_zh,
                 en=group.canonical_en or group.canonical_zh,
                 hs=group.hs,
@@ -1658,15 +2485,27 @@ def build_manifest_candidates(manifest: ManifestSummary) -> list[ProductCandidat
     return sorted(candidates, key=lambda item: item.score, reverse=True)
 
 
+def ensure_manifest_codeflag_candidates(
+    manifest: ManifestSummary,
+    candidates: list[ProductCandidate],
+) -> None:
+    if manifest.row_count > 0 and not candidates:
+        raise RuntimeError(
+            "manifest_schema_unresolved: "
+            "清单识别到商品行，但没有生成 Codeflag 查询候选，请检查字段映射和商品解析结果"
+        )
+
+
 def build_manifest_hs_groups(manifest: ManifestSummary) -> list[ManifestHsGroup]:
-    groups: dict[str, ManifestHsGroup] = {}
-    skipped_rows: list[int] = []
+    groups: dict[tuple[str, str, str, str], ManifestHsGroup] = {}
     for item in manifest.items:
         hs = normalize_hs(item.hs)
         if len(hs) != 10:
-            skipped_rows.append(item.row)
+            hs = ""
+        if not hs and not clean_text(item.zh or item.en):
             continue
-        group = groups.setdefault(hs, ManifestHsGroup(hs=hs))
+        key = manifest_group_identity(item, hs)
+        group = groups.setdefault(key, ManifestHsGroup(hs=hs))
         group.source_rows.append(item.row)
         append_unique(group.zh_names, item.zh)
         append_unique(group.en_names, item.en)
@@ -1692,9 +2531,20 @@ def build_manifest_hs_groups(manifest: ManifestSummary) -> list[ManifestHsGroup]
             group.warnings.append("该 HS group 缺少有效数量")
         if not group.total_gross_weight and not group.total_real_weight:
             group.warnings.append("该 HS group 缺少有效重量")
+        if not group.hs:
+            group.warnings.append("原清单未提供有效 HS，使用品名和材质查询 Codeflag")
         round_manifest_group_totals(group)
         result.append(group)
     return sorted(result, key=lambda item: item.total_gross_weight + item.total_declared_value / 100, reverse=True)
+
+
+def manifest_group_identity(item: ManifestItem, hs: str) -> tuple[str, str, str, str]:
+    return (
+        hs,
+        normalize_text(item.zh),
+        normalize_text(item.en),
+        normalize_text(item.material),
+    )
 
 
 def append_unique(values: list[str], value: Any) -> None:
@@ -1788,6 +2638,13 @@ async def qualify_single_candidate(
     product_reason = product_rule_reason(candidate, rules)
     if product_reason:
         return replace(candidate, filter_reason=product_reason)
+    if is_customer_codebook_candidate(candidate):
+        if candidate_tax_rate(candidate) >= CUSTOMER_CODEBOOK_TAX_LIMIT:
+            return replace(
+                candidate,
+                filter_reason=f"客户编码库总税率 {format_rate(candidate_tax_rate(candidate))} 不小于 30%",
+            )
+        return replace(candidate, filter_reason="")
 
     errors: list[str] = []
     if candidate.source in {"replacement", "manifest_group"} and normalize_hs(candidate.hs):
@@ -1798,9 +2655,20 @@ async def qualify_single_candidate(
                 rules,
                 required_hs=candidate.hs,
                 enforce_tax_limit=enforce_tax_limit,
+                prefer_first=True,
+                ignore_certifications=True,
             )
             if selected:
-                return attach_tax_data(candidate, selected, f"{candidate.source}_hs")
+                attached = attach_tax_data(candidate, selected, f"{candidate.source}_hs")
+                value_limit_reason = tax_description_unit_value_limit_reason(attached, selected)
+                if value_limit_reason:
+                    return replace(
+                        attached,
+                        compliance_review_required=True,
+                        compliance_review_reason=value_limit_reason,
+                        row_warnings=[*attached.row_warnings, value_limit_reason],
+                    )
+                return attached
             errors.append("原始 HTS 查询无合格结果")
         except Exception as exc:
             errors.append(f"原始 HTS 查询失败: {exc}")
@@ -1813,6 +2681,10 @@ async def qualify_single_candidate(
             rules,
             required_hs=required_hs,
             enforce_tax_limit=enforce_tax_limit,
+            ignore_certifications=True,
+            semantic_name=candidate.zh or candidate.en,
+            semantic_material=candidate.material,
+            semantic_usage=candidate.usage,
         )
         if selected:
             return attach_tax_data(candidate, selected, "product")
@@ -1831,6 +2703,8 @@ async def qualify_single_candidate(
                 rules,
                 required_hs=candidate.hs,
                 enforce_tax_limit=enforce_tax_limit,
+                prefer_first=True,
+                ignore_certifications=True,
             )
             if selected:
                 return attach_tax_data(candidate, selected, "hs")
@@ -1996,13 +2870,18 @@ def candidate_reference_unit_price(candidate: ProductCandidate) -> float:
     return 0.0
 
 
-def selection_score(candidate: ProductCandidate, rules: SelectionRules) -> tuple[int, float, float]:
+def selection_score(candidate: ProductCandidate, rules: SelectionRules) -> tuple[int, int, float, float]:
     rate = candidate_tax_rate(candidate)
     reference_price = candidate_reference_unit_price(candidate)
     price_tax_pressure = max(0.0, reference_price) * max(0.0, rate)
     penalty = 1.0 + rate * 8.0 + price_tax_pressure * 6.0
     feasibility_score = candidate.score / penalty
-    return (1 if product_is_allowed(candidate, rules) else 0, feasibility_score, candidate.score)
+    return (
+        1 if product_is_allowed(candidate, rules) else 0,
+        0 if candidate.compliance_review_required else 1,
+        feasibility_score,
+        candidate.score,
+    )
 
 
 def select_qualified_tax_data(
@@ -2010,19 +2889,67 @@ def select_qualified_tax_data(
     rules: SelectionRules,
     required_hs: str = "",
     enforce_tax_limit: bool = True,
+    prefer_first: bool = False,
+    ignore_certifications: bool = False,
+    semantic_name: str = "",
+    semantic_material: str = "",
+    semantic_usage: str = "",
 ) -> Optional[dict[str, Any]]:
-    ranked: list[tuple[int, float, dict[str, Any]]] = []
-    for data in candidates.values():
+    ranked: list[tuple[Any, ...]] = []
+    for order, data in enumerate(candidates.values()):
         if required_hs and not tax_candidate_matches_required_hs(data, required_hs):
             continue
-        reason = tax_filter_reason(data, rules, enforce_tax_limit=enforce_tax_limit)
+        reason = tax_filter_reason(
+            data,
+            rules,
+            enforce_tax_limit=enforce_tax_limit,
+            ignore_certifications=ignore_certifications,
+        )
         if reason:
             continue
+        if semantic_name and tax_candidate_semantic_mismatch_reason(
+            data,
+            semantic_name,
+            semantic_material,
+        ):
+            continue
         anti_dumping_penalty = 1 if data.get("anti_dumping") else 0
-        ranked.append((anti_dumping_penalty, effective_tax_rate(data), base_tax_rate(data) or 0, data))
+        if prefer_first:
+            ranked.append((order, 0.0, 0.0, 0.0, 0.0, data))
+        elif semantic_name or semantic_material or semantic_usage:
+            semantic_score = tax_candidate_semantic_score(
+                data,
+                semantic_name,
+                semantic_material,
+                semantic_usage,
+            )
+            certification_penalty = 1 if (
+                data.get("certification_required") or data.get("certification_texts")
+            ) else 0
+            ranked.append(
+                (
+                    -semantic_score,
+                    certification_penalty,
+                    anti_dumping_penalty,
+                    effective_tax_rate(data),
+                    base_tax_rate(data) or 0,
+                    order,
+                    data,
+                )
+            )
+        else:
+            ranked.append(
+                (
+                    anti_dumping_penalty,
+                    effective_tax_rate(data),
+                    base_tax_rate(data) or 0,
+                    order,
+                    data,
+                )
+            )
     if not ranked:
         return None
-    return sorted(ranked, key=lambda item: (item[0], item[1], item[2]))[0][3]
+    return sorted(ranked, key=lambda item: item[:-1])[0][-1]
 
 
 def summarize_tax_candidate_rejections(
@@ -2030,6 +2957,7 @@ def summarize_tax_candidate_rejections(
     rules: SelectionRules,
     required_hs: str = "",
     enforce_tax_limit: bool = True,
+    ignore_certifications: bool = False,
     limit: int = 4,
 ) -> str:
     if not candidates:
@@ -2041,7 +2969,12 @@ def summarize_tax_candidate_rejections(
         if required_hs and not tax_candidate_matches_required_hs(data, required_hs):
             reason = f"不匹配指定 HTS {normalize_hs(required_hs)}"
         else:
-            reason = tax_filter_reason(data, rules, enforce_tax_limit=enforce_tax_limit)
+            reason = tax_filter_reason(
+                data,
+                rules,
+                enforce_tax_limit=enforce_tax_limit,
+                ignore_certifications=ignore_certifications,
+            )
         if not reason:
             continue
         item = f"{hs}: {reason}"
@@ -2072,7 +3005,12 @@ def tax_candidate_matches_required_hs(data: dict[str, Any], required_hs: str) ->
     return False
 
 
-def tax_filter_reason(data: dict[str, Any], rules: SelectionRules, enforce_tax_limit: bool = True) -> str:
+def tax_filter_reason(
+    data: dict[str, Any],
+    rules: SelectionRules,
+    enforce_tax_limit: bool = True,
+    ignore_certifications: bool = False,
+) -> str:
     hs = normalize_hs(data.get("hs_code_us"))
     if len(hs) != 10:
         return "美国 HTS 不是 10 位"
@@ -2085,10 +3023,49 @@ def tax_filter_reason(data: dict[str, Any], rules: SelectionRules, enforce_tax_l
         combined_rate = effective_tax_rate(data)
         if combined_rate >= BASE_TAX_LIMIT:
             return f"综合税率 {format_rate(combined_rate)} 不小于 20%"
-    cert_reason = certification_filter_reason(data.get("certification_texts") or [], rules)
-    if cert_reason:
-        return cert_reason
+    if not ignore_certifications:
+        cert_reason = certification_filter_reason(data.get("certification_texts") or [], rules)
+        if cert_reason:
+            return cert_reason
     return ""
+
+
+def tax_description_unit_value_limit_usd(data: dict[str, Any]) -> Optional[float]:
+    text = " ".join(
+        clean_text(data.get(key))
+        for key in ("description_cn", "taric", "source_description_cn")
+        if clean_text(data.get(key))
+    ).lower()
+    limits: list[float] = []
+    patterns = (
+        (r"valued\s+not\s+over\s+(\d+(?:\.\d+)?)\s*cents?\s+per\s+(?:piece|item|article)", 0.01),
+        (r"valued\s+not\s+over\s+\$?\s*(\d+(?:\.\d+)?)\s*(?:usd|dollars?)?\s+per\s+(?:piece|item|article)", 1.0),
+        (r"每件价值不超过\s*(\d+(?:\.\d+)?)\s*美分", 0.01),
+        (r"每件(?:价值)?不超过\s*(\d+(?:\.\d+)?)\s*(?:美元|usd)", 1.0),
+    )
+    for pattern, factor in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            limits.append(float(match) * factor)
+    return min(limits) if limits else None
+
+
+def tax_description_unit_value_limit_reason(
+    candidate: ProductCandidate,
+    data: dict[str, Any],
+) -> str:
+    limit = tax_description_unit_value_limit_usd(data)
+    if limit is None:
+        return ""
+    unit_price = to_float(candidate.unit_price)
+    if (unit_price is None or unit_price <= 0) and candidate.declared_value and candidate.qty:
+        unit_price = candidate.declared_value / candidate.qty
+    if unit_price is None or unit_price <= limit + 0.0001:
+        return ""
+    hs = normalize_hs(data.get("hs_code_us")) or normalize_hs(candidate.hs)
+    return (
+        f"Codeflag HTS {hs} 限定每件价值不超过 {limit:.4f} USD，"
+        f"原始清单单价 {unit_price:.4f} USD；仅在合格候选不足时保留并要求人工复核"
+    )
 
 
 def attach_tax_data(candidate: ProductCandidate, data: dict[str, Any], match_source: str) -> ProductCandidate:
@@ -2146,32 +3123,170 @@ async def ensure_candidate_plausibility_ranges(
     known_ranges: dict[tuple[str, str, str], PlausibilityRange],
     llm: LLMClient,
     query_cache: Optional[QueryCache] = None,
+    metrics: Optional[dict[str, Any]] = None,
 ) -> tuple[list[ProductCandidate], bool]:
-    result: list[ProductCandidate] = []
-    llm_used = False
-    for candidate in candidates:
+    result: list[Optional[ProductCandidate]] = [None] * len(candidates)
+    unresolved: list[tuple[int, ProductCandidate]] = []
+    cache_hits = 0
+    for index, candidate in enumerate(candidates):
         known = lookup_plausibility_range(candidate, known_ranges)
         if known and plausibility_range_is_complete(known):
-            result.append(replace(candidate, plausibility_range=with_default_plausibility_bounds(known)))
+            result[index] = replace(candidate, plausibility_range=with_default_plausibility_bounds(known))
             continue
         if not should_use_llm_for_plausibility(candidate, known):
             derived = derive_candidate_plausibility_range(candidate)
             if plausibility_range_is_complete(derived):
-                result.append(replace(candidate, plausibility_range=with_default_plausibility_bounds(derived)))
+                result[index] = replace(candidate, plausibility_range=with_default_plausibility_bounds(derived))
                 continue
-        estimated = await estimate_candidate_plausibility_with_llm(llm, candidate, manifest, bill, query_cache)
-        llm_used = True
-        if not plausibility_range_is_complete(estimated):
-            raise RuntimeError(f"LLM 未能给出完整合理范围，不能生成: {candidate.zh}/{candidate.en}")
-        result.append(
-            replace(
-                candidate,
-                plausibility_range=with_default_plausibility_bounds(estimated),
-                plausibility_confidence=range_confidence(estimated),
-                plausibility_basis=estimated.source,
-            )
+        cached = cached_candidate_plausibility(llm, candidate, manifest, bill, query_cache)
+        if cached is not None:
+            result[index] = attach_candidate_plausibility(candidate, cached)
+            cache_hits += 1
+            continue
+        unresolved.append((index, candidate))
+
+    batch_calls = 0
+    individual_calls = 0
+    fallback_candidates: list[tuple[int, ProductCandidate]] = []
+    if len(unresolved) == 1:
+        fallback_candidates = unresolved
+    elif unresolved:
+        semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
+        chunks = [
+            unresolved[offset : offset + LLM_PLAUSIBILITY_BATCH_SIZE]
+            for offset in range(0, len(unresolved), LLM_PLAUSIBILITY_BATCH_SIZE)
+        ]
+
+        async def run_batch(chunk: list[tuple[int, ProductCandidate]]) -> list[tuple[int, ProductCandidate]]:
+            nonlocal batch_calls
+            batch_calls += 1
+            try:
+                async with semaphore:
+                    payload = await llm.chat_json(
+                        build_batch_plausibility_messages(chunk, manifest, bill),
+                        temperature=0.1,
+                        max_tokens=8192,
+                    )
+                parsed = normalize_batch_plausibility_payload(payload, chunk)
+            except Exception:
+                return chunk
+            missing: list[tuple[int, ProductCandidate]] = []
+            for index, candidate in chunk:
+                estimated = parsed.get(index)
+                if estimated is None or not plausibility_range_is_complete(estimated):
+                    missing.append((index, candidate))
+                    continue
+                cache_candidate_plausibility(llm, candidate, manifest, bill, estimated, query_cache)
+                result[index] = attach_candidate_plausibility(candidate, estimated)
+            return missing
+
+        missing_groups = await asyncio.gather(*(run_batch(chunk) for chunk in chunks))
+        fallback_candidates = [item for group in missing_groups for item in group]
+
+    if fallback_candidates:
+        semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
+
+        async def run_individual(index: int, candidate: ProductCandidate) -> None:
+            nonlocal individual_calls
+            individual_calls += 1
+            async with semaphore:
+                estimated = await estimate_candidate_plausibility_with_llm(
+                    llm, candidate, manifest, bill, query_cache
+                )
+            if not plausibility_range_is_complete(estimated):
+                raise RuntimeError(f"LLM 未能给出完整合理范围，不能生成: {candidate.zh}/{candidate.en}")
+            result[index] = attach_candidate_plausibility(candidate, estimated)
+
+        await asyncio.gather(*(run_individual(index, candidate) for index, candidate in fallback_candidates))
+
+    finalized = [candidate for candidate in result if candidate is not None]
+    if len(finalized) != len(candidates):
+        raise RuntimeError("LLM 合理性估算结果数量不完整")
+    if metrics is not None:
+        metrics.update(
+            {
+                "candidate_count": len(candidates),
+                "llm_candidate_count": len(unresolved),
+                "batch_calls": batch_calls,
+                "individual_fallback_calls": individual_calls,
+                "cache_hits": cache_hits,
+                "max_concurrency": LLM_MAX_CONCURRENCY,
+            }
         )
-    return result, llm_used
+    return finalized, bool(unresolved)
+
+
+def attach_candidate_plausibility(
+    candidate: ProductCandidate,
+    estimated: PlausibilityRange,
+) -> ProductCandidate:
+    return replace(
+        candidate,
+        plausibility_range=with_default_plausibility_bounds(estimated),
+        plausibility_confidence=range_confidence(estimated),
+        plausibility_basis=estimated.source,
+    )
+
+
+def build_batch_plausibility_messages(
+    candidates: list[tuple[int, ProductCandidate]],
+    manifest: ManifestSummary,
+    bill: BillInfo,
+) -> list[dict[str, str]]:
+    context = {
+        "manifest_total_weight_kg": manifest.total_real_weight,
+        "manifest_total_ctns": manifest.total_ctns,
+        "bill_products": bill.products,
+        "candidates": [
+            {"candidate_id": f"candidate-{index}", **candidate_to_llm_dict(candidate)}
+            for index, candidate in candidates
+        ],
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是美国清关商业发票合理性审核专家。批量估算每个候选的合理申报范围。"
+                "不得修改 candidate_id、HS 或税率，不要为了满足目标税金压低价格或重量。只返回 JSON object。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "为每个候选返回正数范围，min <= max，单位为 USD、kg、PCS/CTN。"
+                "必须逐个覆盖输入 candidate_id。\n"
+                "JSON格式：{\"candidates\":[{\"candidate_id\":\"candidate-0\","
+                "\"unit_price_min\":0.0,\"unit_price_max\":0.0,"
+                "\"kg_per_pc_min\":0.0,\"kg_per_pc_max\":0.0,"
+                "\"qty_per_ctn_min\":0.0,\"qty_per_ctn_max\":0.0,"
+                "\"kg_per_ctn_min\":0.0,\"kg_per_ctn_max\":0.0,"
+                "\"confidence\":0.0,\"basis\":\"\"}]}\n"
+                f"上下文：{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
+            ),
+        },
+    ]
+
+
+def normalize_batch_plausibility_payload(
+    payload: dict[str, Any],
+    candidates: list[tuple[int, ProductCandidate]],
+) -> dict[int, PlausibilityRange]:
+    raw_items = payload.get("candidates") or payload.get("items") or payload.get("results") or []
+    if not isinstance(raw_items, list):
+        return {}
+    by_id = {
+        clean_text(item.get("candidate_id")): item
+        for item in raw_items
+        if isinstance(item, dict) and clean_text(item.get("candidate_id"))
+    }
+    result: dict[int, PlausibilityRange] = {}
+    for index, candidate in candidates:
+        item = by_id.get(f"candidate-{index}")
+        if not item:
+            continue
+        ranges = item.get("ranges") if isinstance(item.get("ranges"), dict) else item
+        result[index] = normalize_llm_plausibility_payload(ranges, candidate)
+    return result
 
 
 def should_use_llm_for_plausibility(candidate: ProductCandidate, known: Optional[PlausibilityRange]) -> bool:
@@ -2234,6 +3349,80 @@ def range_confidence(value: PlausibilityRange) -> float:
     return max(0.0, min(1.0, parsed or 0.0))
 
 
+def candidate_plausibility_context(
+    candidate: ProductCandidate,
+    manifest: ManifestSummary,
+    bill: BillInfo,
+) -> dict[str, Any]:
+    return {
+        "candidate": candidate_to_llm_dict(candidate),
+        "manifest_total_weight_kg": manifest.total_real_weight,
+        "manifest_total_ctns": manifest.total_ctns,
+        "bill_products": bill.products,
+    }
+
+
+def candidate_plausibility_cache_key(
+    llm: LLMClient,
+    candidate: ProductCandidate,
+    manifest: ManifestSummary,
+    bill: BillInfo,
+) -> str:
+    model = clean_text(getattr(getattr(llm, "settings", None), "model", "")) or llm.__class__.__name__
+    context = candidate_plausibility_context(candidate, manifest, bill)
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "kind": "plausibility",
+                "prompt_version": LLM_PLAUSIBILITY_PROMPT_VERSION,
+                "model": model,
+                **context,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8", errors="ignore")
+    ).hexdigest()
+
+
+def cached_candidate_plausibility(
+    llm: LLMClient,
+    candidate: ProductCandidate,
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    query_cache: Optional[QueryCache],
+) -> Optional[PlausibilityRange]:
+    if query_cache is None:
+        return None
+    cache_key = candidate_plausibility_cache_key(llm, candidate, manifest, bill)
+    payload = query_cache.setdefault("llm_plausibility", {}).get(cache_key)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("_normalized_range") is True:
+        values = {key: value for key, value in payload.items() if key != "_normalized_range"}
+        try:
+            return normalize_plausibility_range_bounds(PlausibilityRange(**values))
+        except TypeError:
+            return None
+    return normalize_llm_plausibility_payload(payload, candidate)
+
+
+def cache_candidate_plausibility(
+    llm: LLMClient,
+    candidate: ProductCandidate,
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    plausibility: PlausibilityRange,
+    query_cache: Optional[QueryCache],
+) -> None:
+    if query_cache is None:
+        return
+    cache_key = candidate_plausibility_cache_key(llm, candidate, manifest, bill)
+    query_cache.setdefault("llm_plausibility", {})[cache_key] = {
+        "_normalized_range": True,
+        **asdict(plausibility),
+    }
+
+
 async def estimate_candidate_plausibility_with_llm(
     llm: LLMClient,
     candidate: ProductCandidate,
@@ -2241,24 +3430,14 @@ async def estimate_candidate_plausibility_with_llm(
     bill: BillInfo,
     query_cache: Optional[QueryCache] = None,
 ) -> PlausibilityRange:
-    payload_context = {
-        "candidate": candidate_to_llm_dict(candidate),
-        "manifest_total_weight_kg": manifest.total_real_weight,
-        "manifest_total_ctns": manifest.total_ctns,
-        "bill_products": bill.products,
-    }
-    cache_key = hashlib.sha256(
-        json.dumps({"kind": "plausibility", **payload_context}, ensure_ascii=False, sort_keys=True).encode("utf-8", errors="ignore")
-    ).hexdigest()
-    if query_cache is not None:
-        section = query_cache.setdefault("llm_plausibility", {})
-        if cache_key in section and isinstance(section[cache_key], dict):
-            return normalize_llm_plausibility_payload(section[cache_key], candidate)
+    payload_context = candidate_plausibility_context(candidate, manifest, bill)
+    cached = cached_candidate_plausibility(llm, candidate, manifest, bill, query_cache)
+    if cached is not None:
+        return cached
 
     payload = await llm.chat_json(build_plausibility_messages(payload_context), temperature=0.1)
     plausibility = normalize_llm_plausibility_payload(payload, candidate)
-    if query_cache is not None:
-        query_cache.setdefault("llm_plausibility", {})[cache_key] = payload
+    cache_candidate_plausibility(llm, candidate, manifest, bill, plausibility, query_cache)
     return plausibility
 
 
@@ -2359,6 +3538,74 @@ def attach_price_evidence_to_candidates(
         plausibility = adjust_plausibility_with_price_evidence(candidate.plausibility_range, evidence)
         result.append(replace(candidate, price_evidence=evidence, plausibility_range=plausibility))
     return result
+
+
+async def attach_price_evidence_to_candidates_concurrently(
+    candidates: list[ProductCandidate],
+    *,
+    query_cache: Optional[QueryCache] = None,
+    max_concurrency: int = LLM_MAX_CONCURRENCY,
+    metrics: Optional[dict[str, Any]] = None,
+) -> list[ProductCandidate]:
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+    results: list[Optional[ProductCandidate]] = [None] * len(candidates)
+    network_candidates = 0
+    trusted_candidates = 0
+
+    async def enrich(index: int, candidate: ProductCandidate) -> None:
+        nonlocal network_candidates, trusted_candidates
+        if candidate_has_trusted_price_reference(candidate):
+            trusted_candidates += 1
+            evidence = apply_price_fallback(
+                candidate,
+                PriceEvidence(
+                    query=build_price_query(candidate),
+                    basis="trusted candidate unit price",
+                    confidence=0.8,
+                    source="candidate",
+                ).to_dict(),
+            )
+            plausibility = adjust_plausibility_with_price_evidence(candidate.plausibility_range, evidence)
+            results[index] = replace(candidate, price_evidence=evidence, plausibility_range=plausibility)
+            return
+        network_candidates += 1
+        async with semaphore:
+            enriched = await asyncio.to_thread(
+                attach_price_evidence_to_candidates,
+                [candidate],
+                query_cache=None,
+            )
+        results[index] = enriched[0]
+
+    await asyncio.gather(*(enrich(index, candidate) for index, candidate in enumerate(candidates)))
+    finalized = [candidate for candidate in results if candidate is not None]
+    if len(finalized) != len(candidates):
+        raise RuntimeError("价格证据并发处理结果数量不完整")
+    if query_cache is not None:
+        cache = query_cache.setdefault("price", {})
+        for candidate in finalized:
+            cache[product_cache_key(build_price_query(candidate), candidate.material)] = candidate.price_evidence
+    if metrics is not None:
+        metrics.update(
+            {
+                "candidate_count": len(candidates),
+                "network_candidates": network_candidates,
+                "trusted_price_candidates": trusted_candidates,
+                "max_concurrency": max(1, max_concurrency),
+            }
+        )
+    return finalized
+
+
+def candidate_has_trusted_price_reference(candidate: ProductCandidate) -> bool:
+    return bool(
+        candidate.unit_price
+        and candidate.unit_price > 0
+        and (
+            candidate.source_label == "DEFAULT_REFERENCE_STYLE_ROWS"
+            or is_customer_codebook_candidate(candidate)
+        )
+    )
 
 
 def build_price_query(candidate: ProductCandidate) -> str:
@@ -2694,14 +3941,14 @@ def format_rate(value: float) -> str:
 
 
 def load_replacement_candidates(path: Path = REPLACEMENT_WORKBOOK_PATH) -> list[ProductCandidate]:
-    if not path.exists():
-        return []
-    workbook = load_workbook(path, data_only=True)
     candidates: list[ProductCandidate] = []
-    if "常用1" in workbook.sheetnames:
-        candidates.extend(load_common_sheet_candidates(workbook["常用1"]))
-    if "20260330" in workbook.sheetnames:
-        candidates.extend(load_20260330_candidates(workbook["20260330"]))
+    if path.exists():
+        workbook = load_workbook(path, data_only=True)
+        if "常用1" in workbook.sheetnames:
+            candidates.extend(load_common_sheet_candidates(workbook["常用1"]))
+        if "20260330" in workbook.sheetnames:
+            candidates.extend(load_20260330_candidates(workbook["20260330"]))
+    candidates.extend(load_customer_codebook_candidates())
     candidates.extend(load_default_reference_replacement_candidates())
     return dedupe_candidates(candidates)
 
@@ -2716,6 +3963,161 @@ def load_plausibility_ranges(path: Path = REPLACEMENT_WORKBOOK_PATH) -> dict[tup
     if "20260330" in workbook.sheetnames:
         ranges.update(load_20260330_plausibility_ranges(workbook["20260330"]))
     return ranges
+
+
+def load_customer_codebook_candidates(path: Path = CUSTOMER_CODEBOOK_PATH) -> list[ProductCandidate]:
+    if not path.exists():
+        return []
+    workbook = load_workbook(path, data_only=True)
+    candidates: list[ProductCandidate] = []
+    for sheet in workbook.worksheets:
+        header_row = find_customer_codebook_header_row(sheet)
+        if not header_row:
+            continue
+        columns = customer_codebook_columns(sheet, header_row)
+        required = {"zh", "en", "material", "hs", "base_rate", "floating_rate", "fixed_rate"}
+        if not required.issubset(columns):
+            continue
+        for row_idx in range(header_row + 1, sheet.max_row + 1):
+            zh = clean_text(sheet.cell(row_idx, columns["zh"]).value)
+            en = clean_text(sheet.cell(row_idx, columns["en"]).value) or zh
+            material = clean_text(sheet.cell(row_idx, columns["material"]).value)
+            hs = normalize_hs(sheet.cell(row_idx, columns["hs"]).value)
+            if not zh or not hs:
+                continue
+            base_raw = sheet.cell(row_idx, columns["base_rate"]).value
+            floating_raw = sheet.cell(row_idx, columns["floating_rate"]).value
+            fixed_raw = sheet.cell(row_idx, columns["fixed_rate"]).value
+            base_rate = parse_percentage_component_tax_rate(base_raw)
+            floating_rate = parse_percentage_component_tax_rate(floating_raw) or 0.0
+            fixed_rate = parse_percentage_component_tax_rate(fixed_raw) or 0.0
+            if base_rate is None:
+                continue
+            total_rate = base_rate + floating_rate + fixed_rate
+            if total_rate >= CUSTOMER_CODEBOOK_TAX_LIMIT:
+                continue
+            row_warnings: list[str] = []
+            if has_specific_duty_component(base_raw):
+                row_warnings.append(f"复合税率按百分比部分估算，原始基础税率: {clean_text(base_raw)}")
+            plausibility = build_plausibility_range(
+                kg_per_ctn=10.0,
+                kg_per_pc=0.5,
+                unit_price=1.0,
+                ctns=1.0,
+                qty_per_ctn=10.0,
+                source="客户编码库默认合理范围",
+            )
+            candidates.append(
+                ProductCandidate(
+                    source="replacement",
+                    source_label=f"客户编码库/{sheet.title}",
+                    zh=zh,
+                    en=en,
+                    hs=hs,
+                    material=material or "Mixed",
+                    usage="HOME",
+                    real_weight=10.0,
+                    gross_weight=10.0,
+                    ctns=1.0,
+                    qty=10.0,
+                    unit_price=1.0,
+                    declared_value=10.0,
+                    tax_data=customer_codebook_tax_data(hs, base_raw, floating_raw, fixed_raw, total_rate),
+                    base_tax_rate=base_rate,
+                    effective_tax_rate=total_rate,
+                    tax_match_source="customer_codebook",
+                    plausibility_range=plausibility,
+                    plausibility_confidence=0.65,
+                    plausibility_basis=plausibility.source,
+                    row_warnings=row_warnings,
+                )
+            )
+    return candidates
+
+
+def find_customer_codebook_header_row(sheet) -> Optional[int]:
+    for row_idx in range(1, min(sheet.max_row, 10) + 1):
+        values = [normalize_text(sheet.cell(row_idx, col_idx).value) for col_idx in range(1, sheet.max_column + 1)]
+        joined = " ".join(values).replace(" ", "")
+        if "customcode" in joined and ("descriptionofgoods" in joined or "中文品名" in joined):
+            return row_idx
+    return None
+
+
+def customer_codebook_columns(sheet, header_row: int) -> dict[str, int]:
+    columns: dict[str, int] = {}
+    for col_idx in range(1, sheet.max_column + 1):
+        key = normalize_text(sheet.cell(header_row, col_idx).value)
+        compact = key.replace(" ", "")
+        if key in {"中文品名", "chineseproductname"}:
+            columns["zh"] = col_idx
+        elif "descriptionofgoods" in compact or key in {"英文品名", "englishname"}:
+            columns["en"] = col_idx
+        elif "material" in compact or "材质" in key:
+            columns["material"] = col_idx
+        elif "customcode" in compact or "海关编码" in key or key in {"hts", "hscode"}:
+            columns["hs"] = col_idx
+        elif "基本税率" in key or "baserate" in compact:
+            columns["base_rate"] = col_idx
+        elif "浮动加增" in key or "floating" in compact:
+            columns["floating_rate"] = col_idx
+        elif "固定加增" in key or "fixed" in compact:
+            columns["fixed_rate"] = col_idx
+    return columns
+
+
+def customer_codebook_tax_data(
+    hs: str,
+    base_raw: Any,
+    floating_raw: Any,
+    fixed_raw: Any,
+    total_rate: float,
+) -> dict[str, Any]:
+    return {
+        "hs_code_us": normalize_hs(hs),
+        "tax_rate": clean_text(base_raw) or "Free",
+        "additional_tax_rate": "+".join(
+            part
+            for part in (format_raw_rate(floating_raw), format_raw_rate(fixed_raw))
+            if part
+        ),
+        "description_cn": "客户编码库确认可报",
+        "certification_texts": [],
+        "anti_dumping": False,
+        "customer_codebook_total_tax_rate": total_rate,
+    }
+
+
+def format_raw_rate(value: Any) -> str:
+    parsed = parse_percentage_component_tax_rate(value)
+    if parsed is None or parsed == 0:
+        return ""
+    return format_rate(parsed)
+
+
+def parse_percentage_component_tax_rate(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if math.isnan(float(value)):
+            return None
+        number = float(value)
+        return number if abs(number) <= 1 else number / 100
+    text = clean_text(value)
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in {"free", "免税", "无", "n/a", "na", "none", "null", "-"}:
+        return 0.0 if lowered in {"free", "免税", "无"} else None
+    percent_matches = re.findall(r"(-?\d+(?:\.\d+)?)\s*%", text.replace(",", ""))
+    if percent_matches:
+        return sum(float(match) for match in percent_matches) / 100
+    return parse_tax_rate(text)
+
+
+def has_specific_duty_component(value: Any) -> bool:
+    text = normalize_text(value)
+    return "each" in text or "¢" in str(value or "") or "cent" in text
 
 
 def load_common_sheet_plausibility_ranges(sheet) -> dict[tuple[str, str, str], PlausibilityRange]:
@@ -3043,12 +4445,94 @@ def candidate_identity(candidate: ProductCandidate) -> tuple[str, str, str]:
     return (normalize_text(candidate.zh), normalize_text(candidate.en), normalize_hs(candidate.hs))
 
 
+def candidate_semantic_keys(candidate: ProductCandidate) -> set[str]:
+    keys: set[str] = set()
+    zh = normalize_text(candidate.zh)
+    en = normalize_text(candidate.en)
+    if zh:
+        keys.add(f"zh:{zh}")
+    if en:
+        keys.add(f"en:{en}")
+    return keys
+
+
+def candidates_have_duplicate_names(candidates: list[ProductCandidate]) -> bool:
+    seen: set[str] = set()
+    for candidate in candidates:
+        keys = candidate_semantic_keys(candidate)
+        if keys & seen:
+            return True
+        seen.update(keys)
+    return False
+
+
 def candidate_key_from_parts(zh: Any, en: Any, hs: Any) -> tuple[str, str, str]:
     return (normalize_text(zh), normalize_text(en), normalize_hs(hs))
 
 
 def target_tax_upper_bound(target_tax_amount: float) -> float:
     return round(target_tax_amount * (1 + MAX_TAX_OVER_TARGET_RATIO), 2)
+
+
+def output_package_total(bill: BillInfo, row_count: int) -> int:
+    package_count = normalize_carton_count(bill.cartons)
+    if package_count is None:
+        raise RuntimeError("提单未识别到有效包装数量，不能生成与整票包装数量对齐的输出")
+    target = int(package_count)
+    if target < row_count:
+        unit = f" {bill.carton_unit}" if bill.carton_unit else ""
+        raise RuntimeError(
+            f"模型识别的整票包装数量 {package_count:g}{unit} 小于输出行数 {row_count}，"
+            "无法保证每行至少分配一个包装单位并闭合总数"
+        )
+    return target
+
+
+def manifest_net_to_gross_ratio(manifest: ManifestSummary) -> Optional[float]:
+    gross_weight = to_float(manifest.total_real_weight)
+    net_weight = to_float(manifest.total_net_weight)
+    if gross_weight is None or gross_weight <= 0 or net_weight is None or net_weight <= 0:
+        return None
+    if net_weight > gross_weight + 0.01:
+        raise RuntimeError(
+            "manifest_weight_conflict: "
+            f"清单总净重 {net_weight:.4f} kg 大于总毛重 {gross_weight:.4f} kg"
+        )
+    return min(1.0, net_weight / gross_weight)
+
+
+def apply_manifest_net_weights(rows: list[dict[str, Any]], manifest: ManifestSummary) -> None:
+    ratio = manifest_net_to_gross_ratio(manifest)
+    if ratio is None:
+        for row in rows:
+            gross = to_float(row.get("毛重")) or 0.0
+            ctns = to_float(row.get("箱数")) or 0.0
+            row["净重"] = round(max(0.01, gross - ctns), 2)
+            row["净重计算依据"] = "清单未提供完整净重，按毛重减箱数兼容计算"
+            row["净毛重比例"] = round(row["净重"] / gross, 6) if gross else 0
+        return
+
+    gross_values = [max(0.01, to_float(row.get("毛重")) or 0.0) for row in rows]
+    target_net_weight = round(sum(gross_values) * ratio, 2)
+    if target_net_weight < len(rows) * 0.01:
+        raise RuntimeError(
+            f"原始清单净重/毛重比例 {ratio:.6f} 无法为每个输出行分配正净重"
+        )
+    net_values = scale_decimal(gross_values, target_net_weight, 2)
+    for row, gross, net in zip(rows, gross_values, net_values):
+        if net <= 0 or net > gross + 0.01:
+            raise RuntimeError(
+                f"按原始清单净重/毛重比例分配失败: 净重 {net} kg, 毛重 {gross} kg"
+            )
+        row["净重"] = net
+        row["净重计算依据"] = f"原始清单总净重/总毛重={ratio:.6f}"
+        row["净毛重比例"] = round(net / gross, 6)
+
+    actual_net_weight = round(sum(to_float(row.get("净重")) or 0 for row in rows), 2)
+    if abs(actual_net_weight - target_net_weight) > 0.01:
+        raise RuntimeError(
+            f"总净重未按原始清单比例闭合: 目标 {target_net_weight}, 当前 {actual_net_weight}"
+        )
 
 
 def build_output_rows(
@@ -3101,6 +4585,8 @@ def build_output_rows(
             "爬虫匹配HS": candidate.tax_data.get("hs_code_us") or candidate.hs,
             "爬虫品名": candidate.tax_data.get("description_cn", ""),
             "认证信息": "; ".join(candidate.certification_texts),
+            "合规需复核": candidate.compliance_review_required,
+            "合规复核原因": candidate.compliance_review_reason,
             "重量规则来源": plan.plausibility.source or "默认规则",
             "约束提示": "; ".join(plan.warnings),
             "source_rows": candidate.source_rows,
@@ -3111,9 +4597,79 @@ def build_output_rows(
             "参考单价": plan.price_reference,
             "数量推导": plan.quantity_basis,
         }
+        for warning in candidate.row_warnings:
+            append_row_warning(row, warning)
         update_row_tax_display(row)
         rows.append(row)
 
+    apply_manifest_net_weights(rows, manifest)
+    normalize_output_language_fields(rows)
+    return rows
+
+
+def build_output_rows_best_effort(
+    selected: list[ProductCandidate],
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    options: ProcessingOptions,
+    reason: str,
+) -> list[dict[str, Any]]:
+    if not selected:
+        raise RuntimeError(f"无可输出候选，无法生成最接近方案: {reason}")
+    target_ctns = output_package_total(bill, len(selected))
+    target_weight = round(manifest.total_real_weight or sum(candidate.gross_weight or candidate.real_weight or 1 for candidate in selected), 2)
+    ctn_values = [candidate.ctns or 1 for candidate in selected]
+    ctns = scale_positive_integers(ctn_values, target_ctns)
+    weight_values = [candidate.gross_weight or candidate.real_weight or 1 for candidate in selected]
+    weights = scale_decimal(weight_values, target_weight, 2)
+    rows: list[dict[str, Any]] = []
+    for candidate, row_ctns, gross_weight in zip(selected, ctns, weights):
+        qty = max(row_ctns, int(round(candidate.qty or row_ctns)))
+        if qty % row_ctns != 0:
+            qty = row_ctns * max(1, math.ceil(qty / row_ctns))
+        unit_price = max(0.0001, round(candidate_reference_unit_price(candidate) or candidate.unit_price or DEFAULT_UNIT_PRICE_MIN, 4))
+        tax_rate = candidate_tax_rate(candidate)
+        row = {
+            "中文品名": candidate.zh,
+            "英文品名": candidate.en or candidate.zh,
+            "商品编码": hs_cell_value(candidate.hs),
+            "材质": translate_material_to_english(candidate.material),
+            "用途": translate_usage_to_english(candidate.usage),
+            "箱数": row_ctns,
+            "数量": qty,
+            "单位": "PCS",
+            "币制": "USD",
+            "单价": unit_price,
+            "总价": round(unit_price * qty, 2),
+            "净重": round(max(0.01, gross_weight - row_ctns), 2),
+            "毛重": gross_weight,
+            "原产国": "CN",
+            "来源": candidate.source,
+            "来源文件": candidate.source_label,
+            "基础税率": round(candidate.base_tax_rate, 6),
+            "综合税率": round(tax_rate, 6),
+            "加征税率": clean_text(candidate.tax_data.get("additional_tax_rate")),
+            "预计税金": round(unit_price * qty * tax_rate, 2),
+            "爬虫匹配HS": candidate.tax_data.get("hs_code_us") or candidate.hs,
+            "爬虫品名": candidate.tax_data.get("description_cn", ""),
+            "认证信息": "; ".join(candidate.certification_texts),
+            "合规需复核": candidate.compliance_review_required,
+            "合规复核原因": candidate.compliance_review_reason,
+            "重量规则来源": "best_effort",
+            "约束提示": f"最接近方案，未完全满足原优化约束: {reason}",
+            "source_rows": candidate.source_rows,
+            "单件重量": round(gross_weight / qty, 6) if qty else 0,
+            "每箱数量": round(qty / row_ctns, 6) if row_ctns else 0,
+            "单箱重量": round(gross_weight / row_ctns, 6) if row_ctns else 0,
+            "税金预算": 0,
+            "参考单价": unit_price,
+            "数量推导": "best_effort 原始数量/箱数比例，并闭合总箱数和总重量",
+        }
+        for warning in candidate.row_warnings:
+            append_row_warning(row, warning)
+        update_row_tax_display(row)
+        rows.append(row)
+    apply_manifest_net_weights(rows, manifest)
     normalize_output_language_fields(rows)
     return rows
 
@@ -3187,6 +4743,7 @@ def build_output_draft_prompt(
         "硬要求：\n"
         f"1. 输出 rows 数量必须等于 {options.target_item_count}，且每个候选必须输出一行，不得新增/删除/改名/改 HS。\n"
         f"2. 毛重请按品类合理分配；代码会按 Excel 总重量 {manifest.total_real_weight} kg 等比例倒推并强制闭合。\n"
+        "   净重不由模型生成，代码会优先继承原始清单的总净重/总毛重比例。\n"
         f"3. 总税金尽量贴近目标 {options.target_tax_amount} USD，最终不得高于 {target_tax_upper_bound(options.target_tax_amount)} USD（目标上浮 10%）；税金=总价*综合税率；每行税金只能等于 0 或不低于 {MIN_ROW_TAX_AMOUNT_USD} USD，且税金为 0 的行数最多 {MAX_ZERO_TAX_ROWS} 行。\n"
         f"4. 总箱数必须等于提单总箱数 {bill.cartons}，不得使用清单箱数替代。\n"
         "5. 每行数量必须大于等于箱数，且数量必须是箱数的整数倍；每箱数量必须落入 candidate.plausibility_range；单价优先参考价格证据/合理范围，但不得导致总税金超过上限。\n"
@@ -3223,6 +4780,8 @@ def candidate_to_llm_dict(candidate: ProductCandidate) -> dict[str, Any]:
         "plausibility_basis": candidate.plausibility_basis,
         "price_evidence": candidate.price_evidence,
         "llm_reason": candidate.llm_reason,
+        "compliance_review_required": candidate.compliance_review_required,
+        "compliance_review_reason": candidate.compliance_review_reason,
     }
 
 
@@ -3274,6 +4833,8 @@ def normalize_llm_output_draft(payload: dict[str, Any], selected: list[ProductCa
             "爬虫匹配HS": candidate.tax_data.get("hs_code_us") or candidate.hs,
             "爬虫品名": candidate.tax_data.get("description_cn", ""),
             "认证信息": "; ".join(candidate.certification_texts),
+            "合规需复核": candidate.compliance_review_required,
+            "合规复核原因": candidate.compliance_review_reason,
             "重量规则来源": (candidate.plausibility_range.source if candidate.plausibility_range else ""),
             "约束提示": "",
             "source_rows": candidate.source_rows,
@@ -3309,9 +4870,11 @@ def validate_llm_output_rows(
         raise RuntimeError("LLM 草案必须一行对应一个候选，不能重复或遗漏候选")
     ensure_bill_products_present(rows, bill.products, selected)
 
+    output_package_total(bill, len(rows))
     reconcile_llm_rows_ctns(rows, bill.cartons)
     reconcile_row_quantities_to_cartons(rows, selected)
     close_llm_rows_gross_weight(rows, manifest.total_real_weight)
+    apply_manifest_net_weights(rows, manifest)
     close_llm_rows_tax_gap(rows, selected, options.target_tax_amount)
     validate_qty_ctn_relationship(rows)
     validate_row_counts(rows, bill.cartons)
@@ -3566,10 +5129,7 @@ def build_plausible_row_plans(
     plausibility_ranges: dict[tuple[str, str, str], PlausibilityRange],
 ) -> list[RowPlan]:
     target_gross = round(manifest.total_real_weight, 2)
-    if not bill.cartons or bill.cartons <= 0:
-        raise RuntimeError("提单未识别到有效总箱数，不能生成与提单箱数对齐的输出")
-    target_ctns = bill.cartons
-    target_ctns = max(options.target_item_count, int(round(target_ctns)))
+    target_ctns = output_package_total(bill, options.target_item_count)
     ranges = [resolve_plausibility_range(candidate, plausibility_ranges) for candidate in selected]
     ctns = allocate_price_first_cartons(selected, target_ctns)
     weights = allocate_plausible_weights(selected, ctns, ranges, target_gross)
@@ -3672,7 +5232,7 @@ def optimize_selected_candidates_for_price_fit(
             for idx, plan in enumerate(best_plans)
             if row_plan_price_fit_ratio(plan) is not None
             and (row_plan_price_fit_ratio(plan) or 0.0) < PRICE_FIT_MIN_REFERENCE_RATIO
-            and not is_undetailed_bill_candidate(plan.candidate)
+            and not is_bill_required_candidate(plan.candidate)
         ]
         bad_indexes.sort(key=lambda idx: row_plan_price_fit_ratio(best_plans[idx]) or 0.0)
         if not bad_indexes:
@@ -3751,7 +5311,7 @@ def optimize_selected_candidates_for_manual_invoice(
     bill: BillInfo,
     options: ProcessingOptions,
 ) -> tuple[list[ProductCandidate], dict[str, Any]]:
-    required = [candidate for candidate in selected if is_undetailed_bill_candidate(candidate)]
+    required = [candidate for candidate in selected if is_bill_required_candidate(candidate)]
     required_keys = {candidate_identity(candidate) for candidate in required}
     pool = dedupe_candidates([*required, *candidate_pool, *selected])
     optional = [candidate for candidate in pool if candidate_identity(candidate) not in required_keys]
@@ -3806,7 +5366,23 @@ def optimize_selected_candidates_for_manual_invoice(
     }
 
 
+def build_manual_invoice_candidate_pool(
+    selected: list[ProductCandidate],
+    qualified_manifest: list[ProductCandidate],
+    candidate_library: list[ProductCandidate],
+    *,
+    allow_candidate_library: bool,
+) -> list[ProductCandidate]:
+    candidates = [*selected, *qualified_manifest]
+    if allow_candidate_library:
+        candidates.extend(candidate_library)
+    return dedupe_candidates(candidates)
+
+
 def manual_invoice_search_pool(candidates: list[ProductCandidate], target_optional_count: int) -> list[ProductCandidate]:
+    clean_candidates = [candidate for candidate in candidates if not candidate.compliance_review_required]
+    if len(clean_candidates) >= target_optional_count:
+        candidates = clean_candidates
     manual_refs = [candidate for candidate in candidates if candidate.source_label == "DEFAULT_REFERENCE_STYLE_ROWS"]
     anchors = [candidate for candidate in candidates if normalize_hs(candidate.hs) in MANUAL_INVOICE_ANCHOR_HS]
     low_tax = [candidate for candidate in candidates if candidate_tax_rate(candidate) <= 0.153]
@@ -3815,8 +5391,7 @@ def manual_invoice_search_pool(candidates: list[ProductCandidate], target_option
 
 
 def manual_invoice_trial_allowed(candidates: list[ProductCandidate]) -> bool:
-    names = [normalize_text(candidate.zh or candidate.en) for candidate in candidates]
-    if duplicate_count(names):
+    if candidates_have_duplicate_names(candidates):
         return False
     anchor_hs_counts: dict[str, int] = {}
     for candidate in candidates:
@@ -3827,7 +5402,7 @@ def manual_invoice_trial_allowed(candidates: list[ProductCandidate]) -> bool:
     return all(count <= 1 for count in anchor_hs_counts.values())
 
 
-def manual_invoice_candidate_order(candidate: ProductCandidate) -> tuple[int, float, float, float, float]:
+def manual_invoice_candidate_order(candidate: ProductCandidate) -> tuple[int, int, float, float, float, float]:
     rate = candidate_tax_rate(candidate)
     source_rank = 0 if candidate.source == "manifest_group" else 1
     if candidate.source_label == "DEFAULT_REFERENCE_STYLE_ROWS":
@@ -3839,7 +5414,14 @@ def manual_invoice_candidate_order(candidate: ProductCandidate) -> tuple[int, fl
     weight = max(candidate.gross_weight or candidate.real_weight or 0.0, 0.1)
     ctns = max(candidate.ctns or 0.0, 1.0)
     kg_per_ctn = weight / ctns
-    return (source_rank, rate, -(candidate.declared_value or 0.0), -kg_per_ctn, -candidate.score)
+    return (
+        1 if candidate.compliance_review_required else 0,
+        source_rank,
+        rate,
+        -(candidate.declared_value or 0.0),
+        -kg_per_ctn,
+        -candidate.score,
+    )
 
 
 def manual_invoice_plan_score(plans: list[RowPlan], options: ProcessingOptions) -> float:
@@ -3865,6 +5447,8 @@ def manual_invoice_plan_score(plans: list[RowPlan], options: ProcessingOptions) 
     score += duplicate_name_penalty * 280.0
     replacement_count = sum(1 for plan in plans if plan.candidate.source == "replacement")
     score += replacement_count * 8.0
+    review_required_count = sum(1 for plan in plans if plan.candidate.compliance_review_required)
+    score += review_required_count * 1000000.0
     warning_count = sum(len(plan.warnings) for plan in plans)
     score += warning_count * 1.5
     return round(score, 4)
@@ -3947,22 +5531,52 @@ def with_default_plausibility_bounds(value: PlausibilityRange) -> PlausibilityRa
 
 
 def allocate_price_first_cartons(selected: list[ProductCandidate], target_ctns: float) -> list[int]:
-    target = max(len(selected), int(round(target_ctns)))
+    target = int(round(target_ctns))
+    if target < len(selected):
+        raise RuntimeError(
+            f"整票包装数量 {target} 小于输出行数 {len(selected)}，无法逐行分配并闭合总数"
+        )
     values = [candidate.ctns or 1 for candidate in selected]
+    detailed_bill_indexes = [
+        idx
+        for idx, candidate in enumerate(selected)
+        if is_bill_required_candidate(candidate) and candidate.bill_has_manifest_detail
+    ]
     undetailed_bill_indexes = [
         idx
         for idx, candidate in enumerate(selected)
         if is_undetailed_bill_candidate(candidate)
     ]
+
+    locked_detailed: dict[int, int] = {}
+    unlocked_indexes = [idx for idx in range(len(selected)) if idx not in set(detailed_bill_indexes)]
+    detailed_total = sum(max(1, int(round(values[idx]))) for idx in detailed_bill_indexes)
+    if detailed_bill_indexes and detailed_total + len(unlocked_indexes) <= target:
+        locked_detailed = {
+            idx: max(1, int(round(values[idx])))
+            for idx in detailed_bill_indexes
+        }
+        unlocked_total = target - sum(locked_detailed.values())
+        unlocked_ctns = scale_positive_integers(
+            [values[idx] for idx in unlocked_indexes],
+            unlocked_total,
+        )
+        initial = [0 for _ in selected]
+        for idx, value in locked_detailed.items():
+            initial[idx] = value
+        for idx, value in zip(unlocked_indexes, unlocked_ctns):
+            initial[idx] = value
+    else:
+        initial = scale_positive_integers(values, target)
+
     if not undetailed_bill_indexes or len(undetailed_bill_indexes) == len(selected):
-        return scale_positive_integers(values, target)
+        return initial
 
     bill_total_cap = max(
         len(undetailed_bill_indexes),
         int(round(target * UNDETAILED_BILL_CARTON_SHARE)),
     )
     bill_row_cap = max(1, math.ceil(bill_total_cap / len(undetailed_bill_indexes)))
-    initial = scale_positive_integers(values, target)
     if sum(initial[idx] for idx in undetailed_bill_indexes) <= bill_total_cap:
         return initial
 
@@ -3972,16 +5586,27 @@ def allocate_price_first_cartons(selected: list[ProductCandidate], target_ctns: 
         result[idx] = min(initial[idx], bill_row_cap)
         used_bill += result[idx]
 
-    non_bill_indexes = [idx for idx in range(len(selected)) if idx not in set(undetailed_bill_indexes)]
-    remaining = max(len(non_bill_indexes), target - used_bill)
-    non_bill_values = [values[idx] for idx in non_bill_indexes]
-    non_bill_ctns = scale_positive_integers(non_bill_values, remaining)
-    for idx, ctn_value in zip(non_bill_indexes, non_bill_ctns):
+    fixed_detailed_total = sum(locked_detailed.values())
+    for idx, value in locked_detailed.items():
+        result[idx] = value
+    flexible_indexes = [
+        idx
+        for idx in range(len(selected))
+        if idx not in set(undetailed_bill_indexes) and idx not in locked_detailed
+    ]
+    remaining = max(len(flexible_indexes), target - used_bill - fixed_detailed_total)
+    flexible_values = [values[idx] for idx in flexible_indexes]
+    flexible_ctns = scale_positive_integers(flexible_values, remaining)
+    for idx, ctn_value in zip(flexible_indexes, flexible_ctns):
         result[idx] = ctn_value
 
     diff = target - sum(result)
     if diff:
-        order = sorted(non_bill_indexes, key=lambda idx: values[idx], reverse=True) or list(range(len(result)))
+        order = sorted(flexible_indexes, key=lambda idx: values[idx], reverse=True)
+        if not order:
+            order = [idx for idx in range(len(result)) if idx not in locked_detailed]
+        if not order:
+            order = list(range(len(result)))
         for step in range(abs(diff)):
             idx = order[step % len(order)]
             if diff > 0:
@@ -4080,8 +5705,20 @@ def distribute_tax_budget(
             budgets[idx] += extra / float(len(indexes))
 
 
+def is_bill_required_candidate(candidate: ProductCandidate) -> bool:
+    return (
+        bool(normalize_bill_product_text(candidate.bill_product_name))
+        or candidate.source in {"bill", "bill_product"}
+        or candidate.tax_match_source in {"bill_hs", "bill_product"}
+    )
+
+
 def is_undetailed_bill_candidate(candidate: ProductCandidate) -> bool:
-    return candidate.source in {"bill", "bill_product"} or candidate.tax_match_source in {"bill_hs", "bill_product"}
+    return is_bill_required_candidate(candidate) and not candidate.bill_has_manifest_detail
+
+
+def is_customer_codebook_candidate(candidate: ProductCandidate) -> bool:
+    return candidate.tax_match_source == "customer_codebook" or candidate.source_label.startswith("客户编码库/")
 
 
 def price_reference_for_candidate(candidate: ProductCandidate, plausibility: PlausibilityRange) -> float:
@@ -4353,9 +5990,9 @@ def adjust_price_gap(
     min_row_tax_amount: float = 0.0,
 ) -> None:
     current_tax = sum(price * qty * candidate_tax_rate(candidate) for price, qty, candidate in zip(unit_prices, quantities, selected))
-    if current_tax <= target_tax_upper_bound(target_tax_amount):
-        return
     diff = target_tax_amount - current_tax
+    if abs(diff) <= 0.0001:
+        return
     if diff > 0:
         order = sorted(range(len(unit_prices)), key=lambda idx: (maxes[idx] - unit_prices[idx]) * quantities[idx] * candidate_tax_rate(selected[idx]), reverse=True)
         for idx in order:
@@ -4638,6 +6275,416 @@ def infer_manifest_weight_from_context(summary: dict[str, Any]) -> ManifestWeigh
     )
 
 
+async def detect_manifest_schema(
+    workbook,
+    source: Path,
+    llm: Optional[LLMClient],
+    query_cache: Optional[QueryCache] = None,
+) -> ManifestSchema:
+    if llm is None:
+        raise manifest_schema_error("缺少 LLM，无法识别清单结构")
+    model = clean_text(getattr(getattr(llm, "settings", None), "model", "")) or llm.__class__.__name__
+    file_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    cache_key = (
+        f"schema:{MANIFEST_SCHEMA_PROMPT_VERSION}:"
+        f"{MANIFEST_SCHEMA_CACHE_REVISION}:{model}:{file_hash}"
+    )
+    cached = (query_cache or {}).get("manifest_schema", {}).get(cache_key)
+    if isinstance(cached, dict):
+        return validate_manifest_schema(workbook, normalize_manifest_schema_payload(cached))
+
+    context = build_manifest_schema_context(workbook)
+    try:
+        payload = await llm.chat_json(
+            build_manifest_schema_parser_messages(source.name, context),
+            temperature=0.0,
+            max_tokens=4096,
+            json_mode=True,
+        )
+    except Exception as exc:
+        raise manifest_schema_error(f"LLM 结构识别失败: {exc}") from exc
+    schema = validate_manifest_schema(workbook, normalize_manifest_schema_payload(payload))
+    if query_cache is not None:
+        query_cache.setdefault("manifest_schema", {})[cache_key] = payload
+    return schema
+
+
+def build_manifest_schema_context(workbook) -> dict[str, Any]:
+    sheets: list[dict[str, Any]] = []
+    for sheet in workbook.worksheets[:6]:
+        row_indexes = list(range(1, min(sheet.max_row, 30) + 1))
+        row_indexes.extend(range(max(1, sheet.max_row - 4), sheet.max_row + 1))
+        rows: list[dict[str, Any]] = []
+        for row_idx in dict.fromkeys(row_indexes):
+            rows.append(
+                {
+                    "row": row_idx,
+                    "values": [
+                        clean_text(sheet.cell(row_idx, col_idx).value)[:100]
+                        for col_idx in range(1, min(sheet.max_column, 24) + 1)
+                    ],
+                }
+            )
+        sheets.append(
+            {
+                "name": sheet.title,
+                "max_row": sheet.max_row,
+                "max_column": sheet.max_column,
+                "merged_ranges": [str(item) for item in list(sheet.merged_cells.ranges)[:20]],
+                "rows": rows,
+            }
+        )
+    return {"sheets": sheets}
+
+
+def build_manifest_schema_parser_messages(filename: str, context: dict[str, Any]) -> list[dict[str, str]]:
+    workbook_json = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是装箱清单 Excel 结构识别器。只识别语义和单元格坐标，不计算或猜测最终重量。"
+                "返回一个 JSON object，所有行列坐标从 1 开始。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"文件名：{filename}\n"
+                "识别商品清单 sheet、表头行、汇总行、数据起止行和字段列。columns 只可使用 "
+                "zh_name,en_name,material,usage,qty,ctns,net_weight,gross_weight,declared_value,unit_price,hs_code。"
+                "若存在净重列必须返回 net_weight；不存在则省略。\n"
+                "header_labels 必须逐字段原样返回对应表头单元格文字，用于代码核验列坐标。\n"
+                "weight_strategy 只能是 explicit_total 或 detail_sum；若存在汇总毛重，返回 total_cell；"
+                "若存在毛重明细列，detail_range 必须指向 gross_weight 毛重列，禁止指向 net_weight 净重列。"
+                "不要返回模型计算出的总重量。\n"
+                "JSON格式："
+                "{\"sheet_name\":\"\",\"header_row\":1,\"summary_rows\":[],"
+                "\"data_start_row\":2,\"data_end_row\":2,\"columns\":{},\"header_labels\":{},"
+                "\"weight_unit\":\"kg\",\"confidence\":0.0,\"weight_strategy\":\"detail_sum\","
+                "\"weight_total_cell\":\"\",\"weight_detail_range\":\"\"}\n"
+                f"工作簿摘要：\n{workbook_json[:30000]}"
+            ),
+        },
+    ]
+
+
+def normalize_manifest_schema_payload(payload: dict[str, Any]) -> ManifestSchema:
+    if not isinstance(payload, dict):
+        raise manifest_schema_error("LLM 返回值不是 JSON object")
+    raw_columns = payload.get("columns") if isinstance(payload.get("columns"), dict) else {}
+    raw_labels = payload.get("header_labels") if isinstance(payload.get("header_labels"), dict) else {}
+    aliases = {
+        "chinese_name": "zh_name",
+        "english_name": "en_name",
+        "name_zh": "zh_name",
+        "name_en": "en_name",
+        "weight": "gross_weight",
+        "grossweight": "gross_weight",
+        "netweight": "net_weight",
+        "amount": "declared_value",
+        "value": "declared_value",
+        "price": "unit_price",
+        "hs": "hs_code",
+        "hscode": "hs_code",
+    }
+    allowed = {
+        "zh_name",
+        "en_name",
+        "material",
+        "usage",
+        "qty",
+        "ctns",
+        "net_weight",
+        "gross_weight",
+        "declared_value",
+        "unit_price",
+        "hs_code",
+    }
+    columns: dict[str, int] = {}
+    header_labels: dict[str, str] = {}
+    for raw_key, raw_value in raw_columns.items():
+        key = aliases.get(normalize_header(raw_key), normalize_header(raw_key))
+        if key not in allowed or raw_value in (None, ""):
+            continue
+        value = to_float(raw_value)
+        if value is None or not float(value).is_integer():
+            raise manifest_schema_error(f"字段 {raw_key} 的列号无效: {raw_value}")
+        columns[key] = int(value)
+        label = raw_labels.get(raw_key, raw_labels.get(key, ""))
+        header_labels[key] = clean_text(label)
+    weight = payload.get("weight") if isinstance(payload.get("weight"), dict) else {}
+    summary_rows: list[int] = []
+    for value in payload.get("summary_rows") or []:
+        parsed = to_float(value)
+        if parsed is None or not float(parsed).is_integer():
+            raise manifest_schema_error(f"汇总行号无效: {value}")
+        summary_rows.append(int(parsed))
+    return ManifestSchema(
+        sheet_name=clean_text(payload.get("sheet_name")),
+        header_row=int(to_float(payload.get("header_row")) or 0),
+        summary_rows=sorted(set(summary_rows)),
+        data_start_row=int(to_float(payload.get("data_start_row")) or 0),
+        data_end_row=int(to_float(payload.get("data_end_row")) or 0),
+        columns=columns,
+        header_labels=header_labels,
+        weight_unit=clean_text(payload.get("weight_unit") or weight.get("unit") or "kg"),
+        confidence=float(to_float(payload.get("confidence")) or 0.0),
+        weight_strategy=normalize_header(payload.get("weight_strategy") or weight.get("strategy")),
+        weight_total_cell=clean_text(payload.get("weight_total_cell") or payload.get("total_cell") or weight.get("total_cell")),
+        weight_detail_range=clean_text(payload.get("weight_detail_range") or payload.get("detail_range") or weight.get("detail_range")),
+    )
+
+
+def validate_manifest_schema(workbook, schema: ManifestSchema) -> ManifestSchema:
+    if schema.sheet_name not in workbook.sheetnames:
+        raise manifest_schema_error(f"sheet 不存在: {schema.sheet_name or '(empty)'}")
+    sheet = workbook[schema.sheet_name]
+    if schema.confidence < MANIFEST_SCHEMA_MIN_CONFIDENCE:
+        raise manifest_schema_error(
+            f"结构识别置信度 {schema.confidence:.2f} 低于 {MANIFEST_SCHEMA_MIN_CONFIDENCE:.2f}"
+        )
+    if not 1 <= schema.header_row <= sheet.max_row:
+        raise manifest_schema_error(f"表头行越界: {schema.header_row}")
+    if not 1 <= schema.data_start_row <= sheet.max_row or schema.data_start_row <= schema.header_row:
+        raise manifest_schema_error(f"数据起始行无效: {schema.data_start_row}")
+    if schema.data_end_row <= 0:
+        schema.data_end_row = sheet.max_row
+    if not schema.data_start_row <= schema.data_end_row <= sheet.max_row:
+        raise manifest_schema_error(f"数据结束行无效: {schema.data_end_row}")
+    if any(row < 1 or row > sheet.max_row or row == schema.header_row for row in schema.summary_rows):
+        raise manifest_schema_error(f"汇总行越界或与表头重叠: {schema.summary_rows}")
+    if not schema.columns:
+        raise manifest_schema_error("LLM 未返回字段列映射")
+    if not any(schema.columns.get(key) for key in ("zh_name", "en_name", "hs_code")):
+        raise manifest_schema_error("字段映射缺少商品名称和 HS")
+    if not schema.columns.get("gross_weight"):
+        raise manifest_schema_error("字段映射缺少重量列")
+
+    for key, col_idx in schema.columns.items():
+        if not 1 <= col_idx <= sheet.max_column:
+            raise manifest_schema_error(f"字段 {key} 的列号越界: {col_idx}")
+        expected = schema.header_labels.get(key, "")
+        actual = clean_text(sheet.cell(schema.header_row, col_idx).value)
+        if not expected:
+            raise manifest_schema_error(f"字段 {key} 缺少 header_labels 核验值")
+        if normalize_header(expected) != normalize_header(actual):
+            raise manifest_schema_error(
+                f"字段 {key} 表头不一致: 模型返回 {expected!r}，单元格实际为 {actual!r}"
+            )
+
+    data_rows = [
+        row
+        for row in range(schema.data_start_row, schema.data_end_row + 1)
+        if row not in schema.summary_rows
+    ]
+    for key in ("qty", "ctns", "net_weight", "gross_weight", "declared_value", "unit_price"):
+        col_idx = schema.columns.get(key)
+        if not col_idx:
+            continue
+        values = [sheet.cell(row, col_idx).value for row in data_rows]
+        nonempty = [value for value in values if clean_text(value)]
+        if nonempty and sum(to_float(value) is not None for value in nonempty) / len(nonempty) < 0.6:
+            raise manifest_schema_error(f"字段 {key} 的数据主要不是数值")
+
+    hs_col = schema.columns.get("hs_code")
+    if hs_col:
+        samples = [clean_text(sheet.cell(row, hs_col).value) for row in data_rows]
+        samples = [value for value in samples if value][:20]
+        if samples:
+            valid = sum(is_manifest_hs_sample(value) for value in samples)
+            if valid / len(samples) < 0.8:
+                raise manifest_schema_error("HS 列样本不符合编码格式")
+
+    if schema.weight_strategy not in {"explicit_total", "detail_sum"}:
+        raise manifest_schema_error(f"重量策略无效: {schema.weight_strategy or '(empty)'}")
+    if schema.weight_strategy == "explicit_total" and not schema.weight_total_cell:
+        raise manifest_schema_error("explicit_total 策略缺少 weight_total_cell")
+    if schema.weight_strategy == "detail_sum" and not schema.weight_detail_range:
+        raise manifest_schema_error("detail_sum 策略缺少 weight_detail_range")
+    if schema.weight_total_cell:
+        total_sheet, total_bounds = validate_manifest_reference(
+            schema.weight_total_cell, schema.sheet_name, workbook, single_cell=True
+        )
+        if total_sheet != schema.sheet_name:
+            raise manifest_schema_error("weight_total_cell 不在识别的清单 sheet")
+        if schema.summary_rows and total_bounds[1] not in schema.summary_rows:
+            raise manifest_schema_error("weight_total_cell 不在模型识别的汇总行")
+    if schema.weight_detail_range:
+        detail_sheet, bounds = validate_manifest_reference(
+            schema.weight_detail_range, schema.sheet_name, workbook, single_column=True
+        )
+        if detail_sheet == schema.sheet_name and bounds[0] == schema.columns.get("net_weight"):
+            gross_col = get_column_letter(schema.columns["gross_weight"])
+            schema.weight_detail_range = (
+                f"{gross_col}{schema.data_start_row}:{gross_col}{schema.data_end_row}"
+            )
+            detail_sheet, bounds = validate_manifest_reference(
+                schema.weight_detail_range, schema.sheet_name, workbook, single_column=True
+            )
+        if detail_sheet != schema.sheet_name or bounds[0] != schema.columns["gross_weight"]:
+            raise manifest_schema_error("weight_detail_range 与识别的重量列不一致")
+        if bounds[1] > schema.data_start_row or bounds[3] < schema.data_end_row:
+            raise manifest_schema_error("weight_detail_range 未覆盖模型识别的全部数据行")
+    return schema
+
+
+def manifest_schema_error(message: str) -> RuntimeError:
+    return RuntimeError(f"manifest_schema_unresolved: {message}")
+
+
+def is_manifest_hs_sample(value: Any) -> bool:
+    text = clean_text(value)
+    if re.search(r"[A-Za-z\u4e00-\u9fff]", text):
+        return False
+    return 6 <= len(normalize_hs(text)) <= 10
+
+
+def validate_manifest_reference(
+    reference: str,
+    default_sheet: str,
+    workbook,
+    *,
+    single_cell: bool = False,
+    single_column: bool = False,
+) -> tuple[str, tuple[int, int, int, int]]:
+    sheet_name, coordinate = split_manifest_reference(reference, default_sheet)
+    if sheet_name not in workbook.sheetnames:
+        raise manifest_schema_error(f"重量坐标 sheet 不存在: {sheet_name}")
+    try:
+        bounds = range_boundaries(coordinate.replace("$", ""))
+    except (TypeError, ValueError) as exc:
+        raise manifest_schema_error(f"重量坐标无效: {reference}") from exc
+    min_col, min_row, max_col, max_row = bounds
+    sheet = workbook[sheet_name]
+    if min_col < 1 or min_row < 1 or max_col > sheet.max_column or max_row > sheet.max_row:
+        raise manifest_schema_error(f"重量坐标越界: {reference}")
+    if single_cell and (min_col != max_col or min_row != max_row):
+        raise manifest_schema_error(f"总重量坐标必须是单个单元格: {reference}")
+    if single_column and min_col != max_col:
+        raise manifest_schema_error(f"重量明细范围必须是单列: {reference}")
+    return sheet_name, bounds
+
+
+def split_manifest_reference(reference: str, default_sheet: str) -> tuple[str, str]:
+    text = clean_text(reference)
+    if "!" not in text:
+        return default_sheet, text
+    sheet_name, coordinate = text.rsplit("!", 1)
+    return sheet_name.strip().strip("'"), coordinate.strip()
+
+
+def manifest_weight_unit_factor(unit: str) -> float:
+    normalized = normalize_header(unit).replace(".", "")
+    if normalized in {"kg", "kgs", "kilogram", "kilograms", "千克", "公斤"}:
+        return 1.0
+    if normalized in {"lb", "lbs", "pound", "pounds", "磅"}:
+        return 0.45359237
+    raise manifest_schema_error(f"不支持的重量单位: {unit}")
+
+
+def resolve_manifest_weight(
+    workbook,
+    schema: ManifestSchema,
+    items: list[ManifestItem],
+) -> ManifestWeightResolution:
+    factor = manifest_weight_unit_factor(schema.weight_unit)
+    explicit_total: Optional[float] = None
+    if schema.weight_total_cell:
+        total_sheet, bounds = validate_manifest_reference(
+            schema.weight_total_cell, schema.sheet_name, workbook, single_cell=True
+        )
+        raw_total = to_float(workbook[total_sheet].cell(bounds[1], bounds[0]).value)
+        if raw_total is None or raw_total <= 0:
+            raise manifest_schema_error(
+                f"模型给出的总重量单元格无法从原表重算: {schema.weight_total_cell}"
+            )
+        explicit_total = raw_total * factor
+
+    detail_values = [item.gross_weight for item in items if item.gross_weight and item.gross_weight > 0]
+    detail_sum = sum(detail_values) if detail_values else None
+    if schema.weight_strategy == "detail_sum" and detail_sum is None:
+        raise manifest_schema_error("模型给出的明细重量范围无法从商品行重算")
+
+    reconciled = False
+    if explicit_total is not None and detail_sum is not None:
+        tolerance = max(
+            MANIFEST_WEIGHT_ABSOLUTE_TOLERANCE_KG,
+            max(explicit_total, detail_sum) * MANIFEST_WEIGHT_RELATIVE_TOLERANCE,
+        )
+        if abs(explicit_total - detail_sum) > tolerance:
+            raise RuntimeError(
+                "manifest_weight_conflict: "
+                f"显式汇总重量 {explicit_total:.4f} kg 与明细合计 {detail_sum:.4f} kg 冲突"
+            )
+        final_weight = explicit_total
+        reconciled = True
+        strategy = "explicit_total"
+    elif explicit_total is not None:
+        final_weight = explicit_total
+        strategy = "explicit_total"
+    elif detail_sum is not None:
+        final_weight = detail_sum
+        strategy = "detail_sum"
+    else:
+        raise manifest_schema_error("清单没有可重算的汇总重量或商品明细重量")
+
+    explicit_display = round(explicit_total, 4) if explicit_total is not None else None
+    detail_display = round(detail_sum, 4) if detail_sum is not None else None
+    evidence = json.dumps(
+        {
+            "strategy": strategy,
+            "total_cell": schema.weight_total_cell,
+            "detail_range": schema.weight_detail_range,
+            "explicit_total": explicit_display,
+            "detail_sum": detail_display,
+            "final": round(final_weight, 4),
+            "reconciled": reconciled,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return ManifestWeightResolution(
+        strategy=strategy,
+        total_cell=schema.weight_total_cell,
+        detail_range=schema.weight_detail_range,
+        explicit_total=explicit_display,
+        detail_sum=detail_display,
+        final_weight=round(final_weight, 4),
+        reconciled=reconciled,
+        evidence=evidence,
+    )
+
+
+def resolve_manifest_net_weight(items: list[ManifestItem], total_gross_weight: float) -> Optional[float]:
+    weighted_items = [item for item in items if item.gross_weight is not None and item.gross_weight > 0]
+    if not weighted_items or any(item.real_weight is None or item.real_weight <= 0 for item in weighted_items):
+        return None
+
+    for item in weighted_items:
+        if (item.real_weight or 0) > (item.gross_weight or 0) + 0.01:
+            raise RuntimeError(
+                "manifest_weight_conflict: "
+                f"第 {item.row} 行净重 {item.real_weight:.4f} kg 大于毛重 {item.gross_weight:.4f} kg"
+            )
+
+    detail_gross_weight = sum(item.gross_weight or 0 for item in weighted_items)
+    tolerance = max(
+        MANIFEST_WEIGHT_ABSOLUTE_TOLERANCE_KG,
+        max(detail_gross_weight, total_gross_weight) * MANIFEST_WEIGHT_RELATIVE_TOLERANCE,
+    )
+    if abs(detail_gross_weight - total_gross_weight) > tolerance:
+        return None
+
+    total_net_weight = round(sum(item.real_weight or 0 for item in weighted_items), 4)
+    if total_net_weight > total_gross_weight + tolerance:
+        raise RuntimeError(
+            "manifest_weight_conflict: "
+            f"明细净重合计 {total_net_weight:.4f} kg 大于总毛重 {total_gross_weight:.4f} kg"
+        )
+    return total_net_weight
+
+
 async def parse_manifest(
     path: str | Path,
     llm: Optional[LLMClient] = None,
@@ -4645,116 +6692,117 @@ async def parse_manifest(
 ) -> ManifestSummary:
     source = Path(path)
     workbook = load_workbook(source, data_only=True)
-    sheet = workbook[workbook.sheetnames[0]]
-    headers = [str(sheet.cell(1, col).value or "").strip() for col in range(1, sheet.max_column + 1)]
-    header_map = {normalize_header(name): idx + 1 for idx, name in enumerate(headers)}
+    schema = await detect_manifest_schema(workbook, source, llm, query_cache)
+    sheet = workbook[schema.sheet_name]
+    columns = schema.columns
+    factor = manifest_weight_unit_factor(schema.weight_unit)
 
-    def col(*names: str) -> Optional[int]:
-        for name in names:
-            key = normalize_header(name)
-            if key in header_map:
-                return header_map[key]
-        for idx, header in enumerate(headers, start=1):
-            flat = normalize_header(header)
-            if any(normalize_header(name) in flat for name in names):
-                return idx
-        return None
-
-    ctn_col = col("件数", "箱数", "箱数CTN", "CTN")
-    real_weight_col = col("实重", "净重")
-    gross_weight_col = col("总抛重", "总毛重", "毛重", "总毛重KGS", "KGS")
-    value_col = col("清关申报金额", "申报金额", "总价", "总金额", "总金额USD")
-    zh_col = col("中文品名", "中英文品名", "品名")
-    en_col = col("英文品名", "中英文品名", "DESCRIPTION OF GOODS")
-    hs_col = col("清关HS CODE", "报关编码 HS", "HS CODE", "商品编码")
-    unit_price_col = col("单价", "单价USD")
-    qty_col = col("总数量", "总数量PCS", "数量")
-    material_col = col("中英文材质", "材质", "MATERIAL")
-    usage_col = col("中英文用途", "用途", "USE FOR")
+    def value(row: int, key: str) -> Any:
+        col_idx = columns.get(key)
+        return sheet.cell(row, col_idx).value if col_idx else None
 
     total_ctns = 0.0
-    total_real_weight = 0.0
     total_declared_value = 0.0
-    row_count = 0
     items: list[ManifestItem] = []
     categories: list[str] = []
     seen_categories: set[str] = set()
-
-    for row_idx in range(2, sheet.max_row + 1):
-        zh = clean_text(sheet.cell(row_idx, zh_col).value if zh_col else "")
-        en = clean_text(sheet.cell(row_idx, en_col).value if en_col else "")
-        has_any = any(sheet.cell(row_idx, col_idx).value not in (None, "") for col_idx in range(1, sheet.max_column + 1))
-        if not has_any or not zh:
+    for row_idx in range(schema.data_start_row, schema.data_end_row + 1):
+        if row_idx in schema.summary_rows:
             continue
-
-        ctns = to_float(sheet.cell(row_idx, ctn_col).value if ctn_col else None)
-        real_weight = to_float(sheet.cell(row_idx, real_weight_col).value if real_weight_col else None)
-        gross_weight = to_float(sheet.cell(row_idx, gross_weight_col).value if gross_weight_col else None)
-        declared_value = to_float(sheet.cell(row_idx, value_col).value if value_col else None)
-        qty = to_float(sheet.cell(row_idx, qty_col).value if qty_col else None)
-        unit_price = to_float(sheet.cell(row_idx, unit_price_col).value if unit_price_col else None)
-
-        row_count += 1
-        key = normalize_text(zh)
-        if key and key not in seen_categories:
-            seen_categories.add(key)
-            categories.append(zh)
-
+        zh = clean_text(value(row_idx, "zh_name"))
+        en = clean_text(value(row_idx, "en_name"))
+        raw_hs = clean_text(value(row_idx, "hs_code"))
+        hs = normalize_hs(raw_hs) if is_manifest_hs_sample(raw_hs) else ""
+        if not (zh or en or hs):
+            continue
+        ctns = to_float(value(row_idx, "ctns"))
+        qty = to_float(value(row_idx, "qty"))
+        net_weight = to_float(value(row_idx, "net_weight"))
+        if net_weight is not None:
+            net_weight *= factor
+        gross_weight = to_float(value(row_idx, "gross_weight"))
+        if gross_weight is not None:
+            gross_weight *= factor
+        declared_value = to_float(value(row_idx, "declared_value"))
+        unit_price = to_float(value(row_idx, "unit_price"))
+        category = zh or en or hs
+        category_key = normalize_text(category)
+        if category_key and category_key not in seen_categories:
+            seen_categories.add(category_key)
+            categories.append(category)
         total_ctns += ctns or 0
-        total_real_weight += real_weight or gross_weight or 0
         total_declared_value += declared_value or 0
         items.append(
             ManifestItem(
                 row=row_idx,
                 zh=zh,
                 en=en,
-                hs=normalize_hs(sheet.cell(row_idx, hs_col).value if hs_col else ""),
-                material=clean_text(sheet.cell(row_idx, material_col).value if material_col else ""),
-                usage=clean_text(sheet.cell(row_idx, usage_col).value if usage_col else ""),
+                hs=hs,
+                material=clean_text(value(row_idx, "material")),
+                usage=clean_text(value(row_idx, "usage")),
                 ctns=ctns,
                 qty=qty,
                 unit_price=unit_price,
                 declared_value=declared_value,
-                real_weight=real_weight,
+                real_weight=net_weight,
                 gross_weight=gross_weight,
             )
         )
 
-    weight_info = await parse_manifest_total_weight(workbook, source, llm, query_cache)
-    if weight_info.total_weight_kg is not None and weight_info.total_weight_kg > 0:
-        total_real_weight = weight_info.total_weight_kg
-        weight_source = weight_info.source
-        weight_evidence = weight_info.evidence
-        weight_confidence = weight_info.confidence
-    else:
-        weight_source = "parsed_rows" if total_real_weight > 0 else ""
-        weight_evidence = "逐行重量字段求和" if total_real_weight > 0 else ""
-        weight_confidence = 0.6 if total_real_weight > 0 else 0.0
-
+    weight = resolve_manifest_weight(workbook, schema, items)
+    total_net_weight = resolve_manifest_net_weight(items, weight.final_weight)
     return ManifestSummary(
         filename=source.name,
-        row_count=row_count,
+        row_count=len(items),
         total_ctns=round(total_ctns, 2),
-        total_real_weight=round(total_real_weight, 2),
+        total_real_weight=round(weight.final_weight, 2),
         total_declared_value=round(total_declared_value, 2),
         categories=categories,
         items=items,
-        weight_source=weight_source,
-        weight_evidence=weight_evidence,
-        weight_confidence=round(weight_confidence, 4),
+        total_net_weight=round(total_net_weight, 2) if total_net_weight is not None else None,
+        weight_source=weight.total_cell or weight.detail_range or weight.strategy,
+        weight_evidence=weight.evidence,
+        weight_confidence=round(schema.confidence, 4),
+        schema_sheet=schema.sheet_name,
+        schema_header_row=schema.header_row,
+        schema_data_start_row=schema.data_start_row,
+        schema_data_end_row=schema.data_end_row,
+        schema_summary_rows=schema.summary_rows,
+        schema_columns=schema.columns,
+        schema_confidence=round(schema.confidence, 4),
+        weight_strategy=weight.strategy,
+        weight_total_cell=weight.total_cell,
+        weight_detail_range=weight.detail_range,
+        weight_explicit_total=weight.explicit_total,
+        weight_detail_sum=weight.detail_sum,
+        weight_final=weight.final_weight,
+        weight_reconciled=weight.reconciled,
     )
 
 
-async def parse_bill(path: str | Path, llm: LLMClient, query_cache: Optional[QueryCache] = None) -> BillInfo:
+async def parse_bill(
+    path: str | Path,
+    llm: LLMClient,
+    query_cache: Optional[QueryCache] = None,
+    *,
+    allow_missing_carton_count: bool = False,
+    text_max_chars: int = BILL_PARSER_TEXT_CHARS,
+    vision_max_pages: int = BILL_VISION_MAX_PAGES,
+) -> BillInfo:
     source = Path(path)
     text = extract_bill_text(source)
     text_chars = len(normalize_text(text))
     parse_source = "text"
     vision_pages = 0
     if text_chars >= BILL_TEXT_MIN_CHARS:
-        parsed_fields = await parse_bill_fields_from_text(text, llm, query_cache)
+        parsed_fields = await parse_bill_fields_from_text(
+            text,
+            llm,
+            query_cache,
+            max_chars=text_max_chars,
+        )
     else:
-        image_data_urls = render_bill_pdf_pages(source)
+        image_data_urls = render_bill_pdf_pages(source, max_pages=vision_max_pages)
         vision_pages = len(image_data_urls)
         parse_source = "vision"
         try:
@@ -4765,11 +6813,37 @@ async def parse_bill(path: str | Path, llm: LLMClient, query_cache: Optional[Que
             raise
     product_entries = parsed_fields.product_entries
     products = [entry.name for entry in product_entries]
-    text_cartons = extract_number(r"(\d+(?:\.\d+)?)\s*CARTONS?", text)
+    text_carton_match = re.search(
+        r"(?<![\d,])([+\-−–—]?\s*\d+(?:,\d{3})*(?:\.\d+)?)\s*CARTONS?\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text_cartons = normalize_carton_count(
+        text_carton_match.group(1) if text_carton_match else None
+    )
     cartons = parsed_fields.carton_count or text_cartons
-    if not cartons or cartons <= 0:
+    if (not cartons or cartons <= 0) and not allow_missing_carton_count:
         source_label = "扫描件视觉模型" if parse_source == "vision" else "文本/LLM"
         raise RuntimeError(f"提单未识别到有效总箱数，{source_label}未返回 carton_count")
+    carton_source = parsed_fields.carton_source
+    carton_unit = parsed_fields.carton_unit
+    carton_evidence = parsed_fields.carton_evidence
+    if cartons and cartons > 0 and not parsed_fields.carton_count:
+        carton_source = "bill_text_cartons_regex"
+        carton_unit = carton_unit or "CARTONS"
+        carton_evidence = carton_evidence or f"{cartons:g} CARTONS"
+    initial_status = "recognized" if cartons and cartons > 0 else "missing"
+    initial_history = [
+        {
+            "attempt": 1,
+            "status": initial_status,
+            "package_count": cartons,
+            "package_unit": carton_unit,
+            "source": carton_source or parse_source,
+            "evidence": carton_evidence,
+            "reasoning": parsed_fields.carton_reasoning,
+        }
+    ]
     return BillInfo(
         filename=source.name,
         raw_text=text,
@@ -4779,13 +6853,400 @@ async def parse_bill(path: str | Path, llm: LLMClient, query_cache: Optional[Que
         shipment_no=extract_shipment_no(text),
         eta=extract_eta(text),
         cartons=cartons,
-        carton_evidence=parsed_fields.carton_evidence,
+        carton_evidence=carton_evidence,
+        carton_unit=carton_unit,
+        carton_source=carton_source or parse_source,
+        carton_reasoning=parsed_fields.carton_reasoning,
+        carton_manifest_comparison=parsed_fields.carton_manifest_comparison,
+        carton_confidence=parsed_fields.carton_confidence,
+        carton_inferred=parsed_fields.carton_inferred,
+        carton_recognition_attempts=1,
+        carton_resolution_history=initial_history,
         gross_weight=extract_number(r"(\d+(?:\.\d+)?)\s*KGS?", text),
         cbm=extract_number(r"(\d+(?:\.\d+)?)\s*CBM", text),
         product_entries=product_entries,
         parse_source=parse_source,
         text_chars=text_chars,
         vision_pages=vision_pages,
+    )
+
+
+def bill_and_manifest_carton_comparison(
+    package_count: Optional[float],
+    manifest: ManifestSummary,
+) -> str:
+    manifest_count = to_float(manifest.total_ctns)
+    if not manifest_count or manifest_count <= 0:
+        return "清单未识别到有效总箱数，由模型根据提单选择整票包装数量"
+    if package_count and math.isclose(float(package_count), manifest_count, rel_tol=0.0, abs_tol=0.01):
+        return f"提单包装数量 {package_count:g} 与清单总箱数 {manifest_count:g} 一致"
+    if package_count and package_count > 0:
+        return (
+            f"提单候选包装数量 {package_count:g} 与清单总箱数 {manifest_count:g} 不一致，"
+            "已交给模型结合两份资料复核"
+        )
+    return f"提单首次未识别到包装数量，清单总箱数候选为 {manifest_count:g}"
+
+
+def build_bill_package_resolution_context(
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    *,
+    attempt: int,
+    feedback: str,
+) -> dict[str, Any]:
+    return {
+        "attempt": attempt,
+        "max_attempts": BILL_PACKAGE_RECOGNITION_MAX_ATTEMPTS,
+        "feedback_from_previous_attempt": feedback,
+        "bill": {
+            "filename": bill.filename,
+            "parse_source": bill.parse_source,
+            "previous_package_count": bill.cartons,
+            "previous_package_unit": bill.carton_unit,
+            "previous_evidence": bill.carton_evidence,
+            "previous_source": bill.carton_source,
+            "previous_reasoning": bill.carton_reasoning,
+            "previous_manifest_comparison": bill.carton_manifest_comparison,
+            "previous_confidence": bill.carton_confidence,
+            "products": bill.products,
+            "gross_weight": bill.gross_weight,
+            "cbm": bill.cbm,
+        },
+        "manifest": {
+            "filename": manifest.filename,
+            "total_ctns": manifest.total_ctns,
+            "row_count": manifest.row_count,
+            "categories": manifest.categories[:40],
+            "rows": [
+                {
+                    "row": item.row,
+                    "zh_name": item.zh,
+                    "en_name": item.en,
+                    "ctns": item.ctns,
+                    "qty": item.qty,
+                }
+                for item in manifest.items[:80]
+            ],
+        },
+    }
+
+
+def build_bill_package_resolution_prompt(
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    *,
+    attempt: int,
+    feedback: str,
+) -> str:
+    context = build_bill_package_resolution_context(
+        manifest,
+        bill,
+        attempt=attempt,
+        feedback=feedback,
+    )
+    return (
+        "你是国际运输单据识别专家。请重新识别这票货物最终应采用的整票包装数量，并结合清单交叉验证。\n"
+        "不要把识别范围限制在 CTNS、CARTONS、PACKAGES 或 NO. OF PKGS；你可以根据单据版式和语义，"
+        "识别任何实际代表整票运输包装/交运件数的单位和栏位。航空运单的 No. of Pieces RCP、"
+        "No. of Pieces、RCP 等标准栏位可以作为整票包装数量。\n"
+        "清单与提单数字一致时直接采用；不一致时请自行判断每个数字代表的层级，并选择你认为正确的最终值。"
+        "如果上一轮没有识别出来，请完整重看单据，不要机械重复上一轮答案。\n"
+        "必须返回一个 JSON object。识别成功时 package_count 必须是正数；确实无法判断时返回 null。\n"
+        "JSON格式：{\"package_count\":null,\"package_unit\":\"\",\"source_document\":\"\","
+        "\"field_label\":\"\",\"evidence\":\"\",\"manifest_comparison\":\"\","
+        "\"reasoning_summary\":\"\",\"confidence\":0.0,\"inferred\":true}\n"
+        f"交叉验证上下文：\n{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
+def normalize_boolean(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = clean_text(value).lower()
+    if text in {"1", "true", "yes", "y", "是"}:
+        return True
+    if text in {"0", "false", "no", "n", "否"}:
+        return False
+    return default
+
+
+def normalize_bill_package_resolution(payload: dict[str, Any]) -> BillLLMFields:
+    confidence = to_float(payload.get("confidence"))
+    if confidence is None:
+        confidence = 0.0
+    return BillLLMFields(
+        product_entries=[],
+        carton_count=normalize_carton_count(
+            payload.get("package_count")
+            or payload.get("carton_count")
+            or payload.get("packages")
+            or payload.get("total_packages")
+        ),
+        carton_evidence=clean_text(
+            payload.get("evidence")
+            or payload.get("package_evidence")
+            or payload.get("carton_evidence")
+        ),
+        carton_unit=clean_text(
+            payload.get("package_unit")
+            or payload.get("carton_unit")
+            or payload.get("unit")
+        ),
+        carton_source=clean_text(
+            payload.get("source_document")
+            or payload.get("field_label")
+            or payload.get("source")
+        ),
+        carton_reasoning=clean_text(
+            payload.get("reasoning_summary")
+            or payload.get("selection_reason")
+            or payload.get("reasoning")
+        ),
+        carton_manifest_comparison=clean_text(
+            payload.get("manifest_comparison")
+            or payload.get("cross_validation")
+        ),
+        carton_confidence=max(0.0, min(1.0, confidence)),
+        carton_inferred=normalize_boolean(payload.get("inferred"), default=True),
+    )
+
+
+async def request_bill_package_resolution(
+    path: str | Path,
+    bill: BillInfo,
+    manifest: ManifestSummary,
+    llm: LLMClient,
+    *,
+    attempt: int,
+    feedback: str,
+) -> BillLLMFields:
+    prompt = build_bill_package_resolution_prompt(
+        manifest,
+        bill,
+        attempt=attempt,
+        feedback=feedback,
+    )
+    temperature = 0.1 if attempt < BILL_PACKAGE_RECOGNITION_MAX_ATTEMPTS else 0.2
+    if bill.parse_source == "vision":
+        max_pages = (
+            BILL_VISION_MAX_PAGES
+            if attempt < BILL_PACKAGE_RECOGNITION_MAX_ATTEMPTS
+            else BILL_PACKAGE_FINAL_RETRY_MAX_PAGES
+        )
+        payload = await llm.chat_json_with_images(
+            prompt,
+            render_bill_pdf_pages(path, max_pages=max_pages),
+            temperature=temperature,
+        )
+    else:
+        text_limit = (
+            BILL_PARSER_TEXT_CHARS
+            if attempt < BILL_PACKAGE_RECOGNITION_MAX_ATTEMPTS
+            else BILL_PACKAGE_FINAL_RETRY_TEXT_CHARS
+        )
+        payload = await llm.chat_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你负责从国际运输单据和清单中选择最终整票包装数量。"
+                        "请根据字段语义作出判断，只返回 JSON object。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"{prompt}\n提单原始文本：\n{bill.raw_text[:text_limit]}",
+                },
+            ],
+            temperature=temperature,
+        )
+    return normalize_bill_package_resolution(payload)
+
+
+def summarize_model_error(exc: BaseException) -> str:
+    message = clean_text(str(exc))
+    http_match = re.search(r"\bHTTP\s+(\d{3})\b", message, flags=re.IGNORECASE)
+    if http_match:
+        return f"{type(exc).__name__}: provider HTTP {http_match.group(1)}"
+    if "超时" in message or "timeout" in message.lower():
+        return f"{type(exc).__name__}: request timeout"
+    if "JSON" in message:
+        return f"{type(exc).__name__}: invalid JSON response"
+    if "响应结构" in message:
+        return f"{type(exc).__name__}: invalid response structure"
+    return type(exc).__name__
+
+
+def save_bill_package_resolution_audit(
+    query_cache: Optional[QueryCache],
+    path: str | Path,
+    manifest: ManifestSummary,
+    history: list[dict[str, Any]],
+    *,
+    status: str,
+) -> None:
+    if query_cache is None:
+        return
+    source = Path(path)
+    digest_source = source.read_bytes() if source.exists() else str(source).encode("utf-8")
+    digest = hashlib.sha256(digest_source).hexdigest()
+    manifest_signature = f"{manifest.filename}:{manifest.total_ctns}:{manifest.row_count}"
+    key = (
+        f"package-resolution:{BILL_PACKAGE_RESOLUTION_PROMPT_VERSION}:"
+        f"{digest}:{hashlib.sha256(manifest_signature.encode('utf-8')).hexdigest()}"
+    )
+    query_cache.setdefault("bill_package_resolution", {})[key] = {
+        "status": status,
+        "attempts": history,
+    }
+
+
+async def resolve_bill_carton_count(
+    path: str | Path,
+    bill: BillInfo,
+    manifest: ManifestSummary,
+    llm: LLMClient,
+    query_cache: Optional[QueryCache] = None,
+    *,
+    max_attempts: int = BILL_PACKAGE_RECOGNITION_MAX_ATTEMPTS,
+) -> BillInfo:
+    max_attempts = max(1, int(max_attempts))
+    attempts_used = max(1, int(bill.carton_recognition_attempts or 1))
+    history = list(bill.carton_resolution_history)
+    if not history:
+        history.append(
+            {
+                "attempt": attempts_used,
+                "status": "recognized" if bill.cartons and bill.cartons > 0 else "missing",
+                "package_count": bill.cartons,
+                "package_unit": bill.carton_unit,
+                "source": bill.carton_source or bill.parse_source,
+                "evidence": bill.carton_evidence,
+                "reasoning": bill.carton_reasoning,
+            }
+        )
+
+    manifest_count = to_float(manifest.total_ctns)
+    initial_valid = bool(bill.cartons and bill.cartons > 0)
+    counts_conflict = bool(
+        initial_valid
+        and manifest_count
+        and manifest_count > 0
+        and not math.isclose(float(bill.cartons), manifest_count, rel_tol=0.0, abs_tol=0.01)
+    )
+    initial_comparison = bill_and_manifest_carton_comparison(bill.cartons, manifest)
+    if initial_valid and not counts_conflict:
+        history[-1]["status"] = "accepted"
+        history[-1]["manifest_comparison"] = (
+            bill.carton_manifest_comparison or initial_comparison
+        )
+        save_bill_package_resolution_audit(
+            query_cache,
+            path,
+            manifest,
+            history,
+            status="accepted",
+        )
+        return replace(
+            bill,
+            carton_manifest_comparison=bill.carton_manifest_comparison or initial_comparison,
+            carton_recognition_attempts=attempts_used,
+            carton_resolution_history=history,
+        )
+
+    if counts_conflict:
+        history[-1]["status"] = "needs_cross_validation"
+    feedback = initial_comparison
+    last_error = ""
+    while attempts_used < max_attempts:
+        attempts_used += 1
+        try:
+            resolved = await request_bill_package_resolution(
+                path,
+                bill,
+                manifest,
+                llm,
+                attempt=attempts_used,
+                feedback=feedback,
+            )
+        except Exception as exc:
+            last_error = summarize_model_error(exc)
+            feedback = f"第 {attempts_used} 次识别请求失败：{last_error}"
+            history.append(
+                {
+                    "attempt": attempts_used,
+                    "status": "error",
+                    "error": last_error,
+                }
+            )
+            continue
+
+        comparison = (
+            resolved.carton_manifest_comparison
+            or bill_and_manifest_carton_comparison(resolved.carton_count, manifest)
+        )
+        history_entry = {
+            "attempt": attempts_used,
+            "status": "accepted" if resolved.carton_count else "missing",
+            "package_count": resolved.carton_count,
+            "package_unit": resolved.carton_unit,
+            "source": resolved.carton_source,
+            "evidence": resolved.carton_evidence,
+            "reasoning": resolved.carton_reasoning,
+            "manifest_comparison": comparison,
+            "confidence": resolved.carton_confidence,
+        }
+        history.append(history_entry)
+        if resolved.carton_count and resolved.carton_count > 0:
+            save_bill_package_resolution_audit(
+                query_cache,
+                path,
+                manifest,
+                history,
+                status="accepted",
+            )
+            return replace(
+                bill,
+                cartons=resolved.carton_count,
+                carton_evidence=resolved.carton_evidence,
+                carton_unit=resolved.carton_unit,
+                carton_source=resolved.carton_source or bill.parse_source,
+                carton_reasoning=resolved.carton_reasoning,
+                carton_manifest_comparison=comparison,
+                carton_confidence=resolved.carton_confidence,
+                carton_inferred=resolved.carton_inferred,
+                carton_recognition_attempts=attempts_used,
+                carton_resolution_history=history,
+            )
+        bill = replace(
+            bill,
+            carton_evidence=resolved.carton_evidence,
+            carton_unit=resolved.carton_unit,
+            carton_source=resolved.carton_source or bill.carton_source,
+            carton_reasoning=resolved.carton_reasoning,
+            carton_manifest_comparison=comparison,
+            carton_confidence=resolved.carton_confidence,
+            carton_inferred=resolved.carton_inferred,
+            carton_recognition_attempts=attempts_used,
+            carton_resolution_history=history,
+        )
+        feedback = (
+            f"第 {attempts_used} 次仍未返回有效 package_count。"
+            "请重新检查提单所有可能代表整票包装/交运件数的栏位，并结合清单重新选择。"
+        )
+
+    save_bill_package_resolution_audit(
+        query_cache,
+        path,
+        manifest,
+        history,
+        status="failed",
+    )
+    detail = f"；最后错误：{last_error}" if last_error else ""
+    raise RuntimeError(
+        "提单与清单交叉识别包装数量失败，"
+        f"模型已识别 {attempts_used} 次仍未返回有效 package_count，任务已中断{detail}"
     )
 
 
@@ -4852,8 +7313,13 @@ async def parse_bill_fields_from_text(
     text: str,
     llm: LLMClient,
     query_cache: Optional[QueryCache] = None,
+    *,
+    max_chars: int = BILL_PARSER_TEXT_CHARS,
 ) -> BillLLMFields:
-    cache_key = "text:v3:" + hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+    cache_key = (
+        f"text:{BILL_PARSER_PROMPT_VERSION}:{max_chars}:"
+        + hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+    )
     if query_cache is not None:
         bill_cache = query_cache.setdefault("bill", {})
         if cache_key in bill_cache:
@@ -4861,7 +7327,10 @@ async def parse_bill_fields_from_text(
             if isinstance(cached, dict):
                 return normalize_bill_llm_fields(cached)
 
-    payload = await llm.chat_json(build_bill_parser_messages(text), temperature=0.0)
+    payload = await llm.chat_json(
+        build_bill_parser_messages(text, max_chars=max_chars),
+        temperature=0.0,
+    )
     fields = normalize_bill_llm_fields(payload)
     if query_cache is not None:
         query_cache.setdefault("bill", {})[cache_key] = payload
@@ -4884,7 +7353,10 @@ async def parse_bill_fields_from_images(
     query_cache: Optional[QueryCache] = None,
 ) -> BillLLMFields:
     source = Path(path)
-    cache_key = "vision:v3:" + hashlib.sha256(source.read_bytes()).hexdigest()
+    cache_key = (
+        f"vision:{BILL_PARSER_PROMPT_VERSION}:{len(image_data_urls)}:"
+        + hashlib.sha256(source.read_bytes()).hexdigest()
+    )
     if query_cache is not None:
         bill_cache = query_cache.setdefault("bill", {})
         if cache_key in bill_cache:
@@ -4905,7 +7377,7 @@ async def parse_bill_fields_from_images(
 
 def build_bill_vision_prompt(filename: str) -> str:
     return (
-        "你是国际海运提单图像识别和商业字段解析专家。请从上传的提单扫描图中识别发货人、收货人、总箱数和真实货物品类。\n"
+        "你是国际运输单据图像识别和商业字段解析专家。请从上传的提单或航空运单扫描图中识别发货人、收货人、整票包装数量和真实货物品类。\n"
         f"文件名：{filename}\n"
         "规则：\n"
         "1. shipper 提取 SHIPPER/EXPORTER/FROM 栏位的完整公司名和地址；consignee 提取 CONSIGNEE/TO 栏位的完整公司名和地址。\n"
@@ -4916,20 +7388,27 @@ def build_bill_vision_prompt(filename: str) -> str:
         "5. 不得把 SHIPPED ON BOARD、ON BOARD、PORT OF LOADING、PORT OF DISCHARGE、FREIGHT、"
         "EXPRESS BILL、TOTAL NUMBER OF CONTAINERS、日期、港口、船司、付款条款、公司名、地址识别为品类。\n"
         "6. 如果图中出现类似 'STORAGE BAG HS CODE:420222'，品类是 'STORAGE BAG'，hs_code_hint 是 '420222'。\n"
-        "7. carton_count 是货物总箱数/包装数，不是集装箱数量、件数、重量、CBM、日期或提单号；优先读取 TOTAL、NO. OF PKGS、CTNS、CARTONS、PACKAGES、SAY ... CARTONS ONLY 附近的总数。\n"
-        "8. 如果没有可靠货物品类，返回空数组，不要猜；如果没有可靠总箱数，carton_count 返回 null，不要猜。\n"
-        "JSON格式：{\"shipper\":\"\",\"consignee\":\"\",\"carton_count\":null,\"carton_evidence\":\"\","
+        "7. carton_count 是供后续流程使用的整票运输包装/交运件总数。不要把识别范围限制在 CTNS、CARTONS、PACKAGES 或 NO. OF PKGS；"
+        "请根据单据类型、字段位置和上下文自行识别任何可能的单位。航空运单标准栏位 No. of Pieces RCP、No. of Pieces、RCP 中的总数可以作为 carton_count。\n"
+        "8. 必须区分整票运输件数和货描中的商品数量、重量、CBM、日期、提单号或集装箱数量；最终由你根据单据语义判断。\n"
+        "9. 如果没有可靠货物品类，返回空数组；如果本轮确实无法识别整票包装数量，carton_count 返回 null，后续流程会结合清单再次让你识别。\n"
+        "JSON格式：{\"shipper\":\"\",\"consignee\":\"\",\"carton_count\":null,\"carton_unit\":\"\","
+        "\"carton_source\":\"\",\"carton_evidence\":\"\",\"carton_reasoning\":\"\",\"carton_confidence\":0.0,"
         "\"products\":[{\"name\":\"\",\"hs_code_hint\":\"\",\"evidence\":\"\",\"confidence\":0.0}],"
         "\"ignored_phrases\":[{\"text\":\"\",\"reason\":\"\"}]}"
     )
 
 
-def build_bill_parser_messages(text: str) -> list[dict[str, str]]:
+def build_bill_parser_messages(
+    text: str,
+    *,
+    max_chars: int = BILL_PARSER_TEXT_CHARS,
+) -> list[dict[str, str]]:
     return [
         {
             "role": "system",
             "content": (
-                "你是国际海运提单商业字段解析专家。你的任务是从 pypdf 提取出的提单原始文本里识别发货人、收货人、总箱数和真实货物品类。"
+                "你是国际运输单据商业字段解析专家。你的任务是从 pypdf 提取出的提单或航空运单原始文本里识别发货人、收货人、整票包装数量和真实货物品类。"
                 "必须区分货物品类和提单字段、日期、港口、船司、付款条款、装船批注。只返回 JSON object。"
             ),
         },
@@ -4944,12 +7423,15 @@ def build_bill_parser_messages(text: str) -> list[dict[str, str]]:
                 "4. 不要把 SHIPPED ON BOARD、ON BOARD、PORT OF LOADING、FREIGHT、EXPRESS BILL、"
                 "TOTAL NUMBER OF CONTAINERS、日期、港口、公司名、地址识别为品类。\n"
                 "5. 如果文本中出现类似 'STORAGE BAG HS CODE:420222'，品类是 'STORAGE BAG'。\n"
-                "6. carton_count 是货物总箱数/包装数，不是集装箱数量、件数、重量、CBM、日期或提单号；优先读取 TOTAL、NO. OF PKGS、CTNS、CARTONS、PACKAGES、SAY ... CARTONS ONLY 附近的总数。\n"
-                "7. 如果没有可靠品类，返回空数组，不要猜；如果没有可靠总箱数，carton_count 返回 null，不要猜。\n"
-                "JSON格式：{\"shipper\":\"\",\"consignee\":\"\",\"carton_count\":null,\"carton_evidence\":\"\","
+                "6. carton_count 是供后续流程使用的整票运输包装/交运件总数。不要把识别范围限制在 CTNS、CARTONS、PACKAGES 或 NO. OF PKGS；"
+                "请根据字段语义识别任何可能单位。航空运单的 No. of Pieces RCP、No. of Pieces、RCP 可以作为整票包装数量。\n"
+                "7. 必须区分整票运输件数和货描中的商品数量、重量、CBM、日期、提单号或集装箱数量，由你根据上下文判断。\n"
+                "8. 如果没有可靠品类，返回空数组；如果本轮确实无法识别整票包装数量，carton_count 返回 null，后续会结合清单再次识别。\n"
+                "JSON格式：{\"shipper\":\"\",\"consignee\":\"\",\"carton_count\":null,\"carton_unit\":\"\","
+                "\"carton_source\":\"\",\"carton_evidence\":\"\",\"carton_reasoning\":\"\",\"carton_confidence\":0.0,"
                 "\"products\":[{\"name\":\"\",\"hs_code_hint\":\"\",\"evidence\":\"\",\"confidence\":0.0}],"
                 "\"ignored_phrases\":[{\"text\":\"\",\"reason\":\"\"}]}\n"
-                f"提单文本：\n{text[:12000]}"
+                f"提单文本：\n{text[:max_chars]}"
             ),
         },
     ]
@@ -4960,28 +7442,65 @@ def normalize_bill_llm_products(payload: dict[str, Any]) -> list[str]:
 
 
 def normalize_bill_llm_fields(payload: dict[str, Any]) -> BillLLMFields:
+    confidence = to_float(payload.get("carton_confidence") or payload.get("package_confidence"))
+    if confidence is None:
+        confidence = 0.0
     return BillLLMFields(
         product_entries=normalize_bill_llm_product_entries(payload),
         shipper=normalize_party_block(payload.get("shipper")),
         consignee=normalize_party_block(payload.get("consignee")),
-        carton_count=normalize_carton_count(payload.get("carton_count") or payload.get("cartons") or payload.get("total_cartons")),
+        carton_count=normalize_carton_count(
+            payload.get("carton_count")
+            or payload.get("package_count")
+            or payload.get("cartons")
+            or payload.get("total_cartons")
+            or payload.get("total_packages")
+        ),
         carton_evidence=clean_text(payload.get("carton_evidence") or payload.get("carton_count_evidence") or payload.get("package_evidence")),
+        carton_unit=clean_text(payload.get("carton_unit") or payload.get("package_unit") or payload.get("unit")),
+        carton_source=clean_text(payload.get("carton_source") or payload.get("source_document") or payload.get("field_label")),
+        carton_reasoning=clean_text(payload.get("carton_reasoning") or payload.get("reasoning_summary") or payload.get("selection_reason")),
+        carton_manifest_comparison=clean_text(payload.get("manifest_comparison") or payload.get("cross_validation")),
+        carton_confidence=max(0.0, min(1.0, confidence)),
+        carton_inferred=normalize_boolean(payload.get("carton_inferred") or payload.get("inferred")),
     )
 
 
 def normalize_carton_count(value: Any) -> Optional[float]:
     if value is None:
         return None
+    if isinstance(value, bool):
+        return None
     numeric = to_float(value)
-    if numeric is not None and numeric > 0:
-        return numeric
-    text = clean_text(value)
+    if numeric is not None:
+        if (
+            not math.isfinite(numeric)
+            or numeric <= 0
+            or not math.isclose(numeric, round(numeric), rel_tol=0.0, abs_tol=0.000001)
+        ):
+            return None
+        return float(round(numeric))
+    text = (
+        clean_text(value)
+        .replace("−", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+    )
+    text = re.sub(r"([+-])\s+(?=\d)", r"\1", text)
     if not text:
         return None
-    match = re.search(r"(\d+(?:,\d{3})*(?:\.\d+)?)", text)
+    match = re.search(r"([+-]?\d+(?:,\d{3})*(?:\.\d+)?)", text)
     if not match:
         return None
-    return to_float(match.group(1))
+    numeric = to_float(match.group(1))
+    if (
+        numeric is None
+        or not math.isfinite(numeric)
+        or numeric <= 0
+        or not math.isclose(numeric, round(numeric), rel_tol=0.0, abs_tol=0.000001)
+    ):
+        return None
+    return float(round(numeric))
 
 
 def normalize_party_block(value: Any) -> str:
@@ -5308,6 +7827,7 @@ def normalize_llm_rows(payload: dict[str, Any], manifest: ManifestSummary, bill:
     if not bill.cartons or bill.cartons <= 0:
         raise RuntimeError("提单未识别到有效总箱数，不能生成与提单箱数对齐的输出")
     reconcile_totals(rows, bill.cartons, manifest.total_real_weight)
+    apply_manifest_net_weights(rows, manifest)
     validate_output_rows(rows)
     return rows
 
@@ -5479,6 +7999,31 @@ def validate_output_rows(rows: list[dict[str, Any]]) -> None:
             value = to_float(row[field])
             if value is None or value <= 0:
                 raise RuntimeError(f"输出第 {idx} 行 {field} 必须大于 0")
+        if (to_float(row["净重"]) or 0) > (to_float(row["毛重"]) or 0) + 0.01:
+            raise RuntimeError(f"输出第 {idx} 行净重不能大于毛重")
+    validate_output_product_uniqueness(rows)
+
+
+def validate_output_product_uniqueness(rows: list[dict[str, Any]]) -> None:
+    seen: dict[str, tuple[int, str, str]] = {}
+    for idx, row in enumerate(rows, start=1):
+        hs = normalize_hs(row.get("商品编码"))
+        keys = {
+            f"zh:{normalize_text(row.get('中文品名'))}",
+            f"en:{normalize_text(row.get('英文品名'))}",
+        }
+        keys = {key for key in keys if not key.endswith(":")}
+        for key in keys:
+            previous = seen.get(key)
+            if previous:
+                previous_idx, previous_hs, previous_name = previous
+                raise RuntimeError(
+                    "输出商品品名重复："
+                    f"第 {previous_idx} 行 {previous_name}/{previous_hs} 与 "
+                    f"第 {idx} 行 {row.get('中文品名')}/{hs}；"
+                    "同一商品不得仅通过更换 HS 拆成多行，如确有不同商品请在中英文品名中明确材质或用途差异"
+                )
+            seen[key] = (idx, hs, clean_text(row.get("中文品名")))
 
 
 def validate_declaration_strategy(rows: list[dict[str, Any]], bill_products: Optional[list[str]] = None) -> None:
@@ -5622,6 +8167,275 @@ def validate_chinese_name_column(rows: list[dict[str, Any]]) -> None:
         name = clean_text(row.get("中文品名"))
         if chinese_name_needs_translation(name):
             raise RuntimeError(f"输出第 {idx} 行中文品名必须为简体中文，当前: {name}")
+
+
+async def review_output_rows_with_llm(
+    llm: LLMClient,
+    rows: list[dict[str, Any]],
+    selected: list[ProductCandidate],
+    manifest: ManifestSummary,
+    bill: BillInfo,
+    options: ProcessingOptions,
+    *,
+    query_cache: Optional[QueryCache] = None,
+) -> dict[str, Any]:
+    review_rows = []
+    for index, (row, candidate) in enumerate(zip(rows, selected), start=1):
+        review_rows.append(
+            {
+                "row_id": f"row-{index}",
+                "zh_name": row.get("中文品名"),
+                "en_name": row.get("英文品名"),
+                "hs": normalize_hs(row.get("商品编码")),
+                "material": row.get("材质"),
+                "usage": row.get("用途"),
+                "ctns": row.get("箱数"),
+                "qty": row.get("数量"),
+                "unit_price": row.get("单价"),
+                "gross_weight": row.get("毛重"),
+                "net_weight": row.get("净重"),
+                "net_to_gross_ratio": row.get("净毛重比例"),
+                "tax_rate": row.get("综合税率"),
+                "tax_amount": row.get("预计税金"),
+                "source": candidate.source,
+                "source_label": candidate.source_label,
+                "codeflag_description": candidate.tax_data.get("description_cn"),
+                "compliance_review_required": candidate.compliance_review_required,
+                "compliance_review_reason": candidate.compliance_review_reason,
+            }
+        )
+    context = {
+        "target_rows": options.target_item_count,
+        "target_tax_usd": options.target_tax_amount,
+        "target_weight_kg": manifest.total_real_weight,
+        "source_net_weight_kg": manifest.total_net_weight,
+        "source_net_to_gross_ratio": manifest_net_to_gross_ratio(manifest),
+        "target_ctns": bill.cartons,
+        "bill_products": bill.products,
+        "rows": review_rows,
+    }
+    model = clean_text(getattr(getattr(llm, "settings", None), "model", "")) or llm.__class__.__name__
+    cache_key = hashlib.sha256(
+        json.dumps(
+            {
+                "prompt_version": LLM_OUTPUT_REVIEW_PROMPT_VERSION,
+                "model": model,
+                **context,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8", errors="ignore")
+    ).hexdigest()
+    if query_cache is not None:
+        cached = query_cache.setdefault("llm_output_review", {}).get(cache_key)
+        if isinstance(cached, dict):
+            return normalize_output_review_payload(cached, len(rows))
+    payload = await llm.chat_json(build_output_review_messages(context), temperature=0.0, max_tokens=4096)
+    if query_cache is not None:
+        query_cache.setdefault("llm_output_review", {})[cache_key] = payload
+    return normalize_output_review_payload(payload, len(rows))
+
+
+def build_output_review_messages(context: dict[str, Any]) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是美国清关商业发票的最终审查员。只做语义与商业合理性审查，不得改写 HS、税率、"
+                "总重量、总箱数或目标税金。只返回 JSON object。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "检查品名、材质、用途、Codeflag描述、单价、单件重量、单箱重量、每箱数量和整体组合。"
+                "只报告具体问题；建议数值只能作为对现有合理范围的收紧约束。\n"
+                "JSON格式：{\"pass\":true,\"issues\":[{\"row_id\":\"row-1\","
+                "\"severity\":\"high|medium|low\",\"type\":\"\",\"message\":\"\","
+                "\"suggested_bounds\":{\"unit_price_min\":0.0,\"unit_price_max\":0.0,"
+                "\"kg_per_pc_min\":0.0,\"kg_per_pc_max\":0.0,"
+                "\"kg_per_ctn_min\":0.0,\"kg_per_ctn_max\":0.0,"
+                "\"qty_per_ctn_min\":0.0,\"qty_per_ctn_max\":0.0}}]}\n"
+                f"上下文：{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}"
+            ),
+        },
+    ]
+
+
+def normalize_output_review_payload(payload: dict[str, Any], row_count: int) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    for raw in payload.get("issues") or []:
+        if not isinstance(raw, dict):
+            continue
+        match = re.fullmatch(r"row-(\d+)", clean_text(raw.get("row_id")))
+        if not match:
+            continue
+        row_index = int(match.group(1))
+        if not 1 <= row_index <= row_count:
+            continue
+        severity = normalize_text(raw.get("severity"))
+        if severity not in {"high", "medium", "low"}:
+            severity = "medium"
+        bounds = raw.get("suggested_bounds") if isinstance(raw.get("suggested_bounds"), dict) else {}
+        issues.append(
+            {
+                "row_index": row_index,
+                "severity": severity,
+                "type": clean_text(raw.get("type")) or "reasonableness",
+                "message": clean_text(raw.get("message")) or "LLM 标记商业合理性问题",
+                "suggested_bounds": {
+                    key: positive_float(bounds.get(key))
+                    for key in (
+                        "unit_price_min",
+                        "unit_price_max",
+                        "kg_per_pc_min",
+                        "kg_per_pc_max",
+                        "kg_per_ctn_min",
+                        "kg_per_ctn_max",
+                        "qty_per_ctn_min",
+                        "qty_per_ctn_max",
+                    )
+                    if positive_float(bounds.get(key)) is not None
+                },
+            }
+        )
+        if len(issues) >= 20:
+            break
+    return {
+        "pass": bool(payload.get("pass")) and not any(issue["severity"] == "high" for issue in issues),
+        "issues": issues,
+    }
+
+
+def apply_llm_review_constraints(
+    selected: list[ProductCandidate],
+    rows: list[dict[str, Any]],
+    review: dict[str, Any],
+) -> tuple[list[ProductCandidate], int]:
+    adjusted = list(selected)
+    applied = 0
+    for issue in review.get("issues") or []:
+        if issue.get("severity") != "high":
+            continue
+        index = int(issue.get("row_index") or 0) - 1
+        if not 0 <= index < len(adjusted) or index >= len(rows):
+            continue
+        candidate = adjusted[index]
+        current = candidate.plausibility_range
+        if current is None or not plausibility_range_is_complete(current):
+            continue
+        bounds = dict(issue.get("suggested_bounds") or {})
+        if not bounds or not row_violates_review_bounds(rows[index], bounds):
+            continue
+        values = asdict(current)
+        changed = False
+        for field_name, suggested in bounds.items():
+            if field_name not in values or suggested is None:
+                continue
+            current_value = to_float(values.get(field_name))
+            if field_name.endswith("_min"):
+                new_value = max(current_value or 0.0, float(suggested))
+            else:
+                new_value = min(current_value or float(suggested), float(suggested))
+            if current_value is None or abs(new_value - current_value) > 0.000001:
+                values[field_name] = new_value
+                changed = True
+        if not changed or any(
+            (to_float(values.get(low)) or 0) > (to_float(values.get(high)) or 0)
+            for low, high in (
+                ("unit_price_min", "unit_price_max"),
+                ("kg_per_pc_min", "kg_per_pc_max"),
+                ("kg_per_ctn_min", "kg_per_ctn_max"),
+                ("qty_per_ctn_min", "qty_per_ctn_max"),
+            )
+        ):
+            continue
+        tightened = normalize_plausibility_range_bounds(PlausibilityRange(**values))
+        if not plausibility_range_is_complete(tightened):
+            continue
+        adjusted[index] = replace(candidate, plausibility_range=tightened)
+        applied += 1
+    return adjusted, applied
+
+
+def row_violates_review_bounds(row: dict[str, Any], bounds: dict[str, float]) -> bool:
+    ctns = to_float(row.get("箱数")) or 0.0
+    qty = to_float(row.get("数量")) or 0.0
+    gross = to_float(row.get("毛重")) or 0.0
+    values = {
+        "unit_price": to_float(row.get("单价")) or 0.0,
+        "kg_per_pc": gross / qty if qty else 0.0,
+        "kg_per_ctn": gross / ctns if ctns else 0.0,
+        "qty_per_ctn": qty / ctns if ctns else 0.0,
+    }
+    for key, value in values.items():
+        low = bounds.get(f"{key}_min")
+        high = bounds.get(f"{key}_max")
+        if low is not None and value < low - 0.0001:
+            return True
+        if high is not None and value > high + 0.0001:
+            return True
+    return False
+
+
+def append_llm_review_warnings(rows: list[dict[str, Any]], review: dict[str, Any]) -> None:
+    for issue in review.get("issues") or []:
+        index = int(issue.get("row_index") or 0) - 1
+        if not 0 <= index < len(rows):
+            continue
+        append_row_warning(
+            rows[index],
+            f"LLM最终审查[{issue.get('severity')}]: {issue.get('message')}",
+        )
+
+
+def blocking_llm_review_issues(
+    review: dict[str, Any],
+    *,
+    constraints_applied: int,
+    reoptimized: bool,
+    candidates: Optional[list[ProductCandidate]] = None,
+) -> list[dict[str, Any]]:
+    blocking: list[dict[str, Any]] = []
+    semantic_markers = (
+        "hs",
+        "codeflag",
+        "material",
+        "product type",
+        "品名",
+        "编码",
+        "材质",
+        "商品类型",
+        "不匹配",
+        "不一致",
+    )
+    for issue in review.get("issues") or []:
+        if issue.get("severity") != "high":
+            continue
+        row_index = int(to_float(issue.get("row_index")) or 0) - 1
+        if (
+            candidates is not None
+            and 0 <= row_index < len(candidates)
+            and candidates[row_index].compliance_review_required
+        ):
+            continue
+        issue_text = normalize_text(f"{issue.get('type')} {issue.get('message')}")
+        has_semantic_conflict = any(marker in issue_text for marker in semantic_markers)
+        has_numeric_bounds = bool(issue.get("suggested_bounds"))
+        if has_semantic_conflict or not (has_numeric_bounds and constraints_applied and reoptimized):
+            blocking.append(issue)
+    return blocking
+
+
+def format_blocking_llm_review_issues(issues: list[dict[str, Any]]) -> str:
+    details = []
+    for issue in issues[:4]:
+        details.append(
+            f"第 {issue.get('row_index')} 行: {clean_text(issue.get('message')) or clean_text(issue.get('type'))}"
+        )
+    if len(issues) > 4:
+        details.append(f"另有 {len(issues) - 4} 个高风险问题")
+    return "；".join(details)
 
 
 async def translate_output_chinese_names_with_llm(llm: LLMClient, rows: list[dict[str, Any]]) -> None:
@@ -6050,6 +8864,14 @@ def bill_to_public_dict(bill: BillInfo) -> dict[str, Any]:
         "eta": bill.eta,
         "cartons": bill.cartons,
         "carton_evidence": bill.carton_evidence,
+        "carton_unit": bill.carton_unit,
+        "carton_source": bill.carton_source,
+        "carton_reasoning": bill.carton_reasoning,
+        "carton_manifest_comparison": bill.carton_manifest_comparison,
+        "carton_confidence": bill.carton_confidence,
+        "carton_inferred": bill.carton_inferred,
+        "carton_recognition_attempts": bill.carton_recognition_attempts,
+        "carton_resolution_history": bill.carton_resolution_history,
         "gross_weight": bill.gross_weight,
         "cbm": bill.cbm,
         "shipper": bill.shipper,

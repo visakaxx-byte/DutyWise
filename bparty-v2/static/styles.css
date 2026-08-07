@@ -604,6 +604,12 @@ button.compact {
   color: var(--warn);
 }
 
+.queue-status.needs-review {
+  border-color: #fdb022;
+  color: #b54708;
+  background: #fffaeb;
+}
+
 .queue-meta-row {
   display: flex;
   flex-wrap: wrap;
@@ -709,6 +715,11 @@ button.compact {
 .result-card.succeeded {
   border-color: #a6f4c5;
   background: #f8fffb;
+}
+
+.result-card.needs-review {
+  border-color: #fedf89;
+  background: #fffcf5;
 }
 
 .result-card.failed {

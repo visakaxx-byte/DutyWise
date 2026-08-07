@@ -68,7 +68,7 @@
   let feedbackTaskId = "";
   let lastQueueJobs = [];
   let queueMeta = {
-    max_concurrency: 5,
+    max_concurrency: 1,
     running_count: 0,
     queued_count: 0,
     jobs: [],
@@ -406,6 +406,9 @@
 
   function resultCardHtml(job) {
     const status = job.status || "unknown";
+    const needsReview = status === "succeeded" && job.stats && job.stats.constraint_status === "needs_review";
+    const displayStatus = needsReview ? "needs-review" : status;
+    const displayStatusText = needsReview ? "需复核" : (statusText[status] || status);
     const message = job.error || job.message || "";
     const categories = pickArray(job, ["bill_categories"]);
     const createdAt = formatDateTime(job.created_at || job.updated_at);
@@ -472,12 +475,12 @@
       `;
 
     return `
-      <article class="result-card ${escapeHtml(status)}">
+      <article class="result-card ${escapeHtml(displayStatus)}">
         <div class="result-card-head">
           <div>
             <div class="result-title-row">
               <h3>任务 ${escapeHtml(taskLabel)}</h3>
-              <span class="queue-status ${escapeHtml(status)}">${escapeHtml(statusText[status] || status)}</span>
+              <span class="queue-status ${escapeHtml(displayStatus)}">${escapeHtml(displayStatusText)}</span>
             </div>
             <div class="result-meta-row">创建时间 ${escapeHtml(createdAt)}</div>
             <p class="result-message">${escapeHtml(message || "暂无状态说明")}</p>
@@ -528,7 +531,7 @@
   function normalizeQueueData(data) {
     if (Array.isArray(data)) {
       return {
-        max_concurrency: 5,
+        max_concurrency: 1,
         running_count: data.filter((job) => job.status === "running").length,
         queued_count: data.filter((job) => job.status === "queued").length,
         jobs: data.filter((job) => job.status === "queued" || job.status === "running"),
@@ -539,7 +542,7 @@
     const unfinishedJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
     const finishedJobs = jobs.filter((job) => job.status === "succeeded" || job.status === "failed");
     return {
-      max_concurrency: Number(data.max_concurrency) || 5,
+      max_concurrency: Number(data.max_concurrency) || 1,
       running_count: Number(data.running_count) || unfinishedJobs.filter((job) => job.status === "running").length,
       queued_count: Number(data.queued_count) || unfinishedJobs.filter((job) => job.status === "queued").length,
       jobs: unfinishedJobs,
@@ -1165,7 +1168,7 @@
     completedJobs = new Map();
     lastQueueJobs = [];
     renderQueue({
-      max_concurrency: queueMeta.max_concurrency || 5,
+      max_concurrency: queueMeta.max_concurrency || 1,
       running_count: 0,
       queued_count: 0,
       jobs: [],

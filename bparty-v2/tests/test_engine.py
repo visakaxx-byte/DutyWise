@@ -7,12 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from openpyxl import load_workbook
+import httpx
+from openpyxl import Workbook, load_workbook
 
 from engine import (
     BillInfo,
     BillLLMFields,
     BillProduct,
+    blocking_llm_review_issues,
     ManifestHsGroup,
     ManifestItem,
     ManifestWeightInfo,
@@ -21,7 +23,15 @@ from engine import (
     ProcessingOptions,
     SelectionRules,
     assert_selected_price_fit_resolved,
+    apply_manifest_net_weights,
     apply_bill_product_names,
+    adjust_price_gap,
+    allocate_price_first_cartons,
+    allocate_plausible_prices,
+    allocate_row_tax_budgets,
+    build_clearance,
+    build_manual_invoice_candidate_pool,
+    build_manifest_candidates,
     build_manifest_hs_groups,
     build_manifest_weight_context,
     build_output_rows,
@@ -30,6 +40,7 @@ from engine import (
     certification_filter_reason,
     effective_tax_rate,
     ensure_candidate_plausibility_ranges,
+    ensure_manifest_codeflag_candidates,
     ensure_bill_products_present,
     exclude_bill_product_replacements,
     generate_valid_output_rows_with_llm,
@@ -39,10 +50,14 @@ from engine import (
     normalize_bill_llm_products,
     normalize_bill_llm_fields,
     normalize_bill_llm_product_entries,
+    normalize_carton_count,
+    output_package_total,
     parse_bill,
+    parse_manifest,
     parse_bill_product_entries_from_images,
     parse_bill_product_entries_from_text,
     parse_non_exempt_additional_tax_rate,
+    parse_percentage_component_tax_rate,
     parse_tax_rate,
     parse_bill_products_with_llm,
     PlausibilityRange,
@@ -50,6 +65,7 @@ from engine import (
     qualify_single_candidate,
     qualify_bill_product_candidates,
     select_initial_candidates,
+    select_qualified_tax_data,
     tax_filter_reason,
     translate_material_to_english,
     translate_usage_to_english,
@@ -60,10 +76,21 @@ from engine import (
     validate_price_evidence,
     validate_qty_ctn_relationship,
     infer_bill_material_from_entry,
+    is_bill_required_candidate,
+    is_undetailed_bill_candidate,
     load_default_reference_manual_candidates,
+    manual_invoice_search_pool,
     optimize_selected_candidates_for_manual_invoice,
+    validate_output_product_uniqueness,
 )
-from crawler_client import parse_classification_results
+from config import CrawlerSettings
+from crawler_client import (
+    StrictTaxCrawler,
+    aes_encrypt,
+    is_auth_expired,
+    login_body_error_detail,
+    parse_classification_results,
+)
 from price_search import build_price_evidence, extract_price_samples, parse_pack_qty
 
 
@@ -76,6 +103,65 @@ def tax_result(rate: str = "3.4%", hs: str = "3924104000", certifications: list[
             "description_cn": "测试品名",
         }
     }
+
+
+def manifest_schema_payload(
+    *,
+    sheet_name: str = "箱单",
+    header_row: int = 1,
+    summary_rows: list[int] | None = None,
+    data_start_row: int = 3,
+    data_end_row: int = 4,
+    columns: dict[str, int] | None = None,
+    header_labels: dict[str, str] | None = None,
+    confidence: float = 0.98,
+    strategy: str = "explicit_total",
+    total_cell: str = "箱单!F2",
+    detail_range: str = "箱单!F3:F4",
+) -> dict:
+    return {
+        "sheet_name": sheet_name,
+        "header_row": header_row,
+        "summary_rows": [2] if summary_rows is None else summary_rows,
+        "data_start_row": data_start_row,
+        "data_end_row": data_end_row,
+        "columns": columns
+        or {
+            "zh_name": 1,
+            "en_name": 2,
+            "material": 3,
+            "qty": 4,
+            "ctns": 5,
+            "gross_weight": 6,
+            "hs_code": 9,
+        },
+        "header_labels": header_labels
+        or {
+            "zh_name": "中文品名",
+            "en_name": "品名",
+            "material": "材质",
+            "qty": "产品数量",
+            "ctns": "件数",
+            "gross_weight": "重量",
+            "hs_code": "海关编码",
+        },
+        "weight_unit": "kg",
+        "confidence": confidence,
+        "weight_strategy": strategy,
+        "weight_total_cell": total_cell,
+        "weight_detail_range": detail_range,
+    }
+
+
+def write_manifest_workbook(path: Path, *, include_summary: bool = True, include_details: bool = True) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "箱单"
+    sheet.append(["中文品名", "品名", "材质", "产品数量", "件数", "重量", "立方", "计费重", "海关编码"])
+    sheet.append([None, None, None, None, 3, 30 if include_summary else None, None, None, None])
+    sheet.append(["水杯", "Water cup", "塑料", 20, 1, 10 if include_details else None, None, None, "3924104000"])
+    sheet.append(["枕套", "Pillowcase", "涤纶", 40, 2, 20 if include_details else None, None, None, "6302322020"])
+    workbook.save(path)
 
 
 class FakeCrawler:
@@ -193,7 +279,86 @@ class RoutedFakeParser:
         return self.bill_payload
 
 
-class TaxRateTests(unittest.TestCase):
+class SequencedAsyncClient:
+    responses: list[httpx.Response] = []
+    requests: list[dict] = []
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url: str, **kwargs) -> httpx.Response:
+        self.__class__.requests.append({"url": url, **kwargs})
+        if not self.__class__.responses:
+            raise AssertionError(f"no fake response left for {url}")
+        return self.__class__.responses.pop(0)
+
+
+def codeflag_payload(hs: str = "3924104000", tax_rate: str = "3.4%") -> dict:
+    return {
+        "classificationCodeList": [
+            {
+                "hsCode": hs,
+                "importTariffRate": tax_rate,
+            }
+        ],
+        "classificationResultList": [
+            {
+                "hsCode": hs,
+                "gName": "测试品名",
+            }
+        ],
+    }
+
+
+class TaxRateTests(unittest.IsolatedAsyncioTestCase):
+    def test_login_body_error_detail_decrypts_nested_message(self) -> None:
+        encrypted = aes_encrypt('{"code":500,"message":"暂未启用，请联系管理员"}')
+        self.assertEqual(login_body_error_detail({"code": 200, "data": encrypted}), "暂未启用，请联系管理员")
+
+    def test_is_auth_expired_matches_codeflag_logout_text(self) -> None:
+        self.assertTrue(is_auth_expired("你已下线，请重新登陆"))
+        self.assertTrue(is_auth_expired("你的账号在另一地点登录，如果不是本人操作"))
+        self.assertTrue(is_auth_expired("token expired"))
+        self.assertFalse(is_auth_expired("您的操作过于频繁，请联系管理员"))
+
+    async def test_hs_search_relogs_once_when_codeflag_says_logged_out(self) -> None:
+        settings = CrawlerSettings(
+            username="user",
+            password="password",
+            base_url="https://codeflag.test",
+            timeout=1,
+            delay=0,
+            max_retries=1,
+            rate_limit_backoff=0,
+        )
+        SequencedAsyncClient.responses = [
+            httpx.Response(200, json={"code": 200}, headers={"CusAuthorization": "token-1"}),
+            httpx.Response(200, json={"code": 500, "message": "你已下线，请重新登陆"}),
+            httpx.Response(200, json={"code": 200}, headers={"CusAuthorization": "token-2"}),
+            httpx.Response(200, json={"code": 200, "data": codeflag_payload()}),
+        ]
+        SequencedAsyncClient.requests = []
+
+        with patch("crawler_client.httpx.AsyncClient", SequencedAsyncClient):
+            crawler = StrictTaxCrawler(settings)
+            result = await crawler.search("3924104000")
+
+        self.assertEqual(result["3924104000"]["tax_rate"], "3.4%")
+        self.assertEqual(crawler.auth_expired_retry_count, 1)
+        search_tokens = [
+            request["headers"]["CusAuthorization"]
+            for request in SequencedAsyncClient.requests
+            if request["url"].endswith("/classification/search")
+        ]
+        self.assertEqual(search_tokens, ["token-1", "token-2"])
+
     def test_parse_tax_rate_formats(self) -> None:
         self.assertEqual(parse_tax_rate("N/A"), None)
         self.assertAlmostEqual(parse_tax_rate(0.034), 0.034)
@@ -202,6 +367,123 @@ class TaxRateTests(unittest.TestCase):
         self.assertAlmostEqual(parse_tax_rate("20%"), 0.2)
         self.assertAlmostEqual(parse_tax_rate("20"), 0.2)
         self.assertAlmostEqual(parse_tax_rate("Free"), 0.0)
+        self.assertAlmostEqual(parse_percentage_component_tax_rate("0.8¢ each + 4.6%"), 0.046)
+
+    def test_select_qualified_tax_data_can_prefer_first_and_ignore_certifications(self) -> None:
+        rules = SelectionRules()
+        results = {
+            "3924104000": {
+                "hs_code_us": "3924104000",
+                "tax_rate": "3.4%",
+                "additional_tax_rate": "10%",
+                "certification_texts": ["FD1: FDA data MAY BE required"],
+            },
+            "3926400090": {
+                "hs_code_us": "3926400090",
+                "tax_rate": "Free",
+                "additional_tax_rate": "10%",
+                "certification_texts": [],
+            },
+        }
+
+        selected = select_qualified_tax_data(
+            results,
+            rules,
+            enforce_tax_limit=False,
+            prefer_first=True,
+            ignore_certifications=True,
+        )
+
+        self.assertEqual(selected["hs_code_us"], "3924104000")
+
+    def test_bill_tax_selection_ranks_semantic_match_before_lowest_tax(self) -> None:
+        results = {
+            "6307908950": {
+                "hs_code_us": "6307908950",
+                "tax_rate": "7%",
+                "additional_tax_rate": "12.5%",
+                "certification_texts": [],
+                "description_cn": "其他纺织材料制未列名制品",
+            },
+            "4202923131": {
+                "hs_code_us": "4202923131",
+                "tax_rate": "17.6%",
+                "additional_tax_rate": "25%+12.5%",
+                "certification_texts": [],
+                "description_cn": "其他化学纤维制货物包装袋",
+            },
+            "6305390000": {
+                "hs_code_us": "6305390000",
+                "tax_rate": "8.4%",
+                "additional_tax_rate": "7.5%+12.5%",
+                "certification_texts": [],
+                "description_cn": "其他化学纤维制货物包装袋",
+            },
+            "6305200000": {
+                "hs_code_us": "6305200000",
+                "tax_rate": "6.2%",
+                "additional_tax_rate": "7.5%+12.5%",
+                "certification_texts": [],
+                "description_cn": "用于货物包装的袋及包：棉制",
+            },
+            "6305900000": {
+                "hs_code_us": "6305900000",
+                "tax_rate": "6.2%",
+                "additional_tax_rate": "7.5%+12.5%",
+                "certification_texts": [],
+                "description_cn": "用于货物包装的袋及包：其他纺织材料制",
+            },
+        }
+
+        selected = select_qualified_tax_data(
+            results,
+            SelectionRules(),
+            enforce_tax_limit=False,
+            ignore_certifications=True,
+            semantic_name="Polyester bag",
+            semantic_material="Polyester",
+            semantic_usage="Storage",
+        )
+
+        self.assertEqual(selected["hs_code_us"], "6305390000")
+
+    def test_bill_tax_selection_rejects_explicit_material_conflict(self) -> None:
+        results = {
+            "6303910010": {
+                "hs_code_us": "6303910010",
+                "tax_rate": "10.3%",
+                "certification_texts": [],
+                "description_cn": "棉制非针织非钩编窗帘",
+            },
+            "6303921000": {
+                "hs_code_us": "6303921000",
+                "tax_rate": "11.3%",
+                "certification_texts": [],
+                "description_cn": "合纤制非针织非钩编窗帘",
+            },
+        }
+
+        selected = select_qualified_tax_data(
+            results,
+            SelectionRules(),
+            enforce_tax_limit=False,
+            ignore_certifications=True,
+            semantic_name="Polyester curtain",
+            semantic_material="Polyester",
+        )
+
+        self.assertEqual(selected["hs_code_us"], "6303921000")
+
+    def test_customer_codebook_candidates_use_combined_tax_below_30_percent(self) -> None:
+        candidates = [
+            candidate
+            for candidate in load_replacement_candidates()
+            if candidate.tax_match_source == "customer_codebook"
+        ]
+
+        self.assertGreater(len(candidates), 1000)
+        self.assertTrue(all(candidate.effective_tax_rate < 0.30 for candidate in candidates))
+        self.assertTrue(any(candidate.row_warnings for candidate in candidates))
 
     def test_effective_tax_rate_adds_non_exempt_additional_tax(self) -> None:
         self.assertAlmostEqual(
@@ -264,9 +546,31 @@ class TaxRateTests(unittest.TestCase):
         self.assertEqual(item["additional_tax_rate"], "25%+10%")
         self.assertEqual(item["certification_texts"], ["FD1: FDA data MAY BE required"])
 
+    def test_parse_codeflagai_prefers_description_attached_to_us_hts(self) -> None:
+        parsed = parse_classification_results(
+            "Polyester bag",
+            {
+                "classificationResultList": [
+                    {"hsCode": "4202920000", "gName": "塑料片或纺织材料作面的其他容器"}
+                ],
+                "classificationCodeList": [
+                    {
+                        "hsCode": "6305200000",
+                        "importTariffRate": "6.2%",
+                        "taricCn": "用于货物包装的袋及包：棉制",
+                        "taric": "Sacks and bags used for packing goods: Of cotton",
+                    }
+                ],
+            },
+        )
+
+        item = parsed["6305200000"]
+        self.assertEqual(item["description_cn"], "用于货物包装的袋及包：棉制")
+        self.assertEqual(item["source_description_cn"], "塑料片或纺织材料作面的其他容器")
+
 
 class ManifestHsGroupTests(unittest.TestCase):
-    def test_build_manifest_hs_groups_merges_same_hs_rows(self) -> None:
+    def test_build_manifest_hs_groups_preserves_distinct_products_under_same_hs(self) -> None:
         manifest = ManifestSummary(
             filename="input.xlsx",
             row_count=3,
@@ -282,13 +586,13 @@ class ManifestHsGroupTests(unittest.TestCase):
         )
 
         groups = build_manifest_hs_groups(manifest)
-        by_hs = {group.hs: group for group in groups}
+        same_hs_groups = [group for group in groups if group.hs == "9615900000"]
 
-        self.assertEqual(by_hs["9615900000"].source_rows, [2, 20])
-        self.assertEqual(by_hs["9615900000"].total_qty, 300)
-        self.assertEqual(by_hs["9615900000"].total_ctns, 5)
-        self.assertEqual(by_hs["9615900000"].total_gross_weight, 10)
-        self.assertIn("塑料发夹", by_hs["9615900000"].zh_names)
+        self.assertEqual(len(same_hs_groups), 2)
+        self.assertEqual(sorted(group.source_rows[0] for group in same_hs_groups), [2, 20])
+        self.assertEqual(sum(group.total_qty for group in same_hs_groups), 300)
+        self.assertEqual(sum(group.total_ctns for group in same_hs_groups), 5)
+        self.assertEqual(sum(group.total_gross_weight for group in same_hs_groups), 10)
 
 
 class PriceSearchTests(unittest.TestCase):
@@ -468,7 +772,7 @@ class BillProductParsingTests(unittest.IsolatedAsyncioTestCase):
         second = await parse_bill_product_entries_from_text(text, parser, cache)
 
         self.assertEqual(parser.calls, 1)
-        self.assertTrue(list(cache["bill"].keys())[0].startswith("text:v3:"))
+        self.assertTrue(list(cache["bill"].keys())[0].startswith("text:v4:"))
         self.assertEqual(second[0].name, first[0].name)
         self.assertEqual(second[0].hs_code_hint, "420222")
         self.assertEqual(second[0].evidence, text)
@@ -516,7 +820,7 @@ class BillProductParsingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parser.image_calls, 1)
         self.assertEqual(first[0].name, "STORAGE BAG")
         self.assertEqual(second[0].hs_code_hint, "420222")
-        self.assertTrue(next(iter(cache["bill"])).startswith("vision:v3:"))
+        self.assertTrue(next(iter(cache["bill"])).startswith("vision:v4:"))
         self.assertIn("扫描图", parser.image_prompts[0])
 
     async def test_parse_bill_falls_back_to_vision_when_pdf_text_is_empty(self) -> None:
@@ -590,6 +894,75 @@ class BillProductParsingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertRaisesRegex(RuntimeError, "提单未识别到有效总箱数"),
             ):
                 await parse_bill(pdf, parser, {"bill": {}})
+
+    async def test_parse_bill_rejects_fractional_text_carton_fallback(self) -> None:
+        parser = FakeBillParser(
+            {
+                "products": [
+                    {
+                        "name": "STORAGE BAG",
+                        "hs_code_hint": "420222",
+                        "evidence": "STORAGE BAG HS CODE:420222",
+                        "confidence": 0.97,
+                    },
+                ]
+            }
+        )
+        text = ("STORAGE BAG HS CODE:420222 " * 4) + "TOTAL 2.6 CARTONS"
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "text.pdf"
+            pdf.write_bytes(b"fake pdf bytes")
+            with (
+                patch("engine.extract_bill_text", return_value=text),
+                self.assertRaisesRegex(RuntimeError, "提单未识别到有效总箱数"),
+            ):
+                await parse_bill(pdf, parser, {"bill": {}})
+
+    async def test_parse_bill_accepts_thousands_separated_text_carton_fallback(self) -> None:
+        parser = FakeBillParser(
+            {
+                "products": [
+                    {
+                        "name": "STORAGE BAG",
+                        "hs_code_hint": "420222",
+                        "evidence": "STORAGE BAG HS CODE:420222",
+                        "confidence": 0.97,
+                    },
+                ]
+            }
+        )
+        text = ("STORAGE BAG HS CODE:420222 " * 4) + "TOTAL 1,234 CARTONS"
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "text.pdf"
+            pdf.write_bytes(b"fake pdf bytes")
+            with patch("engine.extract_bill_text", return_value=text):
+                bill = await parse_bill(pdf, parser, {"bill": {}})
+
+        self.assertEqual(bill.cartons, 1234)
+        self.assertEqual(bill.carton_source, "bill_text_cartons_regex")
+        self.assertEqual(bill.carton_unit, "CARTONS")
+
+    async def test_parse_bill_rejects_negative_text_carton_fallbacks(self) -> None:
+        payload = {
+            "products": [
+                {
+                    "name": "STORAGE BAG",
+                    "hs_code_hint": "420222",
+                    "evidence": "STORAGE BAG HS CODE:420222",
+                    "confidence": 0.97,
+                },
+            ]
+        }
+        for raw_count in ("- 5 CARTONS", "−5 CARTONS"):
+            with self.subTest(raw_count=raw_count), tempfile.TemporaryDirectory() as tmp:
+                pdf = Path(tmp) / "text.pdf"
+                pdf.write_bytes(b"fake pdf bytes")
+                text = ("STORAGE BAG HS CODE:420222 " * 4) + f"TOTAL {raw_count}"
+                with (
+                    patch("engine.extract_bill_text", return_value=text),
+                    self.assertRaisesRegex(RuntimeError, "提单未识别到有效总箱数"),
+                ):
+                    await parse_bill(pdf, FakeBillParser(payload), {"bill": {}})
 
     async def test_parse_bill_scanned_empty_vision_result_has_clear_error(self) -> None:
         parser = FakeVisionBillParser({"products": []})
@@ -679,6 +1052,38 @@ class BillProductParsingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fields.carton_count, 1234)
         self.assertEqual(fields.carton_evidence, "TOTAL 1,234 CARTONS")
 
+    def test_carton_count_rejects_boolean_negative_zero_and_non_finite_values(self) -> None:
+        self.assertIsNone(normalize_carton_count(True))
+        self.assertIsNone(normalize_carton_count(False))
+        self.assertIsNone(normalize_carton_count(-5))
+        self.assertIsNone(normalize_carton_count("-5 PIECES"))
+        self.assertIsNone(normalize_carton_count("- 5 PIECES"))
+        self.assertIsNone(normalize_carton_count("−5 PIECES"))
+        self.assertIsNone(normalize_carton_count(0))
+        self.assertIsNone(normalize_carton_count(float("inf")))
+        self.assertIsNone(normalize_carton_count(2.4))
+        self.assertIsNone(normalize_carton_count("2.6 PALLETS"))
+        self.assertEqual(normalize_carton_count("153 PIECES RCP"), 153)
+
+    def test_output_package_count_is_never_silently_raised_to_match_row_count(self) -> None:
+        bill = BillInfo(
+            "bill.pdf",
+            "",
+            [],
+            cartons=2,
+            carton_unit="PALLETS",
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "整票包装数量 2 PALLETS 小于输出行数 5",
+        ):
+            output_package_total(bill, 5)
+        with self.assertRaisesRegex(RuntimeError, "未识别到有效包装数量"):
+            output_package_total(
+                BillInfo("bill.pdf", "", [], cartons=2.6, carton_unit="CARTONS"),
+                2,
+            )
+
     def test_bill_material_inference_prefers_modifier_and_does_not_overmatch_pe_pp(self) -> None:
         self.assertEqual(
             "Plastic",
@@ -690,9 +1095,15 @@ class BillProductParsingTests(unittest.IsolatedAsyncioTestCase):
             "",
             infer_bill_material_from_entry(BillProduct(name="PIECE", hs_code_hint="392640", evidence="PIECE HS:392640")),
         )
+        self.assertEqual(
+            "Polyester",
+            infer_bill_material_from_entry(
+                BillProduct(name="POLYESTER BAG", evidence="POLYESTER BAG")
+            ),
+        )
 
 
-class ManifestWeightParsingTests(unittest.TestCase):
+class ManifestWeightParsingTests(unittest.IsolatedAsyncioTestCase):
     def test_manifest_weight_payload_is_normalized(self) -> None:
         payload = {
             "total_weight_kg": "3077.7",
@@ -706,8 +1117,545 @@ class ManifestWeightParsingTests(unittest.TestCase):
         self.assertEqual(info.evidence, "总毛重KGS 列求和")
         self.assertEqual(info.confidence, 0.93)
 
+    async def test_manifest_schema_maps_customs_code_and_reconciles_weight_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.xlsx"
+            write_manifest_workbook(path)
+            parser = FakeBillParser(manifest_schema_payload())
+            cache: dict[str, dict] = {}
+
+            first = await parse_manifest(path, parser, cache)
+            second = await parse_manifest(path, parser, cache)
+
+        self.assertEqual(parser.calls, 1)
+        self.assertEqual(first.schema_columns["hs_code"], 9)
+        self.assertEqual([item.hs for item in first.items], ["3924104000", "6302322020"])
+        self.assertEqual(first.total_real_weight, 30)
+        self.assertEqual(first.weight_explicit_total, 30)
+        self.assertEqual(first.weight_detail_sum, 30)
+        self.assertTrue(first.weight_reconciled)
+        self.assertEqual(second.total_real_weight, 30)
+        self.assertTrue(next(iter(cache["manifest_schema"])).startswith("schema:v1:net-weight-v1:"))
+
+    async def test_manifest_schema_parses_complete_net_weight_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest-net-weight.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "箱单"
+            sheet.append(["中文品名", "英文品名", "箱数", "数量", "净重", "毛重", "HS"])
+            sheet.append(["水杯", "Water cup", 1, 20, 9, 10, "3924104000"])
+            sheet.append(["枕套", "Pillowcase", 2, 40, 18, 20, "6302322020"])
+            workbook.save(path)
+            payload = manifest_schema_payload(
+                header_row=1,
+                summary_rows=[],
+                data_start_row=2,
+                data_end_row=3,
+                columns={
+                    "zh_name": 1,
+                    "en_name": 2,
+                    "ctns": 3,
+                    "qty": 4,
+                    "net_weight": 5,
+                    "gross_weight": 6,
+                    "hs_code": 7,
+                },
+                header_labels={
+                    "zh_name": "中文品名",
+                    "en_name": "英文品名",
+                    "ctns": "箱数",
+                    "qty": "数量",
+                    "net_weight": "净重",
+                    "gross_weight": "毛重",
+                    "hs_code": "HS",
+                },
+                strategy="detail_sum",
+                total_cell="",
+                detail_range="箱单!E2:E3",
+            )
+
+            manifest = await parse_manifest(path, DictFakeLLM(payload), {})
+
+        self.assertEqual(manifest.schema_columns["net_weight"], 5)
+        self.assertEqual([item.real_weight for item in manifest.items], [9, 18])
+        self.assertEqual(manifest.total_net_weight, 27)
+        self.assertEqual(manifest.total_real_weight, 30)
+        self.assertEqual(manifest.weight_detail_range, "F2:F3")
+
+    async def test_manifest_schema_supports_non_first_sheet_and_late_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "late-header.xlsx"
+            workbook = Workbook()
+            workbook.active.title = "说明"
+            sheet = workbook.create_sheet("数据区")
+            sheet.append(["装箱说明"])
+            sheet.append([])
+            sheet.append(["商品名称", "English", "材质描述", "数量", "箱数", "毛重", "HS"])
+            sheet.append([None, None, None, None, 3, 30, None])
+            sheet.append(["水杯", "Water cup", "塑料", 20, 1, 10, "3924104000"])
+            sheet.append(["枕套", "Pillowcase", "涤纶", 40, 2, 20, "6302322020"])
+            workbook.save(path)
+            payload = manifest_schema_payload(
+                sheet_name="数据区",
+                header_row=3,
+                summary_rows=[4],
+                data_start_row=5,
+                data_end_row=6,
+                columns={"zh_name": 1, "en_name": 2, "material": 3, "qty": 4, "ctns": 5, "gross_weight": 6, "hs_code": 7},
+                header_labels={"zh_name": "商品名称", "en_name": "English", "material": "材质描述", "qty": "数量", "ctns": "箱数", "gross_weight": "毛重", "hs_code": "HS"},
+                total_cell="数据区!F4",
+                detail_range="数据区!F5:F6",
+            )
+
+            manifest = await parse_manifest(path, DictFakeLLM(payload), {})
+
+        self.assertEqual(manifest.schema_sheet, "数据区")
+        self.assertEqual(manifest.schema_header_row, 3)
+        self.assertEqual(manifest.row_count, 2)
+        self.assertEqual(manifest.total_real_weight, 30)
+
+    async def test_manifest_schema_rejects_invalid_mapping_and_low_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.xlsx"
+            write_manifest_workbook(path)
+            invalid_column = manifest_schema_payload()
+            invalid_column["columns"] = {**invalid_column["columns"], "hs_code": 99}
+            with self.assertRaisesRegex(RuntimeError, "manifest_schema_unresolved.*列号越界"):
+                await parse_manifest(path, DictFakeLLM(invalid_column), {})
+            with self.assertRaisesRegex(RuntimeError, "manifest_schema_unresolved.*置信度"):
+                await parse_manifest(path, DictFakeLLM(manifest_schema_payload(confidence=0.4)), {})
+
+    def test_manifest_product_rows_cannot_skip_codeflag_when_candidates_are_empty(self) -> None:
+        manifest = ManifestSummary(
+            filename="input.xlsx",
+            row_count=1,
+            total_ctns=1,
+            total_real_weight=1,
+            total_declared_value=0,
+            categories=[],
+            items=[],
+        )
+        with self.assertRaisesRegex(RuntimeError, "manifest_schema_unresolved.*没有生成 Codeflag 查询候选"):
+            ensure_manifest_codeflag_candidates(manifest, [])
+
+    async def test_product_without_hs_uses_name_and_material_codeflag_search(self) -> None:
+        manifest = ManifestSummary(
+            filename="input.xlsx",
+            row_count=1,
+            total_ctns=1,
+            total_real_weight=10,
+            total_declared_value=0,
+            categories=["水杯"],
+            items=[
+                ManifestItem(
+                    row=3,
+                    zh="水杯",
+                    en="Water cup",
+                    hs="",
+                    material="塑料",
+                    usage="",
+                    ctns=1,
+                    qty=20,
+                    unit_price=None,
+                    declared_value=None,
+                    real_weight=None,
+                    gross_weight=10,
+                )
+            ],
+        )
+        candidates = build_manifest_candidates(manifest)
+        crawler = RoutedFakeCrawler(product_results={"水杯": tax_result("3.4%", hs="3924104000")})
+
+        result = await qualify_single_candidate(
+            crawler,
+            candidates[0],
+            SelectionRules(),
+            query_cache={},
+            enforce_tax_limit=False,
+        )
+
+        self.assertEqual(candidates[0].hs, "")
+        self.assertEqual(crawler.hs_calls, [])
+        self.assertEqual(crawler.product_calls, [("水杯", "塑料")])
+        self.assertEqual(result.hs, "3924104000")
+
+    async def test_manifest_weight_supports_detail_only_and_summary_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            detail_path = Path(tmp) / "detail.xlsx"
+            write_manifest_workbook(detail_path, include_summary=False)
+            detail_payload = manifest_schema_payload(
+                summary_rows=[],
+                strategy="detail_sum",
+                total_cell="",
+            )
+            detail = await parse_manifest(detail_path, DictFakeLLM(detail_payload), {})
+
+            summary_path = Path(tmp) / "summary.xlsx"
+            write_manifest_workbook(summary_path, include_details=False)
+            summary_payload = manifest_schema_payload(detail_range="")
+            summary = await parse_manifest(summary_path, DictFakeLLM(summary_payload), {})
+
+        self.assertEqual(detail.weight_strategy, "detail_sum")
+        self.assertEqual(detail.total_real_weight, 30)
+        self.assertIsNone(detail.weight_explicit_total)
+        self.assertEqual(summary.weight_strategy, "explicit_total")
+        self.assertEqual(summary.total_real_weight, 30)
+        self.assertIsNone(summary.weight_detail_sum)
+
+    async def test_manifest_weight_rejects_conflict_and_unrecomputable_total_cell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conflict_path = Path(tmp) / "conflict.xlsx"
+            write_manifest_workbook(conflict_path)
+            workbook = load_workbook(conflict_path)
+            workbook["箱单"]["F2"] = 35
+            workbook.save(conflict_path)
+            with self.assertRaisesRegex(RuntimeError, "manifest_weight_conflict"):
+                await parse_manifest(conflict_path, DictFakeLLM(manifest_schema_payload()), {})
+
+            invalid_path = Path(tmp) / "invalid-total.xlsx"
+            write_manifest_workbook(invalid_path)
+            workbook = load_workbook(invalid_path)
+            workbook["箱单"]["F2"] = "TOTAL"
+            workbook.save(invalid_path)
+            with self.assertRaisesRegex(RuntimeError, "manifest_schema_unresolved.*无法从原表重算"):
+                await parse_manifest(invalid_path, DictFakeLLM(manifest_schema_payload()), {})
+
+    async def test_clearance_queries_manifest_before_customer_codebook_fill(self) -> None:
+        manifest_candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx/HS归并",
+            zh="水杯",
+            en="Water cup",
+            hs="3924104000",
+            material="Plastic",
+            usage="HOME",
+            ctns=1,
+            qty=20,
+            gross_weight=10,
+        )
+        codebook_candidate = ProductCandidate(
+            source="replacement",
+            source_label="客户编码库/Sheet1",
+            zh="枕套",
+            en="Pillowcase",
+            hs="6302322020",
+            material="Polyester",
+            usage="HOME",
+            ctns=1,
+            qty=20,
+            gross_weight=20,
+            tax_match_source="customer_codebook",
+            effective_tax_rate=0.1,
+        )
+        manifest = ManifestSummary(
+            filename="input.xlsx",
+            row_count=1,
+            total_ctns=2,
+            total_real_weight=30,
+            total_declared_value=0,
+            categories=["水杯"],
+            items=[
+                ManifestItem(3, "水杯", "Water cup", "3924104000", "Plastic", "", 1, 20, None, None, None, 10)
+            ],
+        )
+        bill = BillInfo(
+            filename="bill.pdf",
+            raw_text="",
+            products=["WATER CUP"],
+            cartons=2,
+            product_entries=[BillProduct(name="WATER CUP", evidence="WATER CUP")],
+        )
+        events: list[str] = []
+
+        async def fake_qualify(crawler, candidates, rules, **kwargs):
+            events.append("manifest_codeflag")
+            self.assertEqual(candidates, [manifest_candidate])
+            qualified = ProductCandidate(
+                **{
+                    **manifest_candidate.__dict__,
+                    "tax_data": tax_result()["3924104000"],
+                    "base_tax_rate": 0.1,
+                    "effective_tax_rate": 0.1,
+                    "tax_match_source": "manifest_group_hs",
+                }
+            )
+            return [qualified], []
+
+        async def fake_plausibility(selected, *args, **kwargs):
+            return selected, False
+
+        async def fake_manual_replacements(*args, **kwargs):
+            events.append("post_fill_optimization")
+            return [], [], 0
+
+        async def fake_translate(*args, **kwargs):
+            return None
+
+        def fake_rows(selected, *args, **kwargs):
+            events.append("codebook_fill_complete")
+            self.assertEqual([candidate.source for candidate in selected], ["manifest_group", "replacement"])
+            return [
+                {"中文品名": "水杯", "英文品名": "Water cup", "总价": 100, "综合税率": 0.1, "箱数": 1, "毛重": 10, "来源": "manifest_group", "约束提示": "", "商品编码": "3924104000", "爬虫品名": "Water cup"},
+                {"中文品名": "枕套", "英文品名": "Pillowcase", "总价": 100, "综合税率": 0.1, "箱数": 1, "毛重": 20, "来源": "replacement", "约束提示": "", "商品编码": "6302322020", "爬虫品名": "Pillowcase"},
+            ]
+
+        crawler = SimpleNamespace(settings=SimpleNamespace(delay=0), auth_expired_retry_count=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("engine.parse_manifest", return_value=manifest),
+                patch("engine.parse_bill", return_value=bill),
+                patch("engine.StrictTaxCrawler", return_value=crawler),
+                patch("engine.load_selection_rules", return_value=SelectionRules()),
+                patch("engine.load_replacement_candidates", return_value=[codebook_candidate]),
+                patch("engine.load_plausibility_ranges", return_value={}),
+                patch("engine.build_manifest_candidates", return_value=[manifest_candidate]),
+                patch("engine.qualify_candidates", side_effect=fake_qualify),
+                patch("engine.ensure_candidate_plausibility_ranges", side_effect=fake_plausibility),
+                patch("engine.attach_price_evidence_to_candidates", side_effect=lambda selected, **kwargs: selected),
+                patch("engine.qualify_manual_invoice_replacements", side_effect=fake_manual_replacements),
+                patch("engine.optimize_selected_candidates_for_manual_invoice", side_effect=lambda selected, *args, **kwargs: (selected, {"strategy": "test", "swaps": 0})),
+                patch("engine.build_output_rows", side_effect=fake_rows),
+                patch("engine.translate_output_chinese_names_with_llm", side_effect=fake_translate),
+                patch("engine.validate_output_rows"),
+                patch("engine.validate_price_evidence"),
+                patch("engine.write_workbook"),
+                patch("engine.build_audit_summary", return_value={}),
+            ):
+                result = await build_clearance(
+                    "input.xlsx",
+                    "bill.pdf",
+                    tmp,
+                    target_tax_amount=100,
+                    target_item_count=2,
+                    llm=DictFakeLLM({}),
+                )
+
+        self.assertLess(events.index("manifest_codeflag"), events.index("codebook_fill_complete"))
+        self.assertEqual(result["stats"]["codeflag_queried"], 1)
+        self.assertEqual(result["stats"]["codebook_fill_needed"], 1)
+        self.assertEqual(result["stats"]["codebook_fill_used"], 1)
+        self.assertEqual(result["stats"]["constraint_status"], "needs_review")
+        self.assertEqual(result["stats"]["bill_required_locked"], 1)
+        self.assertEqual(result["stats"]["bill_manifest_detailed_locked"], 1)
+        self.assertEqual(result["stats"]["bill_synthetic_locked"], 0)
+        self.assertEqual(result["stats"]["solver_status"], "optimized")
+        self.assertTrue(result["stats"]["tax_optimization_applied"])
+        self.assertEqual(result["stats"]["best_effort_reason"], "")
+        bill_stage = next(item for item in result["flow"] if item["stage"] == "bill_products")
+        self.assertEqual(bill_stage["manifest_reused"], 1)
+        self.assertEqual(bill_stage["queried_separately"], 0)
+
 
 class OutputOptimizationTests(unittest.TestCase):
+    def test_manifest_detailed_bill_candidates_are_not_subject_to_synthetic_caps(self) -> None:
+        original_cartons = [28, 2, 18, 19, 20, 15, 18, 5, 17, 14]
+        selected = [
+            ProductCandidate(
+                source="manifest_group",
+                source_label="input.xlsx/HS归并",
+                zh=f"商品{index}",
+                en=f"Item {index}",
+                hs=f"3926909{index:03d}",
+                material="Polyester",
+                usage="HOME",
+                ctns=ctns,
+                effective_tax_rate=0.2,
+                bill_product_name=f"BILL ITEM {index}" if index < 3 else "",
+                bill_has_manifest_detail=index < 3,
+            )
+            for index, ctns in enumerate(original_cartons)
+        ]
+
+        allocated_cartons = allocate_price_first_cartons(selected, 153)
+        tax_budgets = allocate_row_tax_budgets(selected, 2800)
+
+        self.assertEqual(sum(allocated_cartons), 153)
+        self.assertEqual(allocated_cartons[:3], original_cartons[:3])
+        self.assertGreater(allocated_cartons[0], 3)
+        self.assertGreater(sum(allocated_cartons[:3]), round(153 * 0.06))
+        self.assertGreater(sum(tax_budgets[:3]), 2800 * 0.20)
+        self.assertTrue(all(is_bill_required_candidate(item) for item in selected[:3]))
+        self.assertTrue(all(not is_undetailed_bill_candidate(item) for item in selected[:3]))
+
+    def test_bill_only_synthetic_candidates_keep_carton_and_tax_caps(self) -> None:
+        original_cartons = [28, 2, 18, 19, 20, 15, 18, 5, 17, 14]
+        selected = [
+            ProductCandidate(
+                source="bill" if index < 3 else "manifest_group",
+                source_label="bill.pdf" if index < 3 else "input.xlsx/HS归并",
+                zh=f"商品{index}",
+                en=f"Item {index}",
+                hs=f"3926909{index:03d}",
+                material="Polyester",
+                usage="HOME",
+                ctns=ctns,
+                effective_tax_rate=0.2,
+                bill_product_name=f"BILL ITEM {index}" if index < 3 else "",
+            )
+            for index, ctns in enumerate(original_cartons)
+        ]
+
+        allocated_cartons = allocate_price_first_cartons(selected, 153)
+        tax_budgets = allocate_row_tax_budgets(selected, 2800)
+
+        self.assertEqual(sum(allocated_cartons), 153)
+        self.assertLessEqual(sum(allocated_cartons[:3]), round(153 * 0.06))
+        self.assertAlmostEqual(sum(tax_budgets[:3]), 2800 * 0.20, places=2)
+        self.assertTrue(all(is_undetailed_bill_candidate(item) for item in selected[:3]))
+
+    def test_candidate_library_is_excluded_when_manifest_already_fills_target(self) -> None:
+        manifest_candidates = [
+            ProductCandidate(
+                source="manifest_group",
+                source_label="input.xlsx/HS归并",
+                zh=f"清单商品{index}",
+                en=f"Manifest item {index}",
+                hs=f"3926909{index:03d}",
+                material="Plastic",
+                usage="Home use",
+            )
+            for index in range(10)
+        ]
+        library_candidate = ProductCandidate(
+            source="replacement",
+            source_label="DEFAULT_REFERENCE_STYLE_ROWS",
+            zh="键盘",
+            en="Keyboard",
+            hs="8471602000",
+            material="ABS",
+            usage="Home use",
+        )
+
+        pool = build_manual_invoice_candidate_pool(
+            manifest_candidates,
+            manifest_candidates,
+            [library_candidate],
+            allow_candidate_library=False,
+        )
+
+        self.assertEqual(pool, manifest_candidates)
+        self.assertNotIn(library_candidate, pool)
+
+    def test_candidate_library_is_available_for_real_row_shortage(self) -> None:
+        manifest_candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx/HS归并",
+            zh="清单商品",
+            en="Manifest item",
+            hs="3926909989",
+            material="Plastic",
+            usage="Home use",
+        )
+        library_candidate = ProductCandidate(
+            source="replacement",
+            source_label="DEFAULT_REFERENCE_STYLE_ROWS",
+            zh="键盘",
+            en="Keyboard",
+            hs="8471602000",
+            material="ABS",
+            usage="Home use",
+        )
+
+        pool = build_manual_invoice_candidate_pool(
+            [manifest_candidate],
+            [manifest_candidate],
+            [library_candidate],
+            allow_candidate_library=True,
+        )
+
+        self.assertEqual(pool, [manifest_candidate, library_candidate])
+
+    def test_price_gap_increases_low_tax_plan_to_target(self) -> None:
+        candidates = [
+            ProductCandidate(
+                source="manifest_group",
+                source_label="input.xlsx/HS归并",
+                zh=f"商品{index}",
+                en=f"Item {index}",
+                hs=f"3926909{index:03d}",
+                material="Plastic",
+                usage="Home use",
+                effective_tax_rate=rate,
+            )
+            for index, rate in enumerate((0.2, 0.3))
+        ]
+        unit_prices = [1.0, 1.0]
+
+        adjust_price_gap(
+            unit_prices,
+            [0.5, 0.5],
+            [3.0, 3.0],
+            candidates,
+            [100, 100],
+            100.0,
+        )
+
+        estimated_tax = sum(
+            price * 100 * candidate.effective_tax_rate
+            for price, candidate in zip(unit_prices, candidates)
+        )
+        self.assertAlmostEqual(estimated_tax, 100.0, places=4)
+
+    def test_formal_price_solver_uses_maximum_safe_price_when_target_is_unreachable(self) -> None:
+        candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx/HS归并",
+            zh="塑料商品",
+            en="Plastic item",
+            hs="3926909989",
+            material="Plastic",
+            usage="Home use",
+            effective_tax_rate=0.1,
+        )
+        plausibility = PlausibilityRange(
+            kg_per_ctn_min=1,
+            kg_per_ctn_max=20,
+            kg_per_pc_min=0.1,
+            kg_per_pc_max=5,
+            unit_price_min=0.5,
+            unit_price_max=1.0,
+            qty_per_ctn_min=1,
+            qty_per_ctn_max=100,
+            source="test range",
+        )
+
+        prices = allocate_plausible_prices(
+            [candidate],
+            [10],
+            [10.0],
+            [plausibility],
+            100.0,
+            [100.0],
+        )
+
+        self.assertEqual(prices, [(1.0, 10.0)])
+
+    def test_output_net_weight_inherits_manifest_net_to_gross_ratio(self) -> None:
+        rows = [
+            {"箱数": 10, "毛重": 100, "净重": 90},
+            {"箱数": 20, "毛重": 200, "净重": 180},
+        ]
+        manifest = ManifestSummary(
+            filename="input.xlsx",
+            row_count=2,
+            total_ctns=30,
+            total_real_weight=300,
+            total_declared_value=0,
+            categories=[],
+            total_net_weight=288,
+        )
+
+        apply_manifest_net_weights(rows, manifest)
+
+        self.assertEqual(sum(row["净重"] for row in rows), 288)
+        self.assertAlmostEqual(
+            sum(row["净重"] for row in rows) / sum(row["毛重"] for row in rows),
+            0.96,
+            places=6,
+        )
+        self.assertTrue(all("原始清单总净重/总毛重" in row["净重计算依据"] for row in rows))
+
     def test_material_and_usage_are_translated_to_english(self) -> None:
         material = translate_material_to_english("铁+塑料/Iron + Plastic")
         usage = translate_usage_to_english("测量戒指大小、ring sizer")
@@ -899,6 +1847,110 @@ class OutputOptimizationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "有效简体中文品名"):
             asyncio.run(translate_output_chinese_names_with_llm(llm, rows))
+
+    def test_output_rejects_duplicate_translated_names_even_when_hs_differs(self) -> None:
+        rows = [
+            {"中文品名": "窗帘", "英文品名": "Curtain", "商品编码": "6303910010"},
+            {"中文品名": "窗帘", "英文品名": "Curtain", "商品编码": "6303921000"},
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "输出商品品名重复"):
+            validate_output_product_uniqueness(rows)
+
+    def test_output_allows_explicit_material_qualifiers_for_distinct_products(self) -> None:
+        rows = [
+            {"中文品名": "棉制窗帘", "英文品名": "Cotton curtain", "商品编码": "6303910010"},
+            {"中文品名": "涤纶窗帘", "英文品名": "Polyester curtain", "商品编码": "6303921000"},
+        ]
+
+        validate_output_product_uniqueness(rows)
+
+    def test_high_semantic_llm_review_issue_is_blocking_without_numeric_bounds(self) -> None:
+        review = {
+            "issues": [
+                {
+                    "row_index": 1,
+                    "severity": "high",
+                    "type": "material_hs_mismatch",
+                    "message": "Polyester material is inconsistent with cotton HS description",
+                    "suggested_bounds": {},
+                }
+            ]
+        }
+
+        issues = blocking_llm_review_issues(
+            review,
+            constraints_applied=0,
+            reoptimized=False,
+        )
+
+        self.assertEqual(len(issues), 1)
+
+    def test_review_only_candidate_downgrades_high_review_issue_to_warning(self) -> None:
+        review = {
+            "issues": [
+                {
+                    "row_index": 1,
+                    "severity": "high",
+                    "type": "unit_value_hs_mismatch",
+                    "message": "Unit value exceeds the HTS per-piece limit",
+                    "suggested_bounds": {},
+                }
+            ]
+        }
+        candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx/HS归并",
+            zh="不锈钢首饰",
+            en="Stainless steel jewelry",
+            hs="7117190500",
+            material="Stainless steel",
+            usage="Decoration",
+            compliance_review_required=True,
+            compliance_review_reason="HTS value cap mismatch",
+        )
+
+        issues = blocking_llm_review_issues(
+            review,
+            constraints_applied=0,
+            reoptimized=False,
+            candidates=[candidate],
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_manual_invoice_pool_excludes_review_only_candidate_when_clean_pool_is_sufficient(self) -> None:
+        clean = [
+            ProductCandidate(
+                source="manifest_group",
+                source_label="input.xlsx/HS归并",
+                zh=f"清单商品{i}",
+                en=f"Manifest item {i}",
+                hs=f"39269099{i:02d}",
+                material="Plastic",
+                usage="HOME",
+                gross_weight=10,
+                ctns=1,
+                qty=10,
+                unit_price=1,
+                effective_tax_rate=0.1,
+            )
+            for i in range(10)
+        ]
+        review_only = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx/HS归并",
+            zh="不锈钢首饰",
+            en="Stainless steel jewelry",
+            hs="7117190500",
+            material="Stainless steel",
+            usage="Decoration",
+            compliance_review_required=True,
+        )
+
+        pool = manual_invoice_search_pool([review_only, *clean], 10)
+
+        self.assertNotIn(review_only, pool)
 
     def test_generated_candidates_do_not_inherit_historical_weight_constraints(self) -> None:
         candidate = ProductCandidate(
@@ -1355,8 +2407,112 @@ class OutputOptimizationTests(unittest.TestCase):
         self.assertLessEqual(sum(row["预计税金"] for row in rows), 935)
         self.assertEqual(summary["strategy"], "manual_invoice")
 
+    def test_manual_invoice_optimizer_preserves_reused_manifest_bill_product(self) -> None:
+        broad_range = PlausibilityRange(
+            kg_per_ctn_min=1,
+            kg_per_ctn_max=30,
+            kg_per_pc_min=0.01,
+            kg_per_pc_max=5,
+            unit_price_min=0.1,
+            unit_price_max=20,
+            qty_per_ctn_min=1,
+            qty_per_ctn_max=200,
+            source="test range",
+        )
+
+        def candidate(name: str, hs: str, *, bill_product_name: str = "") -> ProductCandidate:
+            return ProductCandidate(
+                source="manifest_group",
+                source_label="input.xlsx/HS归并",
+                zh=name,
+                en=name,
+                hs=hs,
+                material="Polyester",
+                usage="HOME",
+                ctns=10,
+                qty=100,
+                unit_price=2,
+                declared_value=200,
+                real_weight=90,
+                gross_weight=100,
+                base_tax_rate=0.2,
+                effective_tax_rate=0.2,
+                tax_match_source="manifest_group_hs",
+                plausibility_range=broad_range,
+                bill_product_name=bill_product_name,
+                bill_has_manifest_detail=bool(bill_product_name),
+            )
+
+        bill_bag = candidate("Polyester bag", "4202923131", bill_product_name="POLYESTER BAG")
+        selected = [
+            bill_bag,
+            candidate("Curtain", "6303921000"),
+            candidate("Scarf", "6214300000"),
+        ]
+
+        optimized, _ = optimize_selected_candidates_for_manual_invoice(
+            selected,
+            [*selected, *load_default_reference_manual_candidates()],
+            ManifestSummary("input.xlsx", 3, 30, 300, 1000, []),
+            BillInfo("bill.pdf", "", ["POLYESTER BAG"], cartons=30),
+            ProcessingOptions(target_tax_amount=100, target_item_count=3),
+        )
+
+        self.assertIn(bill_bag, optimized)
+        self.assertEqual(
+            [item.bill_product_name for item in optimized if item.bill_product_name],
+            ["POLYESTER BAG"],
+        )
+
 
 class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bill_product_reuses_matching_manifest_hs_candidate_without_query(self) -> None:
+        bill = BillInfo(
+            filename="bill.pdf",
+            raw_text="",
+            products=["POLYESTER BAG"],
+            cartons=20,
+            product_entries=[BillProduct(name="POLYESTER BAG", evidence="POLYESTER BAG")],
+        )
+        manifest_candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx/HS归并",
+            zh="涤纶包",
+            en="Polyester bag",
+            hs="4202126000",
+            material="Polyester Storage",
+            usage="Storage",
+            ctns=2,
+            qty=74,
+            gross_weight=24.6,
+            base_tax_rate=0.057,
+            effective_tax_rate=0.432,
+            tax_match_source="manifest_group_hs",
+            tax_data={"hs_code_us": "4202126000", "description_cn": "以纺织材料作面的衣箱"},
+        )
+        crawler = RoutedFakeCrawler(product_results={}, hs_results={})
+
+        required, filtered = await qualify_bill_product_candidates(
+            crawler,
+            bill,
+            [manifest_candidate],
+            [],
+            SelectionRules(),
+            ProcessingOptions(target_tax_amount=100, target_item_count=10),
+            query_cache={},
+        )
+
+        self.assertEqual(len(required), 1)
+        self.assertEqual(required[0].zh, manifest_candidate.zh)
+        self.assertEqual(required[0].hs, manifest_candidate.hs)
+        self.assertEqual(required[0].bill_product_name, "POLYESTER BAG")
+        self.assertTrue(required[0].bill_has_manifest_detail)
+        self.assertTrue(is_bill_required_candidate(required[0]))
+        self.assertFalse(is_undetailed_bill_candidate(required[0]))
+        self.assertEqual(filtered, [])
+        self.assertEqual(crawler.product_calls, [])
+        self.assertEqual(crawler.hs_calls, [])
+
     async def test_bill_product_candidates_deduplicate_repeated_bill_products(self) -> None:
         bill = BillInfo(
             filename="bill.pdf",
@@ -1437,7 +2593,7 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(crawler.hs_calls, [])
         self.assertIn("Codeflag", bill_filtered[-1].filter_reason)
 
-    async def test_bill_product_candidates_retry_without_material_when_material_query_fails(self) -> None:
+    async def test_bill_product_candidates_accept_first_codeflag_result_even_with_certification(self) -> None:
         bill = BillInfo(
             filename="bill.pdf",
             raw_text="",
@@ -1467,13 +2623,13 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([item.zh for item in bill_required], ["SILICONE COASTER"])
-        self.assertEqual(bill_required[0].hs, "3926400090")
-        self.assertEqual(bill_required[0].tax_match_source, "bill_product_no_material")
+        self.assertEqual(bill_required[0].hs, "3924905650")
+        self.assertEqual(bill_required[0].tax_match_source, "bill_product")
         self.assertEqual(
             crawler.product_calls,
-            [("SILICONE COASTER", "Silicone"), ("SILICONE COASTER", "")],
+            [("SILICONE COASTER", "Silicone")],
         )
-        self.assertIn("fda", bill_filtered[0].filter_reason.lower())
+        self.assertEqual(bill_filtered, [])
 
     async def test_bill_product_query_retries_transient_failures(self) -> None:
         bill = BillInfo(
@@ -1696,6 +2852,66 @@ class BillProductCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.hs, "9033000090")
         self.assertAlmostEqual(result.effective_tax_rate, 0.25)
         self.assertEqual(result.tax_match_source, "manifest_group_hs")
+
+    async def test_value_capped_hs_is_selected_only_when_clean_candidates_are_insufficient(self) -> None:
+        candidate = ProductCandidate(
+            source="manifest_group",
+            source_label="input.xlsx/HS归并",
+            zh="不锈钢首饰",
+            en="Stainless steel jewelry",
+            hs="7117190500",
+            material="Stainless steel",
+            usage="Decoration",
+            ctns=10,
+            qty=800,
+            unit_price=3,
+            declared_value=2400,
+            gross_weight=175.9,
+        )
+        tax_data = tax_result("Free", hs="7117190500")
+        tax_data["7117190500"]["description_cn"] = "玩具首饰，每件价值不超过8美分"
+        tax_data["7117190500"]["taric"] = "Toy jewelry valued not over 8 cents per piece"
+        crawler = RoutedFakeCrawler(product_results={}, hs_results={"7117190500": tax_data})
+        rules = SelectionRules(allowed_certifications=["Lacey Act", "TSCA"])
+
+        review_only = await qualify_single_candidate(
+            crawler,
+            candidate,
+            rules,
+            query_cache={},
+            enforce_tax_limit=False,
+        )
+
+        self.assertFalse(review_only.filter_reason)
+        self.assertTrue(review_only.compliance_review_required)
+        self.assertIn("0.0800 USD", review_only.compliance_review_reason)
+        clean = [
+            ProductCandidate(
+                source="manifest_group",
+                source_label="input.xlsx/HS归并",
+                zh=f"清单商品{i}",
+                en=f"Manifest item {i}",
+                hs=f"39269099{i:02d}",
+                material="Plastic",
+                usage="HOME",
+                ctns=1,
+                qty=10,
+                unit_price=1,
+                gross_weight=10,
+                effective_tax_rate=0.1,
+            )
+            for i in range(10)
+        ]
+
+        selected_with_choice = select_initial_candidates(
+            [review_only, *clean], [], rules, target_item_count=10
+        )
+        selected_with_shortage = select_initial_candidates(
+            [review_only, *clean[:9]], [], rules, target_item_count=10
+        )
+
+        self.assertNotIn(review_only, selected_with_choice)
+        self.assertIn(review_only, selected_with_shortage)
 
     async def test_bill_product_from_manifest_is_selected_before_other_items(self) -> None:
         bill = BillInfo(

@@ -77,14 +77,14 @@ DEFAULT_ACCOUNT_SEEDS = {
 }
 DEFAULT_USER_PASSWORD = "user123"
 AUTH_TOKENS: dict[str, str] = {}
+SERIAL_JOB_CONCURRENCY = 1
 
 
 def read_max_concurrent_jobs() -> int:
-    try:
-        return max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "5")))
-    except ValueError:
-        logger.warning("invalid MAX_CONCURRENT_JOBS value; falling back to 5")
-        return 5
+    configured = os.getenv("MAX_CONCURRENT_JOBS")
+    if configured and configured.strip() != str(SERIAL_JOB_CONCURRENCY):
+        logger.warning("MAX_CONCURRENT_JOBS is forced to 1 so Codeflag jobs run serially")
+    return SERIAL_JOB_CONCURRENCY
 
 
 def read_job_retention_days() -> int:
@@ -932,12 +932,22 @@ async def run_clearance_job(task_id: str, task_record: dict) -> None:
                 stats = dict(result["stats"])
                 stats["task_elapsed_seconds"] = elapsed_seconds
                 stats["task_elapsed_minutes"] = round(elapsed_seconds / 60, 2)
+                needs_review = stats.get("constraint_status") == "needs_review"
+                constraint_reasons = [
+                    str(reason)
+                    for reason in stats.get("constraint_reasons") or []
+                    if str(reason).strip()
+                ]
+                completion_message = "处理完成"
+                if needs_review:
+                    detail = "；".join(constraint_reasons[:2])
+                    completion_message = "处理完成，需人工复核" + (f"：{detail}" if detail else "")
                 update_task(
                     task_id,
                     status="succeeded",
-                    phase="done",
+                    phase="needs_review" if needs_review else "done",
                     progress=100,
-                    message="处理完成",
+                    message=completion_message,
                     completed_at=now_iso(),
                     completed_at_epoch=completed_at_epoch,
                     stats=stats,
